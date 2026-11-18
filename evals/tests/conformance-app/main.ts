@@ -3,8 +3,13 @@
 // behavior tests can be passed without the design skill. It is NOT a design
 // reference and is never given to generators.
 //
-// ?variant=retry-everything shows Retry for every failed upload, the habit the
-// eval must catch. The meta tests check that the shared tests fail it.
+// The page size is 20, below the API default, so the tests must handle
+// pagination.
+//
+// Broken variants, which the meta tests check the shared tests reject:
+//   ?variant=retry-everything      Retry for every failure, even oversized files
+//   ?variant=stale-after-recovery  recovery uploads, but the screen still shows the failure
+//   ?variant=mouse-only-recovery   recovery controls can't be reached with Tab
 
 interface Asset {
   id: string;
@@ -22,8 +27,11 @@ interface Upload {
 }
 
 const LIMIT_BYTES = 100 * 1024 * 1024;
-const PAGE = 50;
-const retryEverything = new URLSearchParams(location.search).get('variant') === 'retry-everything';
+const PAGE = 20;
+const variant = new URLSearchParams(location.search).get('variant');
+const retryEverything = variant === 'retry-everything';
+const staleAfterRecovery = variant === 'stale-after-recovery';
+const mouseOnlyRecovery = variant === 'mouse-only-recovery';
 
 const state = {
   query: '',
@@ -159,8 +167,14 @@ function renderUploads(): void {
   const failed = state.uploads.filter((u) => u.status === 'failed');
   const items = failed.map((entry) => {
     const actions: HTMLElement[] = [];
+    const recovered = async () => {
+      if (staleAfterRecovery) return;
+      renderUploads();
+      await load();
+    };
+    const keyboard = mouseOnlyRecovery ? { tabindex: '-1' } : {};
     if (entry.code === 'file_too_large' && !retryEverything) {
-      const choose = el('button', { type: 'button' }, 'Choose another file');
+      const choose = el('button', { type: 'button', ...keyboard }, 'Choose another file');
       const picker = el('input', { type: 'file', hidden: '' });
       choose.addEventListener('click', () => picker.click());
       picker.addEventListener('change', async () => {
@@ -168,16 +182,14 @@ function renderUploads(): void {
         if (!file) return;
         entry.file = file;
         await send(entry);
-        renderUploads();
-        await load();
+        await recovered();
       });
       actions.push(choose, picker);
     } else {
-      const retry = el('button', { type: 'button' }, 'Retry');
+      const retry = el('button', { type: 'button', ...keyboard }, 'Retry');
       retry.addEventListener('click', async () => {
         await send(entry);
-        renderUploads();
-        await load();
+        await recovered();
       });
       actions.push(retry);
     }
@@ -189,7 +201,7 @@ function renderUploads(): void {
     actions.push(dismiss);
     return el('li', {}, `${entry.file.name}: ${entry.code ?? ''} `, ...actions);
   });
-  uploadsRegion.replaceChildren(el('p', {}, `${done} of ${state.uploads.length} uploaded`), el('ul', {}, ...items));
+  uploadsRegion.replaceChildren(el('p', { role: 'status' }, `${done} of ${state.uploads.length} uploaded`), el('ul', {}, ...items));
 }
 
 upload.addEventListener('change', async () => {

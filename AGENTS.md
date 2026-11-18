@@ -268,11 +268,23 @@ Setup:
 - **The conformance app** is unstyled and written only from the brief's
   contract. It proves the tests can be passed from the brief alone. It is
   never given to generators and is not a design reference.
-- **Recovery checks** try every control (and menu item) in a failed
-  upload's item, each in a fresh mock session, and judge it by the request
-  log.
-- **Meta tests** prove the checks have teeth: the conformance app's
-  `?variant=retry-everything` must fail the oversized-file check.
+- **Projects:** desktop at 1440 × 900 and mobile at 390 × 844 (Pixel 7
+  touch profile), each in light and dark.
+- **Checks:**
+  - The **initial batch** must send each ordinary file exactly once and
+    successfully.
+  - **Pagination** must reach every asset by scrolling or through a
+    "more" or "next" control.
+  - **Recovery checks** try every control (and menu item) in a failed
+    upload's item, each in a fresh mock session, and judge it by the
+    request log. A recovery counts only if the failed item and the status
+    region then stop showing the failure. At least one working recovery
+    must also work with Tab and Enter.
+- **Meta tests** prove the checks can fail. These broken variants of the
+  conformance app must each fail for the right reason:
+  - `retry-everything`
+  - `stale-after-recovery`
+  - `mouse-only-recovery`
 - The owner makes the final call.
 - When conditions disagree, check skill loading, rule interpretation and
   implementation before revising a rule.
@@ -357,8 +369,8 @@ comparison.
 Next:
 1. Build these, following the eval protocol:
    - `evals/starter/`: Vite + React + TS, the mock API plugin, the token
-     converter, and `upload-files/` (written with `writeUploadFiles` from
-     `evals/fixtures/src/files.ts`)
+     converter, and `upload-files/` plus `replacement-files/` (written with
+     `writeUploadFiles` from `evals/fixtures/src/files.ts`)
    - `evals/rubric/`, for the owner to approve
    - the runner and the Claude Code adapter
    - `.claude/agents/reviewer.md`, pointing to the rubric

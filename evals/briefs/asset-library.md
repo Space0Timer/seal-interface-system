@@ -130,8 +130,9 @@ upload failure. Two of them fail:
 - `Q3-brand-guidelines-final-v2.pdf` is 112 MB, over the limit, so it fails
   with `file_too_large` every time.
 
-`upload-files/` also contains `Q3-brand-guidelines-final-v2-compressed.pdf`,
-an 8 MB version of the oversized file.
+`replacement-files/`, next to `upload-files/`, contains
+`Q3-brand-guidelines-final-v2-compressed.pdf`, an 8 MB version of the
+oversized file.
 
 ## Testability requirements
 
@@ -157,4 +158,12 @@ For them to work:
    behind your own control.
 6. **Each failed upload is its own item.** It contains the failed file's
    name and that file's recovery controls (buttons or links). The controls
-   are visible without hovering and can be reached with the Tab key.
+   are visible without hovering, can be reached with the Tab key, and work
+   with the Enter key.
+7. **Upload results are in a status region.** While a batch's failures are
+   on screen, its result is shown in an element with `role="status"` (or
+   another live region). The region updates when a failed file is
+   recovered.
+8. **More assets load predictably.** If the first page doesn't hold every
+   asset, more load either when the list is scrolled to its end, or through
+   a button or link whose accessible name contains "more" or "next".
