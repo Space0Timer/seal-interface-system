@@ -1,0 +1,19 @@
+{
+  "name": "@ds/eval-fixtures",
+  "private": true,
+  "type": "module",
+  "description": "Shared eval fixtures: messy asset data, the upload batch, and the mock asset API.",
+  "exports": {
+    ".": "./src/data.ts",
+    "./files": "./src/files.ts",
+    "./mock-api": "./src/mock-api.ts",
+    "./vite": "./src/vite-plugin.ts"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p ."
+  },
+  "devDependencies": {
+    "vite": "^8.3.8"
+  }
+}

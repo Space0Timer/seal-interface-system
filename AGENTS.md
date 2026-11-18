@@ -65,8 +65,13 @@ packages/tokens/       token validation, contrast check, and the
 packages/lint/         stylelint rule ds/token-values
 packages/react/        primitives, components, patterns         (empty)
 apps/playground/       reference screens, Storybook, e2e tests  (no screens yet)
-evals/                 briefs, starter, fixtures, rubric,       (not yet)
-                       runner, adapters, results
+evals/fixtures/        asset data, upload batch, mock API and
+                       its Vite plugin
+evals/briefs/          asset-library.md (held-out brief: not yet)
+evals/tests/           shared behavior tests, the contract-only
+                       conformance app, and meta tests
+evals/                 starter, rubric, runner, adapters,       (not yet)
+                       results
 .claude/agents/        Claude-only adapters, e.g. reviewer.md,  (not yet)
                        which points to evals/rubric/ and holds
                        no criteria of its own
@@ -257,6 +262,17 @@ Setup:
   only the skill provides; review scores the copy.
 - **Mobile interaction tests** run with touch emulation, so hover isn't
   available. They measure each control's clickable target, not its icon.
+- **Where the tests live:** `evals/tests/`. Set `EVAL_BASE_URL` to a
+  condition's app, served with the mock API plugin. Without it, the tests
+  run against the **conformance app**.
+- **The conformance app** is unstyled and written only from the brief's
+  contract. It proves the tests can be passed from the brief alone. It is
+  never given to generators and is not a design reference.
+- **Recovery checks** try every control (and menu item) in a failed
+  upload's item, each in a fresh mock session, and judge it by the request
+  log.
+- **Meta tests** prove the checks have teeth: the conformance app's
+  `?variant=retry-everything` must fail the oversized-file check.
 - The owner makes the final call.
 - When conditions disagree, check skill loading, rule interpretation and
   implementation before revising a rule.
@@ -335,15 +351,19 @@ comparison.
   - lint rules
   - `pnpm check`
 
+- Asset-library eval inputs: the fixtures and mock API, the brief, and the
+  shared behavior tests, which pass against the conformance app.
+
 Next:
 1. Build these, following the eval protocol:
-   - `evals/starter/`, with the functional contract and the token
-     converter
-   - `evals/fixtures/` and `evals/rubric/`
+   - `evals/starter/`: Vite + React + TS, the mock API plugin, the token
+     converter, and `upload-files/` (written with `writeUploadFiles` from
+     `evals/fixtures/src/files.ts`)
+   - `evals/rubric/`, for the owner to approve
    - the runner and the Claude Code adapter
    - `.claude/agents/reviewer.md`, pointing to the rubric
-2. Write the fixtures and both briefs (see above). The held-out brief
-   stays out of the skill.
+2. The held-out workspace-members brief, with its fixtures and behavior
+   tests. It stays out of the skill.
 3. Don't install the skill machine-wide yet. When a real UI repo needs it,
    link `core/design-system` into that agent's skills folder (a directory
    junction on Windows), and confirm that baseline eval runs still can't
