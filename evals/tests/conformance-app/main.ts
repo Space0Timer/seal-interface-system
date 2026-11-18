@@ -13,6 +13,9 @@
 //   ?labelledby=1    rows show a truncated filename; the full one comes from aria-labelledby
 //   ?row-actions=1   each row has a "More actions" button next to the page's "Load more"
 //   ?pager-nav=1     "Load more" sits in a pagination nav > ul > li, outside the table
+//   ?toolbar-list=1  "Delete selected" sits in a toolbar's ul > li
+//   ?reorder-last=1  when one failure remains, Dismiss comes before its recovery control
+//   ?virtual=1       the list scrolls inside a box and renders only 5 rows at a time
 //
 // Broken variants, which the meta tests check the shared tests reject:
 //   ?variant=retry-everything      Retry for every failure, even oversized files
@@ -31,6 +34,7 @@
 //   ?variant=retry-clears-all      a successful recovery hides every other failed item too,
 //                                  so the remaining file can't be recovered
 //   ?variant=delete-extra          bulk delete also deletes one unselected asset
+//   ?variant=wrong-summary         after a recovery, the summary claims every file uploaded
 
 interface Asset {
   id: string;
@@ -61,6 +65,11 @@ const prefetch = params.get('prefetch') === '1';
 const labelledBy = params.get('labelledby') === '1';
 const rowActions = params.get('row-actions') === '1';
 const pagerNav = params.get('pager-nav') === '1';
+const toolbarList = params.get('toolbar-list') === '1';
+const reorderLast = params.get('reorder-last') === '1';
+const virtual = params.get('virtual') === '1';
+const ROW_HEIGHT = 40;
+const VISIBLE_ROWS = 5;
 const variant = params.get('variant');
 const is = (name: string) => variant === name;
 
@@ -101,6 +110,12 @@ const uploadsRegion = el('section', { 'aria-label': 'Uploads' });
 const selectionRegion = el('div');
 const listRegion = el('div');
 const fullNames = el('div', { hidden: '' });
+// For ?virtual=1: a scroll box that stays attached (detaching it would reset
+// its position), with slots around it for the count and "Load more".
+const scroller = el('div', { style: `height:${ROW_HEIGHT * VISIBLE_ROWS}px;overflow-y:auto` });
+const countSlot = el('div');
+const moreSlot = el('div');
+scroller.addEventListener('scroll', () => renderList());
 
 document.body.append(
   el(
@@ -184,7 +199,11 @@ function renderList(): void {
     return;
   }
   if (labelledBy) fullNames.replaceChildren(...state.items.map((a) => el('span', { id: `name-${a.id}` }, a.filename)));
-  const rows = state.items.map((asset) => {
+  // ?virtual=1 renders only the rows in view, with spacers for the rest.
+  const first = virtual ? Math.min(Math.floor(scroller.scrollTop / ROW_HEIGHT), Math.max(0, state.items.length - VISIBLE_ROWS)) : 0;
+  const shown = virtual ? state.items.slice(first, first + VISIBLE_ROWS) : state.items;
+  const rowStyle = virtual ? { style: `height:${ROW_HEIGHT}px;white-space:nowrap` } : {};
+  const rows = shown.map((asset) => {
     const name = labelledBy ? { 'aria-labelledby': `name-${asset.id}` } : { 'aria-label': `Select ${asset.filename}` };
     const box = el('input', { type: 'checkbox', ...name });
     box.checked = state.selected.has(asset.id);
@@ -195,7 +214,7 @@ function renderList(): void {
     });
     return el(
       'tr',
-      labelledBy ? { 'aria-labelledby': `name-${asset.id}` } : {},
+      { ...(labelledBy ? { 'aria-labelledby': `name-${asset.id}` } : {}), ...rowStyle },
       el('td', {}, box),
       filenameCell(asset),
       el('td', {}, asset.mimeType),
@@ -204,19 +223,30 @@ function renderList(): void {
       ...(rowActions ? [el('td', {}, el('button', { type: 'button' }, 'More actions'))] : []),
     );
   });
+  const spacer = (n: number) => el('tr', { 'aria-hidden': 'true', style: `height:${n * ROW_HEIGHT}px` });
+  const body = virtual ? [spacer(first), ...rows, spacer(state.items.length - first - shown.length)] : rows;
   const table = el(
     'table',
     { 'aria-label': 'Assets' },
     el('thead', {}, el('tr', {}, el('th', {}, 'Select'), el('th', {}, 'Name'), el('th', {}, 'Type'), el('th', {}, 'Bytes'), el('th', {}, 'Updated'))),
-    el('tbody', {}, ...rows),
+    el('tbody', {}, ...body),
   );
-  const children: Node[] = [count, table];
+  const pager: Node[] = [];
   if (state.items.length < state.total) {
     const more = el('button', { type: 'button' }, 'Load more');
     more.addEventListener('click', () => void load(true));
-    children.push(pagerNav ? el('nav', { 'aria-label': 'Pagination' }, el('ul', {}, el('li', {}, more))) : more);
+    pager.push(pagerNav ? el('nav', { 'aria-label': 'Pagination' }, el('ul', {}, el('li', {}, more))) : more);
   }
-  listRegion.replaceChildren(...children);
+  if (virtual) {
+    if (scroller.parentElement !== listRegion) listRegion.replaceChildren(countSlot, scroller, moreSlot);
+    const top = scroller.scrollTop;
+    scroller.replaceChildren(table);
+    scroller.scrollTop = top;
+    countSlot.replaceChildren(count);
+    moreSlot.replaceChildren(...pager);
+    return;
+  }
+  listRegion.replaceChildren(count, table, ...pager);
 }
 
 function renderSelection(): void {
@@ -235,7 +265,8 @@ function renderSelection(): void {
     renderSelection();
     await load();
   });
-  selectionRegion.replaceChildren(el('p', {}, `${state.selected.size} selected `, remove));
+  const actions = toolbarList ? el('div', { role: 'toolbar', 'aria-label': 'Selection' }, el('ul', {}, el('li', {}, remove))) : remove;
+  selectionRegion.replaceChildren(el('p', {}, `${state.selected.size} selected `, actions));
 }
 
 async function send(entry: Upload): Promise<void> {
@@ -311,14 +342,17 @@ function renderUploads(): void {
     }
     const dismiss = el('button', { type: 'button' }, 'Dismiss');
     dismiss.addEventListener('click', () => {
-      state.uploads = state.uploads.filter((u) => u !== entry);
+      entry.hidden = true; // still part of the batch, just no longer shown
       renderUploads();
     });
-    actions.push(dismiss);
+    // ?reorder-last=1: with one failure left, Dismiss moves first.
+    if (reorderLast && failed.length === 1) actions.unshift(dismiss);
+    else actions.push(dismiss);
     return el('li', {}, `${entry.file.name}: ${entry.code ?? ''} `, ...actions);
   });
 
   let summary = `${done} of ${state.uploads.length} uploaded`;
+  if (is('wrong-summary') && state.recoveredOnce) summary = `${state.uploads.length} of ${state.uploads.length} uploaded`;
   if (is('stale-summary')) {
     // Freeze the first finished summary, so recovery never updates it.
     if (state.frozenSummary === null && !state.uploads.some((u) => u.status === 'pending')) state.frozenSummary = summary;

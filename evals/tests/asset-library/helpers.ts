@@ -123,10 +123,13 @@ export async function waitForItems(page: Page, filenames: readonly string[]): Pr
  */
 export async function loadMore(page: Page, filenames: readonly string[]): Promise<boolean> {
   const before = new Set(await visibleItems(page, filenames));
-  const newItemsAppear = async (timeout: number): Promise<boolean> => {
+  // A virtualized list may render new rows below the current view, so after
+  // using a control, keep scrolling a step at a time while waiting.
+  const newItemsAppear = async (timeout: number, step: boolean): Promise<boolean> => {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
       if ((await visibleItems(page, filenames)).some((n) => !before.has(n))) return true;
+      if (step) await scrollStep(page);
       await page.waitForTimeout(150);
     }
     return false;
@@ -141,18 +144,29 @@ export async function loadMore(page: Page, filenames: readonly string[]): Promis
     }
     window.scrollTo(0, document.documentElement.scrollHeight);
   }, ITEM);
-  if (await newItemsAppear(1_500)) return true;
+  if (await newItemsAppear(1_500, false)) return true;
 
   // The pagination control (brief requirement 8): outside the asset items,
-  // not a menu trigger, named "more" or "next". Row actions such as
-  // "More actions" are skipped, but a pager's own list (nav > ul > li) is
-  // fine: only items that are assets (they name a file or carry selection)
-  // disqualify a control.
+  // not a menu trigger, named "more" or "next".
   const candidates = page
     .getByRole('button', { name: /more|next/i })
     .or(page.getByRole('link', { name: /more|next/i }))
     .filter({ visible: true });
-  const index = await candidates.evaluateAll(
+  const index = await firstOutsideAssetItems(candidates, filenames);
+  if (index < 0) return false;
+  await candidates.nth(index).click({ timeout: 10_000 });
+  return newItemsAppear(5_000, true);
+}
+
+/**
+ * Index of the first candidate that isn't inside an asset item and doesn't
+ * open a menu, or -1. Only items that are assets (they name a known file or
+ * carry selection) disqualify a control, so a toolbar's or pager's own list
+ * items (ul > li) are fine, while row actions such as "More actions" or a
+ * per-row Delete are skipped.
+ */
+async function firstOutsideAssetItems(candidates: Locator, filenames: readonly string[]): Promise<number> {
+  return candidates.evaluateAll(
     (els, [itemSelector, names]) => {
       const isAssetItem = (item: Element): boolean => {
         if (item.querySelector('input[type=checkbox], [role=checkbox]') || item.hasAttribute('aria-selected')) return true;
@@ -177,9 +191,40 @@ export async function loadMore(page: Page, filenames: readonly string[]): Promis
     },
     [ITEM, filenames] as const,
   );
-  if (index < 0) return false;
-  await candidates.nth(index).click({ timeout: 10_000 });
-  return newItemsAppear(5_000);
+}
+
+/**
+ * Scrolls the page and every scrollable box that holds items down by most
+ * of a viewport. True if anything moved.
+ */
+async function scrollStep(page: Page): Promise<boolean> {
+  const moved = await page.evaluate((itemSelector) => {
+    let any = false;
+    for (const el of document.querySelectorAll<HTMLElement>('*')) {
+      const overflow = getComputedStyle(el).overflowY;
+      if ((overflow !== 'auto' && overflow !== 'scroll') || el.scrollHeight <= el.clientHeight + 1 || !el.querySelector(itemSelector)) continue;
+      const before = el.scrollTop;
+      el.scrollTop = before + el.clientHeight * 0.8;
+      if (el.scrollTop !== before) any = true;
+    }
+    const before = window.scrollY;
+    window.scrollBy(0, window.innerHeight * 0.8);
+    return any || window.scrollY !== before;
+  }, ITEM);
+  if (moved) await page.waitForTimeout(100); // let scroll handlers render
+  return moved;
+}
+
+/**
+ * Collects the filenames shown while scrolling down a viewport at a time,
+ * so a virtualized list that renders only nearby rows is fully seen.
+ */
+async function scrollThrough(page: Page, filenames: readonly string[], seen: Set<string>): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    for (const name of await visibleItems(page, filenames)) seen.add(name);
+    if (!(await scrollStep(page))) break;
+  }
+  for (const name of await visibleItems(page, filenames)) seen.add(name);
 }
 
 export function searchField(page: Page): Locator {
@@ -222,8 +267,10 @@ export async function measureTouchTargets(page: Page): Promise<TouchTarget[]> {
     const selector = 'button, a[href], input:not([type=hidden]), select, textarea, [role=button], [role=link], [role=checkbox], [role=menuitem], [tabindex]:not([tabindex="-1"])';
     const targets: TouchTarget[] = [];
     for (const el of document.querySelectorAll<HTMLElement>(selector)) {
-      if (el.getClientRects().length === 0) continue;
-      // The control and its labels are each clickable. Merge only boxes that
+      // No early visibility check: a hidden control (such as a file input)
+      // can still be activated through its visible <label>, which is then
+      // the real target. Controls with no visible box at all are skipped
+      // below. The control and its labels are each clickable. Merge only boxes that
       // touch or overlap, so a gap between a checkbox and a separate label
       // never counts as target area. Report the largest contiguous area.
       type Box = { left: number; right: number; top: number; bottom: number };
@@ -249,7 +296,8 @@ export async function measureTouchTargets(page: Page): Promise<TouchTarget[]> {
       const best = boxes.reduce((x, y) => (size(y) > size(x) ? y : x));
       const width = Math.round((best.right - best.left) * 10) / 10;
       const height = Math.round((best.bottom - best.top) * 10) / 10;
-      const label = (el.getAttribute('aria-label') ?? el.innerText ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
+      const labelText = [...((el as HTMLInputElement).labels ?? [])].map((l) => l.innerText).join(' ');
+      const label = (el.getAttribute('aria-label') || el.innerText || labelText || '').replace(/\s+/g, ' ').trim().slice(0, 60);
       targets.push({ label, tag: el.tagName.toLowerCase(), width, height, meetsMinimum: width >= min && height >= min });
     }
     return targets;
@@ -259,6 +307,26 @@ export async function measureTouchTargets(page: Page): Promise<TouchTarget[]> {
 /** The upload result: a status region whose accessible name contains "upload" (brief requirement 7). */
 export function uploadSummary(page: Page): Locator {
   return page.getByRole('status', { name: /upload/i }).filter({ visible: true }).first();
+}
+
+/**
+ * Checks the summary against what actually uploaded (brief requirement 7):
+ * it must state, as numerals, the files uploaded and the batch size, and any
+ * other count up to the batch size must be the number still failing.
+ * Filenames are removed first, since they contain digits. Larger numbers,
+ * such as "100 MB", are ignored. Returns why the summary is wrong, or null.
+ */
+export function summaryProblem(summary: string | null, uploaded: number, failureRemains: boolean): string | null {
+  const total = UPLOAD_BATCH.length;
+  if (summary === null || summary === '') return failureRemains ? 'the upload summary is gone although a failure remains' : null;
+  let text = summary;
+  for (const name of [...BATCH_NAMES, REPLACEMENT_FILE.filename].sort((a, b) => b.length - a.length)) text = text.split(name).join(' ');
+  const numbers = [...text.matchAll(/\d+/g)].map((m) => Number(m[0]));
+  const allowed = [uploaded, total, total - uploaded];
+  const missing = [uploaded, total].filter((n) => !numbers.includes(n));
+  const wrong = numbers.filter((n) => n <= total && !allowed.includes(n));
+  if (missing.length === 0 && wrong.length === 0) return null;
+  return `the upload summary reads "${summary}", but ${uploaded} of ${total} files have uploaded`;
 }
 
 /** The upload summary's text, normalized, or null if it isn't on screen. */
@@ -272,7 +340,7 @@ async function summaryText(page: Page): Promise<string | null> {
  * Waits until every upload in the log has a response and no new uploads
  * have started for 750 ms, with at least `min` uploads in total.
  */
-export async function settleUploads(page: Page, min: number): Promise<LogEntry[]> {
+export async function settleUploads(page: Page, min: number, quietMs = 750): Promise<LogEntry[]> {
   let previous = -1;
   let stableSince = Date.now();
   const deadline = Date.now() + 60_000;
@@ -283,7 +351,7 @@ export async function settleUploads(page: Page, min: number): Promise<LogEntry[]
     if (uploads.length !== previous) {
       previous = uploads.length;
       stableSince = Date.now();
-    } else if (uploads.length >= min && pending === 0 && Date.now() - stableSince >= 750) {
+    } else if (uploads.length >= min && pending === 0 && Date.now() - stableSince >= quietMs) {
       return entries;
     }
     if (Date.now() > deadline) throw new Error(`uploads did not settle: ${uploads.length} of at least ${min}, ${pending} still in flight`);
@@ -333,8 +401,10 @@ export async function uploadBatch(page: Page): Promise<void> {
     await expect.poll(() => markScope(page, filename), { message: `no failed item with controls for ${filename}` }).not.toBeNull();
   }
   await expect
-    .poll(() => summaryText(page), { message: 'the upload result is in a status region named "upload…" (brief requirement 7)' })
-    .toBeTruthy();
+    .poll(async () => summaryProblem(await summaryText(page), SUCCEEDING.length, true), {
+      message: 'the upload result is in a status region named "upload…" that reports 10 of 12 uploaded (brief requirement 7)',
+    })
+    .toBeNull();
 }
 
 /**
@@ -497,7 +567,7 @@ async function waitUntilCleared(
   page: Page,
   filename: string,
   itemText: string,
-  summaryBefore: string | null,
+  uploaded: number,
   usedLabel: string | null,
   failureRemains: boolean,
 ): Promise<string | null> {
@@ -505,20 +575,38 @@ async function waitUntilCleared(
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     const still = await failureStillShown(page, filename, itemText, usedLabel);
-    const summary = await summaryText(page);
-    const summaryProblem =
-      summary === null || summary === ''
-        ? failureRemains
-          ? 'the upload summary is gone although a failure remains'
-          : null
-        : summary === summaryBefore
-          ? `the upload summary still reads "${summaryBefore}"`
-          : null;
-    if (!still && !summaryProblem) return null;
-    reason = [still, summaryProblem].filter(Boolean).join(' and ');
+    const wrongSummary = summaryProblem(await summaryText(page), uploaded, failureRemains);
+    if (!still && !wrongSummary) return null;
+    reason = [still, wrongSummary].filter(Boolean).join(' and ');
     await page.waitForTimeout(200);
   }
   return reason;
+}
+
+/**
+ * Waits for a file chooser (up to 5 s, generous for loaded machines), but
+ * stops early once the action clearly did something else: an upload
+ * started, or the failed item went away.
+ */
+async function chooserOrOtherOutcome(
+  page: Page,
+  chooser: Promise<FileChooser | null>,
+  scope: Locator,
+  uploadsBefore: number,
+): Promise<FileChooser | null> {
+  let settled = false;
+  const otherOutcome = (async (): Promise<null> => {
+    while (!settled) {
+      await page.waitForTimeout(150);
+      if (settled) break;
+      if (uploadsIn(await mockLog(page)).length > uploadsBefore) break;
+      if (!(await scope.isVisible().catch(() => false))) break;
+    }
+    return null;
+  })();
+  const result = await Promise.race([chooser, otherOutcome]);
+  settled = true;
+  return result;
 }
 
 /** Fresh session, upload the batch, activate one recovery path, and record what happened. */
@@ -553,7 +641,6 @@ async function activate(
   const controlLabel = await labelOf(control);
   let label = controlLabel;
   const itemText = await scope.innerText();
-  const summaryBefore = await summaryText(page);
   const before = uploadsIn(await mockLog(page)).length;
   const notReached: Attempt = { label, via, reachedByKeyboard: false, uploads: [], chooserOpened: false, notCleared: null };
 
@@ -563,10 +650,10 @@ async function activate(
       await control.click();
       const item = menuItem(page, path[1]);
       label += ` > ${await labelOf(item)}`;
-      chooser = page.waitForEvent('filechooser', { timeout: 2_000 }).catch(() => null);
+      chooser = page.waitForEvent('filechooser', { timeout: 5_000 }).catch(() => null);
       await item.click();
     } else {
-      chooser = page.waitForEvent('filechooser', { timeout: 2_000 }).catch(() => null);
+      chooser = page.waitForEvent('filechooser', { timeout: 5_000 }).catch(() => null);
       await control.click();
     }
   } else {
@@ -577,16 +664,21 @@ async function activate(
       label += ` > ${await labelOf(item)}`;
       if (!(await arrowTo(page, item))) return { ...notReached, label };
     }
-    chooser = page.waitForEvent('filechooser', { timeout: 2_000 }).catch(() => null);
+    chooser = page.waitForEvent('filechooser', { timeout: 5_000 }).catch(() => null);
     await page.keyboard.press('Enter');
   }
 
-  const opened = await chooser;
+  const opened = await chooserOrOtherOutcome(page, chooser, scope, before);
   if (opened && replacement) await opened.setFiles(replacement);
-  const uploads = uploadsIn(await settleUploads(page, before)).slice(before);
+  // A chosen replacement must reach the server before this counts as settled;
+  // otherwise allow a longer quiet period for a slow start under load.
+  const all = uploadsIn(await settleUploads(page, opened && replacement ? before + 1 : before, 1_500));
+  const uploads = all.slice(before);
   const succeeded = uploads.some((u) => u.status === 201);
+  // Files of this batch uploaded so far (a replacement counts as its file).
+  const uploaded = all.filter((u) => u.status === 201).length;
   const notCleared = succeeded
-    ? await waitUntilCleared(page, filename, itemText, summaryBefore, path.length === 1 ? controlLabel : null, failureRemains)
+    ? await waitUntilCleared(page, filename, itemText, uploaded, path.length === 1 ? controlLabel : null, failureRemains)
     : null;
   return { label, via, reachedByKeyboard: true, uploads, chooserOpened: opened !== null, notCleared };
 }
@@ -652,18 +744,51 @@ const OVERSIZED: Failure = {
 };
 
 /** Tries every recovery path with the mouse; returns those that recover. */
-async function workingPaths(page: Page, failure: Failure, options: OpenOptions): Promise<Path[]> {
+/** A recovery path that worked, with its label ("Control" or "Trigger > Menu item"). */
+interface Working {
+  path: Path;
+  label: string;
+}
+
+async function workingPaths(page: Page, failure: Failure, options: OpenOptions): Promise<Working[]> {
   const { filename, replacement, judge, goal } = failure;
   const problems: string[] = [];
-  const working: Path[] = [];
+  const working: Working[] = [];
   for (const path of await recoveryPaths(page, filename, options)) {
-    const verdict = judge(await attempt(page, filename, path, 'mouse', replacement, options));
+    const a = await attempt(page, filename, path, 'mouse', replacement, options);
+    const verdict = judge(a);
     problems.push(...verdict.problems);
-    if (verdict.recovered) working.push(path);
+    if (verdict.recovered) working.push({ path, label: a.label });
   }
   expect(problems, `recovery controls for ${filename} misbehaved`).toEqual([]);
   expect(working.length, `no control in ${filename}'s item ${goal}`).toBeGreaterThan(0);
   return working;
+}
+
+/**
+ * Finds a working recovery again in the failed item as it is now, by label,
+ * since controls may change order after another file recovers. Falls back
+ * to the original position if no control has that label.
+ */
+async function resolveByLabel(page: Page, filename: string, working: Working): Promise<Path> {
+  const controls = controlsIn(await failedItem(page, filename));
+  const [controlLabel, itemLabel] = working.label.split(' > ');
+  const count = await controls.count();
+  for (let i = 0; i < count; i++) {
+    if ((await labelOf(controls.nth(i))) !== controlLabel) continue;
+    if (itemLabel === undefined) return [i];
+    await controls.nth(i).click();
+    const items = page.getByRole('menuitem').filter({ visible: true });
+    const itemCount = await items.count();
+    for (let j = 0; j < itemCount; j++) {
+      if ((await labelOf(items.nth(j))) === itemLabel) {
+        await page.keyboard.press('Escape');
+        return [i, j];
+      }
+    }
+    await page.keyboard.press('Escape');
+  }
+  return working.path;
 }
 
 /**
@@ -681,7 +806,7 @@ async function checkRecovery(
   const working = await workingPaths(page, { filename, replacement, judge, goal }, options);
 
   const keyboardProblems: string[] = [];
-  for (const path of working) {
+  for (const { path } of working) {
     const a = await attempt(page, filename, path, 'keyboard', replacement, options);
     if (!a.reachedByKeyboard) {
       keyboardProblems.push(`${describeAttempt(a)} can't be reached with Tab`);
@@ -718,7 +843,7 @@ export function checkOversizedRecovery(page: Page, options: OpenOptions = {}): P
  * recovery controls, and recovering it must work too.
  */
 export async function checkBothFailuresRecover(page: Page, options: OpenOptions = {}): Promise<void> {
-  const paths = new Map<Failure, Path>([
+  const found = new Map<Failure, Working>([
     [TRANSIENT, (await workingPaths(page, TRANSIENT, options))[0]!],
     [OVERSIZED, (await workingPaths(page, OVERSIZED, options))[0]!],
   ]);
@@ -729,7 +854,8 @@ export async function checkBothFailuresRecover(page: Page, options: OpenOptions 
     await openLibrary(page, 'default', options);
     await uploadBatch(page);
 
-    const a = first.judge(await activate(page, first.filename, paths.get(first)!, 'mouse', first.replacement, true));
+    const firstPath = await resolveByLabel(page, first.filename, found.get(first)!);
+    const a = first.judge(await activate(page, first.filename, firstPath, 'mouse', first.replacement, true));
     expect(a.problems, `recovering ${first.filename} first`).toEqual([]);
     expect(a.recovered, `recovering ${first.filename} first`).toBe(true);
 
@@ -739,7 +865,8 @@ export async function checkBothFailuresRecover(page: Page, options: OpenOptions 
         message: `after recovering ${first.filename}, ${second.filename} still has a failed item with recovery controls`,
       })
       .not.toBeNull();
-    const b = second.judge(await activate(page, second.filename, paths.get(second)!, 'mouse', second.replacement, false));
+    const secondPath = await resolveByLabel(page, second.filename, found.get(second)!);
+    const b = second.judge(await activate(page, second.filename, secondPath, 'mouse', second.replacement, false));
     expect(b.problems, `recovering ${second.filename} after ${first.filename}`).toEqual([]);
     expect(b.recovered, `after recovering ${first.filename}, ${second.filename} can still be recovered`).toBe(true);
   }
@@ -751,9 +878,12 @@ export async function checkAllAssetsReachable(page: Page, options: OpenOptions =
   await waitForItems(page, DEFAULT_NAMES);
   const seen = new Set<string>();
   for (let i = 0; i < DEFAULT_NAMES.length; i++) {
-    for (const name of await visibleItems(page, DEFAULT_NAMES)) seen.add(name);
+    // Scroll a viewport at a time before loading more, so rows that a
+    // virtualized list renders only while in view are seen too.
+    await scrollThrough(page, DEFAULT_NAMES, seen);
     if (seen.size === DEFAULT_NAMES.length || !(await loadMore(page, DEFAULT_NAMES))) break;
   }
+  for (const name of await visibleItems(page, DEFAULT_NAMES)) seen.add(name);
   expect(DEFAULT_NAMES.filter((n) => !seen.has(n)), 'assets never shown').toEqual([]);
 }
 
@@ -835,7 +965,7 @@ export async function checkBulkDelete(page: Page, options: OpenOptions = {}): Pr
   const outsideItems = page.locator('button, [role=button]').filter({ hasText: /delete|remove/i });
   const labelled = page.getByRole('button', { name: /delete|remove/i });
   const candidates = labelled.or(outsideItems).filter({ visible: true });
-  const index = await candidates.evaluateAll((els, sel) => els.findIndex((el) => !el.closest(sel)), ITEM);
+  const index = await firstOutsideAssetItems(candidates, DEFAULT_NAMES);
   expect(index, 'a visible Delete or Remove control outside the items').toBeGreaterThanOrEqual(0);
   await candidates.nth(index).click();
 

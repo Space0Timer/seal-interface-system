@@ -17,7 +17,7 @@ import {
 test.describe.configure({ mode: 'parallel' });
 
 const at = (query: string) => ({ path: `/?${query}` });
-const STALE = /failed item is still on screen|is still offered|upload summary still reads/;
+const STALE = /failed item is still on screen|is still offered|upload summary reads/;
 const MOUSE_ONLY = /can't be reached with Tab/;
 
 test.describe('broken variants fail', () => {
@@ -42,7 +42,11 @@ test.describe('broken variants fail', () => {
   });
 
   test('stale-summary: the transient check rejects an unchanged summary beside a changing asset count', async ({ page }) => {
-    await expect(checkTransientRecovery(page, at('variant=stale-summary'))).rejects.toThrow(/upload summary still reads \W{1,3}10 of 12 uploaded/);
+    await expect(checkTransientRecovery(page, at('variant=stale-summary'))).rejects.toThrow(/upload summary reads \W{1,3}10 of 12 uploaded\W{1,3}, but 11 of 12/);
+  });
+
+  test('wrong-summary: a summary that claims every file uploaded while one failure remains is rejected', async ({ page }) => {
+    await expect(checkTransientRecovery(page, at('variant=wrong-summary'))).rejects.toThrow(/upload summary reads \W{1,3}12 of 12 uploaded\W{1,3}, but 11 of 12/);
   });
 
   test('fetch-all-later: the large-library check rejects fetching everything after the first render', async ({ page }) => {
@@ -130,6 +134,18 @@ test.describe('valid variations pass', () => {
   test('both failures recover in one batch, in either order', async ({ page }) => {
     await checkBothFailuresRecover(page);
   });
+
+  test('controls reorder when one failure remains: both still recover in one batch', async ({ page }) => {
+    await checkBothFailuresRecover(page, at('reorder-last=1'));
+  });
+
+  test('a virtualized list rendering 5 rows at a time: every asset is reachable', async ({ page }) => {
+    await checkAllAssetsReachable(page, at('virtual=1'));
+  });
+
+  test('"Delete selected" inside a toolbar ul > li: bulk delete finds it', async ({ page }) => {
+    await checkBulkDelete(page, at('toolbar-list=1'));
+  });
 });
 
 test.describe('touch-target measurement', () => {
@@ -142,6 +158,15 @@ test.describe('touch-target measurement', () => {
     const [box] = await measureTouchTargets(page);
     expect(box?.meetsMinimum).toBe(false);
     expect(box?.width).toBeLessThanOrEqual(22);
+  });
+
+  test('a visible label for a hidden file input is measured as the target', async ({ page }) => {
+    await page.setContent(
+      '<input type="file" id="f" hidden>' + '<label for="f" style="display:inline-block;width:30px;height:20px">Add</label>',
+    );
+    const targets = await measureTouchTargets(page);
+    expect(targets).toHaveLength(1);
+    expect(targets[0]).toMatchObject({ label: 'Add', width: 30, height: 20, meetsMinimum: false });
   });
 
   test('a label that wraps its control counts as one target', async ({ page }) => {

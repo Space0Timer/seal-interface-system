@@ -172,8 +172,11 @@ For them to work:
    `role="status"` whose accessible name contains "upload" (for example
    through `aria-label` or `aria-labelledby`). It stays on screen while any
    failure from the batch remains, and its text updates when a failed file
-   is recovered. Other live regions, such as an asset count, don't count as
-   the upload result.
+   is recovered. Its text states, as numerals, how many files from the
+   batch have uploaded and how many files the batch has; any other count
+   it shows is the number still failing. A replacement for a failed file
+   counts as that file. The wording is up to you. Other live regions, such
+   as an asset count, don't count as the upload result.
 8. **More assets load predictably.** If the first page doesn't hold every
    asset, more load either when the list is scrolled to its end, or through
    a pagination button or link. That control sits outside the asset items,

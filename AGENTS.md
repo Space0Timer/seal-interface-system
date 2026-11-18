@@ -281,7 +281,8 @@ Setup:
     size. Every asset must become reachable by scrolling or through a
     pagination control: outside the asset items, not a menu trigger, and
     named "more" or "next". Row actions such as "More actions" are
-    ignored, but a pager's own list (nav > ul > li) is fine.
+    ignored, but a pager's or toolbar's own list (ul > li) is fine.
+    Lists are scrolled a viewport at a time, so virtualized rows are seen.
     Success means new filenames appear, so prefetched pages count.
   - **The large library** is watched for 3 seconds after its first render
     before any interaction. No more than 1,000 assets may be requested in
@@ -299,15 +300,20 @@ Setup:
     - A recovery counts only if, rechecked by filename, the failure is no
       longer shown.
     - The upload summary itself (the status region named "upload…") must
-      stay on screen, because the other failure remains, and its text must
-      change. Other live regions changing doesn't count.
+      report the actual result, after the batch and after each recovery.
+      It must state, as numerals, the files uploaded and the batch size;
+      any other count up to the batch size must be the number still
+      failing. Wording is free. It must stay on screen while a failure
+      remains. Other live regions don't count.
     - At least one working recovery must also work with Tab and Enter.
     - Both failures must be recoverable in one batch, in either order.
       After the first recovery, the other file keeps its failed item and
-      controls.
+      controls. The second recovery's control is found again by label,
+      since controls may reorder.
   - **Touch targets** (mobile projects): every interactive element's
     largest contiguous clickable area is measured; a control and its label
-    merge only when they touch. The result is written to
+    merge only when they touch. A hidden control (such as a file input) is
+    measured through its visible label. The result is written to
     `evals/tests/test-results/<test>-mobile-*/touch-targets.json`, and a
     summary line is printed. This is design-fit evidence for reviewers
     (P6), not a behavior pass or fail.
@@ -325,6 +331,7 @@ Setup:
   - `summary-vanishes`
   - `retry-clears-all`
   - `delete-extra`
+  - `wrong-summary`
 
   These valid variations must pass:
   - 5 per page with prefetching
@@ -332,6 +339,9 @@ Setup:
   - names given only through `aria-labelledby`
   - a "More actions" button on every row
   - "Load more" inside a pagination list
+  - "Delete selected" inside a toolbar list
+  - recovery controls that reorder after the first recovery
+  - a virtualized list that renders 5 rows at a time
 - The owner makes the final call.
 - When conditions disagree, check skill loading, rule interpretation and
   implementation before revising a rule.
