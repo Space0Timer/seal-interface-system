@@ -5,6 +5,7 @@
 import { expect, test } from '@playwright/test';
 import {
   checkAllAssetsReachable,
+  checkBulkDelete,
   checkLargeLibrary,
   checkOversizedRecovery,
   checkSearchFinds,
@@ -14,7 +15,7 @@ import {
 test.describe.configure({ mode: 'parallel' });
 
 const at = (query: string) => ({ path: `/?${query}` });
-const STALE = /failed item is still on screen|is still offered|upload result still reads/;
+const STALE = /failed item is still on screen|is still offered|upload summary still reads/;
 const MOUSE_ONLY = /can't be reached with Tab/;
 
 test.describe('broken variants fail', () => {
@@ -36,6 +37,14 @@ test.describe('broken variants fail', () => {
 
   test('stale-rerender: the oversized check rejects a re-created failure', async ({ page }) => {
     await expect(checkOversizedRecovery(page, at('variant=stale-rerender'))).rejects.toThrow(STALE);
+  });
+
+  test('stale-summary: the transient check rejects an unchanged summary beside a changing asset count', async ({ page }) => {
+    await expect(checkTransientRecovery(page, at('variant=stale-summary'))).rejects.toThrow(/upload summary still reads \W{1,3}10 of 12 uploaded/);
+  });
+
+  test('fetch-all-later: the large-library check rejects fetching everything after the first render', async ({ page }) => {
+    await expect(checkLargeLibrary(page, at('variant=fetch-all-later'))).rejects.toThrow(/assets requested up front/);
   });
 
   test('mouse-only-recovery: the transient check rejects recovery that Tab cannot reach', async ({ page }) => {
@@ -70,5 +79,21 @@ test.describe('valid variations pass', () => {
 
   test('five per page with prefetching: search still finds assets', async ({ page }) => {
     await checkSearchFinds(page, at('page=5&prefetch=1'));
+  });
+
+  test('one per page: search follows result pages to find both invoices', async ({ page }) => {
+    await checkSearchFinds(page, at('page=1'));
+  });
+
+  test('one per page: bulk delete selects across pages', async ({ page }) => {
+    await checkBulkDelete(page, at('page=1'));
+  });
+
+  test('aria-labelledby names with truncated text: every asset is reachable', async ({ page }) => {
+    await checkAllAssetsReachable(page, at('labelledby=1'));
+  });
+
+  test('aria-labelledby names with truncated text: bulk delete finds and selects rows', async ({ page }) => {
+    await checkBulkDelete(page, at('labelledby=1'));
   });
 });

@@ -161,10 +161,12 @@ For them to work:
    name and that file's recovery controls (buttons or links). The controls
    are visible without hovering, can be reached with the Tab key, and work
    with the Enter key.
-7. **Upload results are in a status region.** While a batch's failures are
-   on screen, its result is shown in an element with `role="status"` (or
-   another live region). The region updates when a failed file is
-   recovered.
+7. **The upload result is a named status region.** While a batch's
+   failures are on screen, its result is shown in an element with
+   `role="status"` whose accessible name contains "upload" (for example
+   through `aria-label` or `aria-labelledby`). Its text updates when a
+   failed file is recovered. Other live regions, such as an asset count,
+   don't count as the upload result.
 8. **More assets load predictably.** If the first page doesn't hold every
    asset, more load either when the list is scrolled to its end, or through
    a button or link whose accessible name contains "more" or "next".

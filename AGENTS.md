@@ -273,30 +273,43 @@ Setup:
 - **Checks:**
   - The **initial batch** must send each ordinary file exactly once and
     successfully. Uploads are scored only once every response is in.
+  - **Items are matched by computed accessible name.** That includes
+    `aria-labelledby`, `aria-label` and `title`, as well as text, so a
+    visually truncated filename still counts.
   - **Pagination** starts from whatever renders first, with any page
     size. Every asset must become reachable by scrolling or through a
     "more" or "next" control. Success means new filenames appear, so
     prefetched pages count.
-  - **Search** for "invoice" must show exactly the two invoices, which sit
-    beyond any small first page.
+  - **The large library** is watched for 3 seconds after its first render
+    before any interaction. No more than 1,000 assets may be requested in
+    that window, background fetches included.
+  - **Search** for "invoice" must find exactly the two invoices,
+    following result pages if needed. No page may show anything else.
+  - **Bulk delete** selects across pages if fewer than three assets are
+    shown.
   - **Recovery checks** try every control (and menu item) in a failed
     upload's item, each in a fresh mock session, and judge it by the
     request log.
     - A recovery counts only if, rechecked by filename, the failure is no
       longer shown.
-    - The upload result's earlier status text must also be gone. A new
-      message added next to it doesn't count.
+    - The upload summary itself (the status region named "upload…") must
+      change. Other live regions changing doesn't count.
     - At least one working recovery must also work with Tab and Enter.
 - **Meta tests** prove the checks can fail. These broken variants of the
   conformance app must each fail for the right reason:
   - `retry-everything`
   - `stale-after-recovery`
   - `stale-rerender`
+  - `stale-summary`
   - `mouse-only-recovery`
   - `empty-search`
   - `search-loaded-only`
+  - `fetch-all-later`
 
-  A valid 5-per-page prefetching variation must pass.
+  These valid variations must pass:
+  - 5 per page with prefetching
+  - 1 per page
+  - names given only through `aria-labelledby`
 - The owner makes the final call.
 - When conditions disagree, check skill loading, rule interpretation and
   implementation before revising a rule.

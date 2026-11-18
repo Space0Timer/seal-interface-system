@@ -4,20 +4,25 @@
 // reference and is never given to generators.
 //
 // The page size defaults to 20, below the API default, so the tests must
-// handle pagination.
+// handle pagination. It also shows a live asset count, so the tests must
+// tell the upload summary apart from other live regions.
 //
 // Valid variations, which the meta tests check the shared tests accept:
-//   ?page=<n>     page size
-//   ?prefetch=1   fetch the next page ahead; "Load more" reveals it with no request
+//   ?page=<n>        page size
+//   ?prefetch=1      fetch the next page ahead; "Load more" reveals it with no request
+//   ?labelledby=1    rows show a truncated filename; the full one comes from aria-labelledby
 //
 // Broken variants, which the meta tests check the shared tests reject:
 //   ?variant=retry-everything      Retry for every failure, even oversized files
 //   ?variant=stale-after-recovery  recovery uploads, but the screen doesn't change
 //   ?variant=stale-rerender        recovery uploads, then re-renders the same failure
 //                                  and adds a "Retry sent" message
+//   ?variant=stale-summary         recovery clears the item, the asset count changes,
+//                                  but the upload summary keeps its old text
 //   ?variant=mouse-only-recovery   recovery controls can't be reached with Tab
 //   ?variant=empty-search          any non-empty search shows nothing
 //   ?variant=search-loaded-only    search filters only the pages already loaded
+//   ?variant=fetch-all-later       renders the first page, then fetches all 10,000 in the background
 
 interface Asset {
   id: string;
@@ -34,17 +39,18 @@ interface Upload {
   code?: string;
 }
 
+interface Page {
+  total: number;
+  items: Asset[];
+}
+
 const LIMIT_BYTES = 100 * 1024 * 1024;
 const params = new URLSearchParams(location.search);
 const PAGE = Number(params.get('page') ?? 20);
 const prefetch = params.get('prefetch') === '1';
+const labelledBy = params.get('labelledby') === '1';
 const variant = params.get('variant');
-const retryEverything = variant === 'retry-everything';
-const staleAfterRecovery = variant === 'stale-after-recovery';
-const staleRerender = variant === 'stale-rerender';
-const mouseOnlyRecovery = variant === 'mouse-only-recovery';
-const emptySearch = variant === 'empty-search';
-const searchLoadedOnly = variant === 'search-loaded-only';
+const is = (name: string) => variant === name;
 
 const state = {
   query: '',
@@ -52,10 +58,13 @@ const state = {
   total: 0,
   /** Everything loaded without a query, for search-loaded-only. */
   loaded: [] as Asset[],
-  /** A prefetched next page. */
-  buffer: [] as Asset[],
+  /** A prefetched page, valid only for the query and offset it was fetched for. */
+  buffer: null as { query: string; offset: number; items: Asset[] } | null,
+  /** Increments on every fresh load, so responses for an older list are dropped. */
+  generation: 0,
   selected: new Set<string>(),
   uploads: [] as Upload[],
+  frozenSummary: null as string | null,
   nextKey: 1,
 };
 
@@ -76,6 +85,7 @@ const upload = el('input', { type: 'file', multiple: '', 'aria-label': 'Upload f
 const uploadsRegion = el('section', { 'aria-label': 'Uploads' });
 const selectionRegion = el('div');
 const listRegion = el('div');
+const fullNames = el('div', { hidden: '' });
 
 document.body.append(
   el(
@@ -87,47 +97,72 @@ document.body.append(
     ' ',
     el('a', { href: '#' }, 'Settings'),
   ),
-  el('main', {}, el('h1', {}, 'Assets'), search, ' ', upload, uploadsRegion, selectionRegion, listRegion),
+  el('main', {}, el('h1', {}, 'Assets'), search, ' ', upload, uploadsRegion, selectionRegion, listRegion, fullNames),
 );
 
-async function fetchPage(offset: number): Promise<{ total: number; items: Asset[] }> {
-  const query = new URLSearchParams({ offset: String(offset), limit: String(PAGE) });
-  if (state.query) query.set('q', state.query);
-  const res = await fetch(`/api/assets?${query}`);
-  return (await res.json()) as { total: number; items: Asset[] };
+async function fetchPage(query: string, offset: number, limit = PAGE): Promise<Page> {
+  const q = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+  if (query) q.set('q', query);
+  const res = await fetch(`/api/assets?${q}`);
+  return (await res.json()) as Page;
 }
 
 async function load(append = false): Promise<void> {
-  if (state.query && (emptySearch || searchLoadedOnly)) {
-    const q = state.query.toLowerCase();
-    state.items = emptySearch ? [] : state.loaded.filter((a) => a.filename.toLowerCase().includes(q));
+  const query = state.query;
+  if (query && (is('empty-search') || is('search-loaded-only'))) {
+    const q = query.toLowerCase();
+    state.items = is('empty-search') ? [] : state.loaded.filter((a) => a.filename.toLowerCase().includes(q));
     state.total = state.items.length;
     renderList();
     return;
   }
-  if (append && state.buffer.length) {
-    state.items = [...state.items, ...state.buffer];
-    state.buffer = [];
-  } else {
-    if (!append) state.buffer = [];
-    const page = await fetchPage(append ? state.items.length : 0);
-    state.items = append ? [...state.items, ...page.items] : page.items;
-    state.total = page.total;
+
+  if (!append) {
+    state.generation++;
+    state.buffer = null;
   }
-  if (!state.query) state.loaded = state.items;
+  const generation = state.generation;
+  const offset = append ? state.items.length : 0;
+  const buffered = state.buffer?.query === query && state.buffer.offset === offset ? state.buffer.items : null;
+  state.buffer = null;
+  const page = buffered ? { total: state.total, items: buffered } : await fetchPage(query, offset);
+  if (generation !== state.generation || state.query !== query) return;
+
+  state.items = append ? [...state.items, ...page.items] : page.items;
+  state.total = page.total;
+  if (!query) state.loaded = state.items;
   renderList();
-  if (prefetch && state.items.length < state.total && state.buffer.length === 0) {
-    state.buffer = (await fetchPage(state.items.length)).items;
+
+  const next = state.items.length;
+  if (prefetch && next < state.total) {
+    const items = (await fetchPage(query, next)).items;
+    if (generation === state.generation && state.query === query && state.items.length === next) {
+      state.buffer = { query, offset: next, items };
+    }
+  }
+  if (is('fetch-all-later') && !append && !query) {
+    window.setTimeout(async () => {
+      for (let o = 0; o < state.total; o += 200) await fetchPage('', o, 200);
+    }, 300);
   }
 }
 
+function filenameCell(asset: Asset): HTMLElement {
+  if (!labelledBy) return el('td', {}, asset.filename);
+  // Truncated in the DOM; the full name is only in the accessible name.
+  return el('td', {}, asset.filename.length > 14 ? `${asset.filename.slice(0, 12)}…` : asset.filename);
+}
+
 function renderList(): void {
+  const count = el('p', { role: 'status' }, `${state.total} assets`);
   if (state.items.length === 0) {
-    listRegion.replaceChildren(el('p', {}, state.query ? `No results for "${state.query}".` : 'No assets.'));
+    listRegion.replaceChildren(count, el('p', {}, state.query ? `No results for "${state.query}".` : 'No assets.'));
     return;
   }
+  if (labelledBy) fullNames.replaceChildren(...state.items.map((a) => el('span', { id: `name-${a.id}` }, a.filename)));
   const rows = state.items.map((asset) => {
-    const box = el('input', { type: 'checkbox', 'aria-label': `Select ${asset.filename}` });
+    const name = labelledBy ? { 'aria-labelledby': `name-${asset.id}` } : { 'aria-label': `Select ${asset.filename}` };
+    const box = el('input', { type: 'checkbox', ...name });
     box.checked = state.selected.has(asset.id);
     box.addEventListener('change', () => {
       if (box.checked) state.selected.add(asset.id);
@@ -136,9 +171,9 @@ function renderList(): void {
     });
     return el(
       'tr',
-      {},
+      labelledBy ? { 'aria-labelledby': `name-${asset.id}` } : {},
       el('td', {}, box),
-      el('td', {}, asset.filename),
+      filenameCell(asset),
       el('td', {}, asset.mimeType),
       el('td', {}, String(asset.sizeBytes)),
       el('td', {}, asset.updatedAt),
@@ -150,7 +185,7 @@ function renderList(): void {
     el('thead', {}, el('tr', {}, el('th', {}, 'Select'), el('th', {}, 'Name'), el('th', {}, 'Type'), el('th', {}, 'Bytes'), el('th', {}, 'Updated'))),
     el('tbody', {}, ...rows),
   );
-  const children: Node[] = [table];
+  const children: Node[] = [count, table];
   if (state.items.length < state.total) {
     const more = el('button', { type: 'button' }, 'Load more');
     more.addEventListener('click', () => void load(true));
@@ -177,7 +212,7 @@ function renderSelection(): void {
 async function send(entry: Upload): Promise<void> {
   entry.status = 'pending';
   delete entry.code;
-  if (entry.file.size > LIMIT_BYTES && !retryEverything) {
+  if (entry.file.size > LIMIT_BYTES && !is('retry-everything')) {
     entry.status = 'failed';
     entry.code = 'file_too_large';
     return;
@@ -206,8 +241,8 @@ function renderUploads(): void {
     const actions: HTMLElement[] = [];
     const snapshot = { file: entry.file, code: entry.code };
     const recovered = async () => {
-      if (staleAfterRecovery) return;
-      if (staleRerender) {
+      if (is('stale-after-recovery')) return;
+      if (is('stale-rerender')) {
         // The upload succeeded, but the screen re-creates the same failure.
         entry.file = snapshot.file;
         entry.status = 'failed';
@@ -219,8 +254,8 @@ function renderUploads(): void {
       renderUploads();
       await load();
     };
-    const keyboard = mouseOnlyRecovery ? { tabindex: '-1' } : {};
-    if (entry.code === 'file_too_large' && !retryEverything) {
+    const keyboard = is('mouse-only-recovery') ? { tabindex: '-1' } : {};
+    if (entry.code === 'file_too_large' && !is('retry-everything')) {
       const choose = el('button', { type: 'button', ...keyboard }, 'Choose another file');
       const picker = el('input', { type: 'file', hidden: '' });
       choose.addEventListener('click', () => picker.click());
@@ -248,7 +283,14 @@ function renderUploads(): void {
     actions.push(dismiss);
     return el('li', {}, `${entry.file.name}: ${entry.code ?? ''} `, ...actions);
   });
-  uploadsRegion.replaceChildren(el('p', { role: 'status' }, `${done} of ${state.uploads.length} uploaded`), el('ul', {}, ...items));
+
+  let summary = `${done} of ${state.uploads.length} uploaded`;
+  if (is('stale-summary')) {
+    // Freeze the first finished summary, so recovery never updates it.
+    if (state.frozenSummary === null && !state.uploads.some((u) => u.status === 'pending')) state.frozenSummary = summary;
+    summary = state.frozenSummary ?? summary;
+  }
+  uploadsRegion.replaceChildren(el('p', { role: 'status', 'aria-label': 'Upload results' }, summary), el('ul', {}, ...items));
 }
 
 upload.addEventListener('change', async () => {
@@ -256,6 +298,7 @@ upload.addEventListener('change', async () => {
   upload.value = '';
   const entries = files.map((file): Upload => ({ key: state.nextKey++, file, status: 'pending' }));
   state.uploads = entries;
+  state.frozenSummary = null;
   renderUploads();
   await Promise.all(entries.map(send));
   renderUploads();

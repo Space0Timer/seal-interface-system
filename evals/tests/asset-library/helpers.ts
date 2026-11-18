@@ -13,6 +13,7 @@ import {
   REPLACEMENT_FILE,
   TRANSIENT_FAILURE_FILENAME,
   UPLOAD_BATCH,
+  type Asset,
   type Scenario,
 } from '../../fixtures/src/data.ts';
 import { writeUploadFiles } from '../../fixtures/src/files.ts';
@@ -23,7 +24,6 @@ export const DEFAULT_NAMES = DEFAULT_ASSETS.map((a) => a.filename);
 
 export const ITEM = 'tr, li, [role=row], [role=listitem], [role=option]';
 const CONTROL = 'button, a[href], [role=button], [role=link]';
-const STATUS = '[role=status], [role=alert], [aria-live]:not([aria-live="off"]), output';
 const BATCH_NAMES = UPLOAD_BATCH.map((f) => f.filename);
 
 export interface OpenOptions {
@@ -48,22 +48,64 @@ export function uploadsIn(entries: LogEntry[]): LogEntry[] {
   return entries.filter((e) => e.path === '/api/uploads');
 }
 
-/** The list item for an asset: a row, list item or option containing the full filename. */
+/**
+ * The list item for an asset: a row, option or list item whose computed
+ * accessible name contains the full filename, or whose text does.
+ */
 export function libraryItem(page: Page, filename: string): Locator {
+  const byName = page
+    .getByRole('row', { name: filename })
+    .or(page.getByRole('option', { name: filename }))
+    .or(page.getByRole('listitem', { name: filename }));
   const byText = page.locator(ITEM).filter({ hasText: filename });
-  const byLabel = page.locator(ITEM).and(page.locator(`[aria-label*=${JSON.stringify(filename)}]`));
-  return byText.or(byLabel).last();
+  return byName.or(byText).last();
 }
 
-/** Filenames from the given list that currently appear, in full, in rendered items. In list order. */
+/** For each filename, the other filenames that contain it (a.png is inside …-cta.png). */
+const containersCache = new WeakMap<readonly string[], string[][]>();
+function containersOf(filenames: readonly string[]): string[][] {
+  let cached = containersCache.get(filenames);
+  if (!cached) {
+    cached = filenames.map((name) => filenames.filter((other) => other !== name && other.includes(name)));
+    containersCache.set(filenames, cached);
+  }
+  return cached;
+}
+
+/**
+ * Filenames from the given list that currently appear, in full, in rendered
+ * items. In list order. An item's text includes its accessible-name sources:
+ * text content, and aria-labelledby, aria-label and title on the item or its
+ * descendants. A filename that only appears inside a longer filename
+ * doesn't count.
+ */
 export async function visibleItems(page: Page, filenames: readonly string[]): Promise<string[]> {
   return page.evaluate(
-    ([selector, names]) => {
+    ([selector, names, containers]) => {
+      const nameSources = (el: Element): string => {
+        const parts = [el.textContent ?? ''];
+        for (const node of [el, ...el.querySelectorAll('[aria-label], [aria-labelledby], [title]')]) {
+          for (const attr of ['aria-label', 'title']) {
+            const value = node.getAttribute(attr);
+            if (value) parts.push(value);
+          }
+          for (const id of (node.getAttribute('aria-labelledby') ?? '').split(/\s+/).filter(Boolean)) {
+            parts.push(document.getElementById(id)?.textContent ?? '');
+          }
+        }
+        return parts.join('\n');
+      };
       const items = [...document.querySelectorAll<HTMLElement>(selector)].filter((el) => el.getClientRects().length > 0);
-      const texts = items.map((el) => `${el.textContent ?? ''} ${el.getAttribute('aria-label') ?? ''}`);
-      return names.filter((name) => texts.some((t) => t.includes(name)));
+      const texts = items.map(nameSources);
+      return names.filter((name, i) =>
+        texts.some((text) => {
+          let rest = text;
+          for (const longer of containers[i] ?? []) rest = rest.split(longer).join('\n');
+          return rest.includes(name);
+        }),
+      );
     },
-    [ITEM, filenames] as const,
+    [ITEM, filenames, containersOf(filenames)] as const,
   );
 }
 
@@ -130,14 +172,16 @@ export async function isSelected(item: Locator): Promise<boolean> {
   return (await item.getAttribute('aria-selected')) === 'true';
 }
 
-/** Text of each visible status or live region (outermost regions only). */
-export async function statusTexts(page: Page): Promise<string[]> {
-  return page.evaluate((selector) => {
-    const regions = [...document.querySelectorAll<HTMLElement>(selector)].filter(
-      (el) => el.getClientRects().length > 0 && !el.parentElement?.closest(selector),
-    );
-    return regions.map((el) => el.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean);
-  }, STATUS);
+/** The upload result: a status region whose accessible name contains "upload" (brief requirement 7). */
+export function uploadSummary(page: Page): Locator {
+  return page.getByRole('status', { name: /upload/i }).filter({ visible: true }).first();
+}
+
+/** The upload summary's text, normalized, or null if it isn't on screen. */
+async function summaryText(page: Page): Promise<string | null> {
+  const summary = uploadSummary(page);
+  if ((await summary.count()) === 0) return null;
+  return (await summary.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -194,7 +238,9 @@ export async function uploadBatch(page: Page): Promise<void> {
   for (const filename of [TRANSIENT_FAILURE_FILENAME, OVERSIZED_FILENAME]) {
     await expect.poll(() => markScope(page, filename), { message: `no failed item with controls for ${filename}` }).not.toBeNull();
   }
-  await expect.poll(async () => (await statusTexts(page)).length, { message: 'the upload result is shown in a status region' }).toBeGreaterThan(0);
+  await expect
+    .poll(() => summaryText(page), { message: 'the upload result is in a status region named "upload…" (brief requirement 7)' })
+    .toBeTruthy();
 }
 
 /**
@@ -348,28 +394,24 @@ interface Attempt {
 
 /**
  * After a successful recovery request, the screen must stop reporting the
- * failure (checked afresh, by filename) and the upload result must change:
- * some status text shown before, other than a message about this file
- * alone, is gone. A new message added next to an unchanged result doesn't
- * count.
+ * failure (checked afresh, by filename) and the upload summary itself (the
+ * status region named "upload…") must read differently or be gone. Other
+ * live regions changing, such as an asset count, don't count.
  */
 async function waitUntilCleared(
   page: Page,
   filename: string,
   itemText: string,
-  statusBefore: string[],
+  summaryBefore: string | null,
   usedLabel: string | null,
 ): Promise<string | null> {
-  const results = statusBefore.filter((t) => !t.includes(filename));
-  const watched = results.length ? results : statusBefore;
   let reason = '';
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     const still = await failureStillShown(page, filename, itemText, usedLabel);
-    const after = await statusTexts(page);
-    const resultChanged = watched.some((t) => !after.includes(t));
-    if (!still && resultChanged) return null;
-    reason = [still, !resultChanged && `the upload result still reads "${watched.join(' / ')}"`].filter(Boolean).join(' and ');
+    const summaryChanged = (await summaryText(page)) !== summaryBefore;
+    if (!still && summaryChanged) return null;
+    reason = [still, !summaryChanged && `the upload summary still reads "${summaryBefore}"`].filter(Boolean).join(' and ');
     await page.waitForTimeout(200);
   }
   return reason;
@@ -391,7 +433,7 @@ async function attempt(
   const controlLabel = await labelOf(control);
   let label = controlLabel;
   const itemText = await scope.innerText();
-  const statusBefore = await statusTexts(page);
+  const summaryBefore = await summaryText(page);
   const before = uploadsIn(await mockLog(page)).length;
   const notReached: Attempt = { label, via, reachedByKeyboard: false, uploads: [], chooserOpened: false, notCleared: null };
 
@@ -424,7 +466,7 @@ async function attempt(
   const uploads = uploadsIn(await settleUploads(page, before)).slice(before);
   const succeeded = uploads.some((u) => u.status === 201);
   const notCleared = succeeded
-    ? await waitUntilCleared(page, filename, itemText, statusBefore, path.length === 1 ? controlLabel : null)
+    ? await waitUntilCleared(page, filename, itemText, summaryBefore, path.length === 1 ? controlLabel : null)
     : null;
   return { label, via, reachedByKeyboard: true, uploads, chooserOpened: opened !== null, notCleared };
 }
@@ -535,14 +577,23 @@ const LARGE_SCAN = assetsFor('large')
   .slice(0, 2_000)
   .map((a) => a.filename);
 
-/** The large library renders, doesn't fetch everything up front, and reaches a later page. */
+/** How long after the first assets render that requests still count as up-front loading. */
+const STARTUP_WINDOW_MS = 3_000;
+
+/**
+ * The large library renders, doesn't fetch everything up front (including
+ * in the background after the first rows appear), and reaches a later page.
+ */
 export async function checkLargeLibrary(page: Page, options: OpenOptions = {}): Promise<void> {
   await openLibrary(page, 'large', options);
   await expect.poll(async () => (await visibleItems(page, LARGE_SCAN)).length, { timeout: 5_000, message: 'assets render' }).toBeGreaterThan(0);
+  // Watch the whole startup window before any interaction, so background
+  // fetching that starts after the first render is counted too.
+  await page.waitForTimeout(STARTUP_WINDOW_MS);
   const requested = (await mockLog(page))
     .filter((e) => e.path === '/api/assets')
     .reduce((sum, e) => sum + Math.min(Number(e.query['limit'] ?? 50), 200), 0);
-  expect(requested, 'assets requested up front').toBeLessThanOrEqual(1_000);
+  expect(requested, `assets requested up front (within ${STARTUP_WINDOW_MS / 1000} s of the first render)`).toBeLessThanOrEqual(1_000);
 
   const furthest = async () => Math.max(-1, ...(await visibleItems(page, LARGE_SCAN)).map((n) => LARGE_SCAN.indexOf(n)));
   const before = await furthest();
@@ -550,11 +601,67 @@ export async function checkLargeLibrary(page: Page, options: OpenOptions = {}): 
   await expect.poll(furthest, { message: 'assets from a later page appear' }).toBeGreaterThan(before);
 }
 
-/** A search finds matching assets that aren't on the first page, and only those. */
+/**
+ * Searching "invoice" finds both invoices, which sit beyond any small first
+ * page, following result pages if needed, and no page shows anything else.
+ */
 export async function checkSearchFinds(page: Page, options: OpenOptions = {}): Promise<void> {
   await openLibrary(page, 'default', options);
   await waitForItems(page, DEFAULT_NAMES);
   await searchField(page).fill('invoice');
   const expected = DEFAULT_NAMES.filter((n) => n.includes('invoice'));
-  await expect.poll(() => visibleItems(page, DEFAULT_NAMES), { message: 'items shown for "invoice"' }).toEqual(expected);
+  const onlyMatches = async () => {
+    const shown = await visibleItems(page, DEFAULT_NAMES);
+    return shown.length > 0 && shown.every((n) => expected.includes(n));
+  };
+  await expect.poll(onlyMatches, { message: 'items shown for "invoice"' }).toBe(true);
+
+  const found = new Set<string>();
+  for (let i = 0; i <= expected.length; i++) {
+    const shown = await visibleItems(page, DEFAULT_NAMES);
+    expect(shown.filter((n) => !expected.includes(n)), 'unrelated assets shown for "invoice"').toEqual([]);
+    for (const name of shown) found.add(name);
+    if (found.size === expected.length || !(await loadMore(page, DEFAULT_NAMES))) break;
+  }
+  expect([...found].sort(), 'matches found for "invoice"').toEqual([...expected].sort());
+}
+
+/**
+ * Selects three assets, loading more pages if fewer are shown, then deletes
+ * them together with one Delete or Remove control outside the items.
+ */
+export async function checkBulkDelete(page: Page, options: OpenOptions = {}): Promise<void> {
+  await openLibrary(page, 'default', options);
+  await waitForItems(page, DEFAULT_NAMES);
+  const targets: Asset[] = [];
+  for (let i = 0; i < 10 && targets.length < 3; i++) {
+    const shown = await visibleItems(page, DEFAULT_NAMES);
+    for (const asset of DEFAULT_ASSETS) {
+      if (targets.length === 3) break;
+      if (!shown.includes(asset.filename) || targets.includes(asset)) continue;
+      const item = libraryItem(page, asset.filename);
+      await selectItem(item);
+      expect(await isSelected(item), `${asset.filename} reports selected`).toBe(true);
+      targets.push(asset);
+    }
+    if (targets.length < 3 && !(await loadMore(page, DEFAULT_NAMES))) break;
+  }
+  expect(targets.map((a) => a.filename), 'three assets could be selected').toHaveLength(3);
+
+  const outsideItems = page.locator('button, [role=button]').filter({ hasText: /delete|remove/i });
+  const labelled = page.getByRole('button', { name: /delete|remove/i });
+  const candidates = labelled.or(outsideItems).filter({ visible: true });
+  const index = await candidates.evaluateAll((els, sel) => els.findIndex((el) => !el.closest(sel)), ITEM);
+  expect(index, 'a visible Delete or Remove control outside the items').toBeGreaterThanOrEqual(0);
+  await candidates.nth(index).click();
+
+  const dialog = page.getByRole('dialog').or(page.getByRole('alertdialog')).filter({ visible: true });
+  if (await dialog.count()) await dialog.getByRole('button', { name: /delete|remove/i }).first().click();
+
+  await expect
+    .poll(async () => (await mockLog(page)).find((e) => e.path === '/api/assets/delete')?.ids?.slice().sort(), {
+      message: 'one delete request with the three selected assets',
+    })
+    .toEqual(targets.map((a) => a.id).sort());
+  await expect.poll(() => visibleItems(page, targets.map((a) => a.filename))).toEqual([]);
 }

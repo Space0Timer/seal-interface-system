@@ -1,16 +1,14 @@
 import { expect, test } from '@playwright/test';
-import { DEFAULT_ASSETS, NO_RESULTS_QUERY } from '../../fixtures/src/data.ts';
+import { NO_RESULTS_QUERY } from '../../fixtures/src/data.ts';
 import {
   checkAllAssetsReachable,
+  checkBulkDelete,
   checkLargeLibrary,
   checkSearchFinds,
   DEFAULT_NAMES,
-  isSelected,
   libraryItem,
-  mockLog,
   openLibrary,
   searchField,
-  selectItem,
   settleUploads,
   uploadFiles,
   visibleItems,
@@ -57,29 +55,5 @@ test('no results: a search with no matches shows no items, and clearing it resto
 });
 
 test('multi-select: three selected assets are deleted together', async ({ page }) => {
-  await openLibrary(page, 'default');
-  const rendered = await waitForItems(page, DEFAULT_NAMES);
-  const targets = DEFAULT_ASSETS.filter((a) => rendered.includes(a.filename)).slice(0, 3);
-  expect(targets, 'at least three assets on the first page').toHaveLength(3);
-  for (const asset of targets) {
-    const item = libraryItem(page, asset.filename);
-    await selectItem(item);
-    expect(await isSelected(item), `${asset.filename} reports selected`).toBe(true);
-  }
-
-  const outsideItems = page.locator('button, [role=button]').filter({ hasText: /delete|remove/i });
-  const labelled = page.getByRole('button', { name: /delete|remove/i });
-  const candidates = labelled.or(outsideItems).filter({ visible: true });
-  const itemSelector = 'tr, li, [role=row], [role=listitem], [role=option]';
-  const index = await candidates.evaluateAll((els, sel) => els.findIndex((el) => !el.closest(sel)), itemSelector);
-  expect(index, 'a visible Delete or Remove control outside the items').toBeGreaterThanOrEqual(0);
-  await candidates.nth(index).click();
-
-  const dialog = page.getByRole('dialog').or(page.getByRole('alertdialog')).filter({ visible: true });
-  if (await dialog.count()) await dialog.getByRole('button', { name: /delete|remove/i }).first().click();
-
-  await expect
-    .poll(async () => (await mockLog(page)).find((e) => e.path === '/api/assets/delete')?.ids?.slice().sort())
-    .toEqual(targets.map((a) => a.id).sort());
-  await expect.poll(() => visibleItems(page, targets.map((a) => a.filename))).toEqual([]);
+  await checkBulkDelete(page);
 });
