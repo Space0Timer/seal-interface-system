@@ -279,8 +279,9 @@ Setup:
     visually truncated filename still counts.
   - **Pagination** starts from whatever renders first, with any page
     size. Every asset must become reachable by scrolling or through a
-    pagination control: outside the items, not a menu trigger, and named
-    "more" or "next". Row actions such as "More actions" are ignored.
+    pagination control: outside the asset items, not a menu trigger, and
+    named "more" or "next". Row actions such as "More actions" are
+    ignored, but a pager's own list (nav > ul > li) is fine.
     Success means new filenames appear, so prefetched pages count.
   - **The large library** is watched for 3 seconds after its first render
     before any interaction. No more than 1,000 assets may be requested in
@@ -289,7 +290,9 @@ Setup:
   - **Search** for "invoice" must find exactly the two invoices,
     following result pages if needed. No page may show anything else.
   - **Bulk delete** selects across pages if fewer than three assets are
-    shown.
+    shown. All delete requests in the interaction together must remove
+    exactly the selected assets, and every other asset must remain in the
+    mock library.
   - **Recovery checks** try every control (and menu item) in a failed
     upload's item, each in a fresh mock session, and judge it by the
     request log.
@@ -299,10 +302,15 @@ Setup:
       stay on screen, because the other failure remains, and its text must
       change. Other live regions changing doesn't count.
     - At least one working recovery must also work with Tab and Enter.
+    - Both failures must be recoverable in one batch, in either order.
+      After the first recovery, the other file keeps its failed item and
+      controls.
   - **Touch targets** (mobile projects): every interactive element's
-    clickable size is attached as `touch-targets.json`, with an annotation
-    counting targets under 44 × 44 px. This is design-fit evidence for
-    reviewers (P6), not a behavior pass or fail.
+    largest contiguous clickable area is measured; a control and its label
+    merge only when they touch. The result is written to
+    `evals/tests/test-results/<test>-mobile-*/touch-targets.json`, and a
+    summary line is printed. This is design-fit evidence for reviewers
+    (P6), not a behavior pass or fail.
 - **Meta tests** prove the checks can fail. These broken variants of the
   conformance app must each fail for the right reason:
   - `retry-everything`
@@ -315,12 +323,15 @@ Setup:
   - `fetch-all-later`
   - `json-body`
   - `summary-vanishes`
+  - `retry-clears-all`
+  - `delete-extra`
 
   These valid variations must pass:
   - 5 per page with prefetching
   - 1 per page
   - names given only through `aria-labelledby`
   - a "More actions" button on every row
+  - "Load more" inside a pagination list
 - The owner makes the final call.
 - When conditions disagree, check skill loading, rule interpretation and
   implementation before revising a rule.

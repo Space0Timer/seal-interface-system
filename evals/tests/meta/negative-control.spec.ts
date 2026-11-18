@@ -5,7 +5,9 @@
 import { expect, test } from '@playwright/test';
 import {
   checkAllAssetsReachable,
+  checkBothFailuresRecover,
   checkBulkDelete,
+  measureTouchTargets,
   checkLargeLibrary,
   checkOversizedRecovery,
   checkSearchFinds,
@@ -45,6 +47,14 @@ test.describe('broken variants fail', () => {
 
   test('fetch-all-later: the large-library check rejects fetching everything after the first render', async ({ page }) => {
     await expect(checkLargeLibrary(page, at('variant=fetch-all-later'))).rejects.toThrow(/assets requested up front/);
+  });
+
+  test('retry-clears-all: a recovery that makes the other failure unrecoverable is rejected', async ({ page }) => {
+    await expect(checkBothFailuresRecover(page, at('variant=retry-clears-all'))).rejects.toThrow(/still has a failed item with recovery controls/);
+  });
+
+  test('delete-extra: bulk delete that also removes an unselected asset is rejected', async ({ page }) => {
+    await expect(checkBulkDelete(page, at('variant=delete-extra'))).rejects.toThrow(/assets deleted across the interaction|unselected assets no longer in the library/);
   });
 
   test('json-body: uploads that lose the file contents are rejected', async ({ page }) => {
@@ -111,6 +121,33 @@ test.describe('valid variations pass', () => {
 
   test('"More actions" on every row: transient recovery still passes', async ({ page }) => {
     await checkTransientRecovery(page, at('row-actions=1'));
+  });
+
+  test('"Load more" inside a pagination nav > ul > li: every asset is reachable', async ({ page }) => {
+    await checkAllAssetsReachable(page, at('pager-nav=1'));
+  });
+
+  test('both failures recover in one batch, in either order', async ({ page }) => {
+    await checkBothFailuresRecover(page);
+  });
+});
+
+test.describe('touch-target measurement', () => {
+  test('the gap between a small checkbox and a separate label is not counted', async ({ page }) => {
+    await page.setContent(
+      '<input type="checkbox" id="c" style="width:16px;height:16px;margin:0">' +
+        '<span style="display:inline-block;width:80px"></span>' +
+        '<label for="c" style="display:inline-block;width:22px;height:18px">On</label>',
+    );
+    const [box] = await measureTouchTargets(page);
+    expect(box?.meetsMinimum).toBe(false);
+    expect(box?.width).toBeLessThanOrEqual(22);
+  });
+
+  test('a label that wraps its control counts as one target', async ({ page }) => {
+    await page.setContent('<label style="display:inline-block;padding:14px"><input type="checkbox" style="width:16px;height:16px;margin:0"> On</label>');
+    const [box] = await measureTouchTargets(page);
+    expect(box?.meetsMinimum).toBe(true);
   });
 });
 

@@ -145,18 +145,37 @@ export async function loadMore(page: Page, filenames: readonly string[]): Promis
 
   // The pagination control (brief requirement 8): outside the asset items,
   // not a menu trigger, named "more" or "next". Row actions such as
-  // "More actions" are skipped.
+  // "More actions" are skipped, but a pager's own list (nav > ul > li) is
+  // fine: only items that are assets (they name a file or carry selection)
+  // disqualify a control.
   const candidates = page
     .getByRole('button', { name: /more|next/i })
     .or(page.getByRole('link', { name: /more|next/i }))
     .filter({ visible: true });
   const index = await candidates.evaluateAll(
-    (els, itemSelector) =>
-      els.findIndex((el) => {
+    (els, [itemSelector, names]) => {
+      const isAssetItem = (item: Element): boolean => {
+        if (item.querySelector('input[type=checkbox], [role=checkbox]') || item.hasAttribute('aria-selected')) return true;
+        const sources = [item.textContent ?? ''];
+        for (const node of [item, ...item.querySelectorAll('[aria-label], [aria-labelledby]')]) {
+          sources.push(node.getAttribute('aria-label') ?? '');
+          for (const id of (node.getAttribute('aria-labelledby') ?? '').split(/\s+/).filter(Boolean)) {
+            sources.push(document.getElementById(id)?.textContent ?? '');
+          }
+        }
+        const text = sources.join('\n');
+        return names.some((name) => text.includes(name));
+      };
+      return els.findIndex((el) => {
         const popup = el.getAttribute('aria-haspopup');
-        return !el.closest(itemSelector) && (popup === null || popup === 'false');
-      }),
-    ITEM,
+        if (popup !== null && popup !== 'false') return false;
+        for (let item = el.closest(itemSelector); item; item = item.parentElement?.closest(itemSelector) ?? null) {
+          if (isAssetItem(item)) return false;
+        }
+        return true;
+      });
+    },
+    [ITEM, filenames] as const,
   );
   if (index < 0) return false;
   await candidates.nth(index).click({ timeout: 10_000 });
@@ -204,16 +223,32 @@ export async function measureTouchTargets(page: Page): Promise<TouchTarget[]> {
     const targets: TouchTarget[] = [];
     for (const el of document.querySelectorAll<HTMLElement>(selector)) {
       if (el.getClientRects().length === 0) continue;
-      const rects = [el.getBoundingClientRect()];
-      for (const label of (el as HTMLInputElement).labels ?? []) rects.push(label.getBoundingClientRect());
-      const visible = rects.filter((r) => r.width > 0 && r.height > 0);
-      if (visible.length === 0) continue;
-      const left = Math.min(...visible.map((r) => r.left));
-      const right = Math.max(...visible.map((r) => r.right));
-      const top = Math.min(...visible.map((r) => r.top));
-      const bottom = Math.max(...visible.map((r) => r.bottom));
-      const width = Math.round((right - left) * 10) / 10;
-      const height = Math.round((bottom - top) * 10) / 10;
+      // The control and its labels are each clickable. Merge only boxes that
+      // touch or overlap, so a gap between a checkbox and a separate label
+      // never counts as target area. Report the largest contiguous area.
+      type Box = { left: number; right: number; top: number; bottom: number };
+      const boxes: Box[] = [el.getBoundingClientRect(), ...[...((el as HTMLInputElement).labels ?? [])].map((l) => l.getBoundingClientRect())]
+        .filter((r) => r.width > 0 && r.height > 0)
+        .map((r) => ({ left: r.left, right: r.right, top: r.top, bottom: r.bottom }));
+      if (boxes.length === 0) continue;
+      const touch = (a: Box, b: Box) => a.left <= b.right + 0.5 && b.left <= a.right + 0.5 && a.top <= b.bottom + 0.5 && b.top <= a.bottom + 0.5;
+      for (let merged = true; merged; ) {
+        merged = false;
+        for (let i = 0; i < boxes.length && !merged; i++) {
+          for (let j = i + 1; j < boxes.length && !merged; j++) {
+            const a = boxes[i]!;
+            const b = boxes[j]!;
+            if (!touch(a, b)) continue;
+            boxes[i] = { left: Math.min(a.left, b.left), right: Math.max(a.right, b.right), top: Math.min(a.top, b.top), bottom: Math.max(a.bottom, b.bottom) };
+            boxes.splice(j, 1);
+            merged = true;
+          }
+        }
+      }
+      const size = (b: Box) => Math.min(b.right - b.left, b.bottom - b.top);
+      const best = boxes.reduce((x, y) => (size(y) > size(x) ? y : x));
+      const width = Math.round((best.right - best.left) * 10) / 10;
+      const height = Math.round((best.bottom - best.top) * 10) / 10;
       const label = (el.getAttribute('aria-label') ?? el.innerText ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
       targets.push({ label, tag: el.tagName.toLowerCase(), width, height, meetsMinimum: width >= min && height >= min });
     }
@@ -454,9 +489,9 @@ interface Attempt {
 /**
  * After a successful recovery request, the screen must stop reporting the
  * failure (checked afresh, by filename). The upload summary itself (the
- * status region named "upload…") must still be on screen, because the other
- * failure remains, and must read differently. Other live regions changing,
- * such as an asset count, don't count.
+ * status region named "upload…") must read differently. While another
+ * failure remains it must also still be on screen; after the last one it
+ * may go. Other live regions changing, such as an asset count, don't count.
  */
 async function waitUntilCleared(
   page: Page,
@@ -464,16 +499,18 @@ async function waitUntilCleared(
   itemText: string,
   summaryBefore: string | null,
   usedLabel: string | null,
+  failureRemains: boolean,
 ): Promise<string | null> {
   let reason = '';
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     const still = await failureStillShown(page, filename, itemText, usedLabel);
-    // The other failure is still on screen, so the summary must be too.
     const summary = await summaryText(page);
     const summaryProblem =
       summary === null || summary === ''
-        ? 'the upload summary is gone although a failure remains'
+        ? failureRemains
+          ? 'the upload summary is gone although a failure remains'
+          : null
         : summary === summaryBefore
           ? `the upload summary still reads "${summaryBefore}"`
           : null;
@@ -495,6 +532,22 @@ async function attempt(
 ): Promise<Attempt> {
   await openLibrary(page, 'default', options);
   await uploadBatch(page);
+  return activate(page, filename, path, via, replacement, true);
+}
+
+/**
+ * Activates one recovery path on the screen as it is now, and records what
+ * happened. `failureRemains` says whether another failure should still be
+ * on screen afterwards.
+ */
+async function activate(
+  page: Page,
+  filename: string,
+  path: Path,
+  via: Via,
+  replacement: string | null,
+  failureRemains: boolean,
+): Promise<Attempt> {
   const scope = await failedItem(page, filename);
   const control = controlsIn(scope).nth(path[0]);
   const controlLabel = await labelOf(control);
@@ -533,7 +586,7 @@ async function attempt(
   const uploads = uploadsIn(await settleUploads(page, before)).slice(before);
   const succeeded = uploads.some((u) => u.status === 201);
   const notCleared = succeeded
-    ? await waitUntilCleared(page, filename, itemText, summaryBefore, path.length === 1 ? controlLabel : null)
+    ? await waitUntilCleared(page, filename, itemText, summaryBefore, path.length === 1 ? controlLabel : null, failureRemains)
     : null;
   return { label, via, reachedByKeyboard: true, uploads, chooserOpened: opened !== null, notCleared };
 }
@@ -577,6 +630,42 @@ function judgeOversized(a: Attempt): Verdict {
   return { recovered: replaced && !a.notCleared, problems };
 }
 
+interface Failure {
+  filename: string;
+  replacement: string | null;
+  judge: (a: Attempt) => Verdict;
+  goal: string;
+}
+
+const TRANSIENT: Failure = {
+  filename: TRANSIENT_FAILURE_FILENAME,
+  replacement: null,
+  judge: judgeTransient,
+  goal: 'resent only that file and cleared the failure',
+};
+
+const OVERSIZED: Failure = {
+  filename: OVERSIZED_FILENAME,
+  replacement: uploadFiles.replacement,
+  judge: judgeOversized,
+  goal: 'uploaded a valid replacement and cleared the failure',
+};
+
+/** Tries every recovery path with the mouse; returns those that recover. */
+async function workingPaths(page: Page, failure: Failure, options: OpenOptions): Promise<Path[]> {
+  const { filename, replacement, judge, goal } = failure;
+  const problems: string[] = [];
+  const working: Path[] = [];
+  for (const path of await recoveryPaths(page, filename, options)) {
+    const verdict = judge(await attempt(page, filename, path, 'mouse', replacement, options));
+    problems.push(...verdict.problems);
+    if (verdict.recovered) working.push(path);
+  }
+  expect(problems, `recovery controls for ${filename} misbehaved`).toEqual([]);
+  expect(working.length, `no control in ${filename}'s item ${goal}`).toBeGreaterThan(0);
+  return working;
+}
+
 /**
  * Tries every recovery path with the mouse, then requires at least one path
  * that recovers to also work from the keyboard (Tab to reach, Enter to use).
@@ -589,15 +678,7 @@ async function checkRecovery(
   goal: string,
   options: OpenOptions,
 ): Promise<void> {
-  const problems: string[] = [];
-  const working: Path[] = [];
-  for (const path of await recoveryPaths(page, filename, options)) {
-    const verdict = judge(await attempt(page, filename, path, 'mouse', replacement, options));
-    problems.push(...verdict.problems);
-    if (verdict.recovered) working.push(path);
-  }
-  expect(problems, `recovery controls for ${filename} misbehaved`).toEqual([]);
-  expect(working.length, `no control in ${filename}'s item ${goal}`).toBeGreaterThan(0);
+  const working = await workingPaths(page, { filename, replacement, judge, goal }, options);
 
   const keyboardProblems: string[] = [];
   for (const path of working) {
@@ -629,6 +710,39 @@ export function checkTransientRecovery(page: Page, options: OpenOptions = {}): P
  */
 export function checkOversizedRecovery(page: Page, options: OpenOptions = {}): Promise<void> {
   return checkRecovery(page, OVERSIZED_FILENAME, uploadFiles.replacement, judgeOversized, 'uploaded a valid replacement and cleared the failure', options);
+}
+
+/**
+ * Both failures from one batch can be recovered, in either order. After the
+ * first recovery, the other file must still have its failed item and
+ * recovery controls, and recovering it must work too.
+ */
+export async function checkBothFailuresRecover(page: Page, options: OpenOptions = {}): Promise<void> {
+  const paths = new Map<Failure, Path>([
+    [TRANSIENT, (await workingPaths(page, TRANSIENT, options))[0]!],
+    [OVERSIZED, (await workingPaths(page, OVERSIZED, options))[0]!],
+  ]);
+  for (const [first, second] of [
+    [TRANSIENT, OVERSIZED],
+    [OVERSIZED, TRANSIENT],
+  ] as const) {
+    await openLibrary(page, 'default', options);
+    await uploadBatch(page);
+
+    const a = first.judge(await activate(page, first.filename, paths.get(first)!, 'mouse', first.replacement, true));
+    expect(a.problems, `recovering ${first.filename} first`).toEqual([]);
+    expect(a.recovered, `recovering ${first.filename} first`).toBe(true);
+
+    await expect
+      .poll(() => markScope(page, second.filename), {
+        timeout: 3_000,
+        message: `after recovering ${first.filename}, ${second.filename} still has a failed item with recovery controls`,
+      })
+      .not.toBeNull();
+    const b = second.judge(await activate(page, second.filename, paths.get(second)!, 'mouse', second.replacement, false));
+    expect(b.problems, `recovering ${second.filename} after ${first.filename}`).toEqual([]);
+    expect(b.recovered, `after recovering ${first.filename}, ${second.filename} can still be recovered`).toBe(true);
+  }
 }
 
 /** Starting from whatever renders first, every default asset can be reached by loading more. */
@@ -728,10 +842,30 @@ export async function checkBulkDelete(page: Page, options: OpenOptions = {}): Pr
   const dialog = page.getByRole('dialog').or(page.getByRole('alertdialog')).filter({ visible: true });
   if (await dialog.count()) await dialog.getByRole('button', { name: /delete|remove/i }).first().click();
 
-  await expect
-    .poll(async () => (await mockLog(page)).find((e) => e.path === '/api/assets/delete')?.ids?.slice().sort(), {
-      message: 'one delete request with the three selected assets',
-    })
-    .toEqual(targets.map((a) => a.id).sort());
+  // The complete effect: every delete request in the interaction, together,
+  // removes exactly the selected assets, in the log and in the library.
+  const targetIds = targets.map((a) => a.id).sort();
+  const deletedIds = async () => {
+    const ids = (await mockLog(page)).filter((e) => e.path === '/api/assets/delete').flatMap((e) => e.ids ?? []);
+    return [...new Set(ids)].sort();
+  };
+  await expect.poll(deletedIds, { message: 'assets deleted across the interaction' }).toEqual(targetIds);
   await expect.poll(() => visibleItems(page, targets.map((a) => a.filename))).toEqual([]);
+  // Let any follow-up requests arrive: wait for 1 s with no new delete request.
+  const deleteCount = async () => (await mockLog(page)).filter((e) => e.path === '/api/assets/delete').length;
+  for (let last = await deleteCount(), stableSince = Date.now(); Date.now() - stableSince < 1_000; ) {
+    await page.waitForTimeout(200);
+    const now = await deleteCount();
+    if (now !== last) {
+      last = now;
+      stableSince = Date.now();
+    }
+  }
+  expect(await deletedIds(), 'assets deleted across the interaction, after it settled').toEqual(targetIds);
+
+  const res = await page.request.get('/api/assets?limit=200');
+  const remaining = new Set(((await res.json()) as { items: Array<{ id: string }> }).items.map((a) => a.id));
+  const wronglyGone = DEFAULT_ASSETS.filter((a) => !targetIds.includes(a.id) && !remaining.has(a.id)).map((a) => a.filename);
+  expect(wronglyGone, 'unselected assets no longer in the library').toEqual([]);
+  expect(targets.filter((a) => remaining.has(a.id)).map((a) => a.filename), 'selected assets still in the library').toEqual([]);
 }

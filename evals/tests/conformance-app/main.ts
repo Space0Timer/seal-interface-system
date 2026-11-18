@@ -12,6 +12,7 @@
 //   ?prefetch=1      fetch the next page ahead; "Load more" reveals it with no request
 //   ?labelledby=1    rows show a truncated filename; the full one comes from aria-labelledby
 //   ?row-actions=1   each row has a "More actions" button next to the page's "Load more"
+//   ?pager-nav=1     "Load more" sits in a pagination nav > ul > li, outside the table
 //
 // Broken variants, which the meta tests check the shared tests reject:
 //   ?variant=retry-everything      Retry for every failure, even oversized files
@@ -27,6 +28,9 @@
 //   ?variant=json-body             uploads JSON.stringify(file) ("{}") instead of the file's bytes
 //   ?variant=summary-vanishes      after a recovery, the upload summary disappears although
 //                                  the other failure is still on screen
+//   ?variant=retry-clears-all      a successful recovery hides every other failed item too,
+//                                  so the remaining file can't be recovered
+//   ?variant=delete-extra          bulk delete also deletes one unselected asset
 
 interface Asset {
   id: string;
@@ -41,6 +45,8 @@ interface Upload {
   file: File;
   status: 'pending' | 'done' | 'failed';
   code?: string;
+  /** Hidden from the screen but still counted (retry-clears-all). */
+  hidden?: boolean;
 }
 
 interface Page {
@@ -54,6 +60,7 @@ const PAGE = Number(params.get('page') ?? 20);
 const prefetch = params.get('prefetch') === '1';
 const labelledBy = params.get('labelledby') === '1';
 const rowActions = params.get('row-actions') === '1';
+const pagerNav = params.get('pager-nav') === '1';
 const variant = params.get('variant');
 const is = (name: string) => variant === name;
 
@@ -207,7 +214,7 @@ function renderList(): void {
   if (state.items.length < state.total) {
     const more = el('button', { type: 'button' }, 'Load more');
     more.addEventListener('click', () => void load(true));
-    children.push(more);
+    children.push(pagerNav ? el('nav', { 'aria-label': 'Pagination' }, el('ul', {}, el('li', {}, more))) : more);
   }
   listRegion.replaceChildren(...children);
 }
@@ -220,6 +227,10 @@ function renderSelection(): void {
   const remove = el('button', { type: 'button' }, 'Delete selected');
   remove.addEventListener('click', async () => {
     await fetch('/api/assets/delete', { method: 'POST', body: JSON.stringify({ ids: [...state.selected] }) });
+    if (is('delete-extra')) {
+      const extra = state.items.find((a) => !state.selected.has(a.id));
+      if (extra) await fetch('/api/assets/delete', { method: 'POST', body: JSON.stringify({ ids: [extra.id] }) });
+    }
     state.selected.clear();
     renderSelection();
     await load();
@@ -254,13 +265,17 @@ function renderUploads(): void {
     return;
   }
   const done = state.uploads.filter((u) => u.status === 'done').length;
-  const failed = state.uploads.filter((u) => u.status === 'failed');
+  const failed = state.uploads.filter((u) => u.status === 'failed' && !u.hidden);
   const items = failed.map((entry) => {
     const actions: HTMLElement[] = [];
     const snapshot = { file: entry.file, code: entry.code };
     const recovered = async () => {
       state.recoveredOnce = true;
       if (is('stale-after-recovery')) return;
+      if (is('retry-clears-all') && entry.status === 'done') {
+        // Hides every other failure: still counted in the summary, but unrecoverable.
+        for (const other of state.uploads) if (other.status === 'failed') other.hidden = true;
+      }
       if (is('stale-rerender')) {
         // The upload succeeded, but the screen re-creates the same failure.
         entry.file = snapshot.file;

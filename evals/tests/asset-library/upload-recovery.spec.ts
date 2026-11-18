@@ -1,6 +1,8 @@
+import { writeFileSync } from 'node:fs';
 import { expect, test } from '@playwright/test';
 import { OVERSIZED_FILENAME, TRANSIENT_FAILURE_FILENAME } from '../../fixtures/src/data.ts';
 import {
+  checkBothFailuresRecover,
   checkOversizedRecovery,
   checkTransientRecovery,
   controlsIn,
@@ -22,15 +24,21 @@ test('partial failure: each failed file has recovery controls visible without ho
 
   // On touch layouts, record every clickable target's size as design-fit
   // evidence (P6). Reviewers score it; it doesn't fail this behavior test.
+  // Written to a file in the test's output folder so it survives the run.
   if (info.project.use.hasTouch) {
     const targets = await measureTouchTargets(page);
     const small = targets.filter((t) => !t.meetsMinimum);
-    await info.attach('touch-targets.json', { body: JSON.stringify({ minimum: TOUCH_TARGET_MIN, targets }, null, 2), contentType: 'application/json' });
-    info.annotations.push({
-      type: 'design-fit evidence (P6)',
-      description: `${small.length} of ${targets.length} interactive targets are smaller than ${TOUCH_TARGET_MIN} × ${TOUCH_TARGET_MIN} px`,
-    });
+    const summary = `${small.length} of ${targets.length} interactive targets are smaller than ${TOUCH_TARGET_MIN} × ${TOUCH_TARGET_MIN} px`;
+    const file = info.outputPath('touch-targets.json');
+    writeFileSync(file, `${JSON.stringify({ project: info.project.name, state: 'partial upload failure', minimum: TOUCH_TARGET_MIN, summary, targets }, null, 2)}\n`);
+    await info.attach('touch-targets.json', { path: file, contentType: 'application/json' });
+    info.annotations.push({ type: 'design-fit evidence (P6)', description: summary });
+    console.log(`[${info.project.name}] touch targets (P6 evidence): ${summary}. Details: ${file}`);
   }
+});
+
+test('partial failure: both failed files can be recovered in one batch, in either order', async ({ page }) => {
+  await checkBothFailuresRecover(page);
 });
 
 // Each check tries every control with the mouse, then requires a working
