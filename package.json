@@ -1,0 +1,28 @@
+{
+  "name": "design-system-harness",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.21.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "tokens:check": "pnpm --filter @ds/tokens check",
+    "tokens:build": "pnpm --filter @ds/tokens build",
+    "lint": "eslint . && stylelint \"**/*.css\"",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "build": "pnpm -r build",
+    "check": "pnpm tokens:check && pnpm tokens:build && pnpm lint && pnpm typecheck && pnpm test && pnpm build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.6",
+    "eslint": "^10.15.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.14.0",
+    "stylelint": "^18.0.0",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.73.0"
+  }
+}

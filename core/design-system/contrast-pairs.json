@@ -1,0 +1,123 @@
+{
+  "description": "Required foreground/background pairs, checked in every mode. A background is a stack: the first entry is opaque, later entries are composited over it. Ratios use the WCAG 2 formula.",
+  "rules": [
+    {
+      "use": "Text and text-like icons on every surface and row state.",
+      "kind": "text",
+      "minimum": 4.5,
+      "foreground": [
+        "color.text.primary",
+        "color.text.secondary",
+        "color.action.link",
+        "color.state.danger",
+        "color.state.warning",
+        "color.state.success",
+        "color.state.info"
+      ],
+      "background": [
+        [
+          "color.surface.canvas"
+        ],
+        [
+          "color.surface.raised"
+        ],
+        [
+          "color.surface.subtle"
+        ],
+        [
+          "color.surface.canvas",
+          "color.interaction.hover"
+        ],
+        [
+          "color.surface.raised",
+          "color.interaction.hover"
+        ],
+        [
+          "color.surface.canvas",
+          "color.interaction.selected"
+        ]
+      ]
+    },
+    {
+      "use": "Label on the primary action in each of its states.",
+      "kind": "text",
+      "minimum": 4.5,
+      "foreground": [
+        "color.action.on-primary"
+      ],
+      "background": [
+        [
+          "color.surface.canvas",
+          "color.action.primary"
+        ],
+        [
+          "color.surface.canvas",
+          "color.action.primary-hover"
+        ],
+        [
+          "color.surface.canvas",
+          "color.action.primary-pressed"
+        ]
+      ]
+    },
+    {
+      "use": "Primary action fill against the surface it sits on.",
+      "kind": "non-text",
+      "minimum": 3,
+      "foreground": [
+        "color.action.primary"
+      ],
+      "background": [
+        [
+          "color.surface.canvas"
+        ],
+        [
+          "color.surface.raised"
+        ]
+      ]
+    },
+    {
+      "use": "Control boundaries.",
+      "kind": "non-text",
+      "minimum": 3,
+      "foreground": [
+        "color.border.control"
+      ],
+      "background": [
+        [
+          "color.surface.canvas"
+        ],
+        [
+          "color.surface.raised"
+        ],
+        [
+          "color.surface.subtle"
+        ]
+      ]
+    },
+    {
+      "use": "Focus ring against what it surrounds.",
+      "kind": "non-text",
+      "minimum": 3,
+      "foreground": [
+        "color.interaction.focus-ring"
+      ],
+      "background": [
+        [
+          "color.surface.canvas"
+        ],
+        [
+          "color.surface.raised"
+        ],
+        [
+          "color.surface.canvas",
+          "color.interaction.selected"
+        ]
+      ]
+    }
+  ],
+  "exempt": {
+    "color.text.disabled": "Disabled controls are exempt from WCAG contrast minimums.",
+    "color.border.divider": "Dividers are optional and not needed to identify a control."
+  }
+}

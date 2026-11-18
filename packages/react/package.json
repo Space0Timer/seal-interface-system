@@ -1,0 +1,19 @@
+{
+  "name": "@ds/react",
+  "private": true,
+  "type": "module",
+  "description": "Layout primitives, components and patterns. Empty until an approved screen needs them.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p ."
+  },
+  "peerDependencies": {
+    "react": ">=19"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "react": "^19.3.1"
+  }
+}

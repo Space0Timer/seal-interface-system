@@ -1,0 +1,17 @@
+{
+  "name": "@ds/tokens",
+  "private": true,
+  "type": "module",
+  "description": "Validates the design system's DTCG tokens, checks contrast pairs, and converts tokens to CSS custom properties.",
+  "exports": {
+    ".": "./src/resolve.ts",
+    "./css": "./src/css.ts",
+    "./tokens.css": "./dist/tokens.css"
+  },
+  "scripts": {
+    "check": "node src/cli.ts check",
+    "build": "node src/cli.ts build",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p ."
+  }
+}

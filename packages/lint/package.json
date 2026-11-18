@@ -1,0 +1,12 @@
+{
+  "name": "@ds/lint",
+  "private": true,
+  "type": "module",
+  "description": "Lint rules that keep product styles on design tokens.",
+  "exports": {
+    "./stylelint-token-values": "./stylelint-token-values.js"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\""
+  }
+}

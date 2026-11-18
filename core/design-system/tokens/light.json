@@ -1,0 +1,195 @@
+{
+  "$description": "Semantic color and elevation roles, light mode. Each mode maps roles independently; never derive one mode from the other.",
+  "color": {
+    "$type": "color",
+    "surface": {
+      "canvas": {
+        "$value": "{palette.neutral.0}",
+        "$description": "Page background."
+      },
+      "raised": {
+        "$value": "{palette.neutral.0}",
+        "$description": "Floating surfaces: menus, popovers, dialogs. Pair with an elevation token."
+      },
+      "subtle": {
+        "$value": "{palette.neutral.50}",
+        "$description": "Quiet fill for a distinct object: thumbnail placeholder, drop zone, input well. Not for sections."
+      }
+    },
+    "text": {
+      "primary": {
+        "$value": "{palette.neutral.950}",
+        "$description": "Primary content: filenames, titles, body copy."
+      },
+      "secondary": {
+        "$value": "{palette.neutral.600}",
+        "$description": "Supporting content: metadata, helper text, column headers."
+      },
+      "disabled": {
+        "$value": "{palette.neutral.350}",
+        "$description": "Disabled control labels only. Exempt from contrast minimums; never for content."
+      }
+    },
+    "border": {
+      "control": {
+        "$value": "{palette.neutral.400}",
+        "$description": "Boundary that identifies a control, such as an input or secondary button. Meets 3:1."
+      },
+      "divider": {
+        "$value": "{palette.neutral.150}",
+        "$description": "Optional row or region divider. Use only when it improves scanning."
+      }
+    },
+    "action": {
+      "primary": {
+        "$value": "{palette.accent.600}",
+        "$description": "Fill of the one primary action in an interaction scope."
+      },
+      "primary-hover": {
+        "$value": "{palette.accent.700}",
+        "$description": "Primary action fill on hover."
+      },
+      "primary-pressed": {
+        "$value": "{palette.accent.800}",
+        "$description": "Primary action fill while pressed."
+      },
+      "on-primary": {
+        "$value": "{palette.neutral.0}",
+        "$description": "Text and icons on action.primary and its states."
+      },
+      "link": {
+        "$value": "{palette.accent.600}",
+        "$description": "Text links and text-style actions."
+      }
+    },
+    "state": {
+      "danger": {
+        "$value": "{palette.red.600}",
+        "$description": "Errors and destructive outcomes: text and icons."
+      },
+      "warning": {
+        "$value": "{palette.amber.700}",
+        "$description": "Warnings: text and icons."
+      },
+      "success": {
+        "$value": "{palette.green.700}",
+        "$description": "Success: text and icons."
+      },
+      "info": {
+        "$value": "{palette.accent.600}",
+        "$description": "Neutral information: text and icons."
+      }
+    },
+    "interaction": {
+      "hover": {
+        "$value": "{palette.black-alpha.04}",
+        "$description": "Overlay for hovered rows and menu items. Translucent; works on any surface."
+      },
+      "pressed": {
+        "$value": "{palette.black-alpha.08}",
+        "$description": "Overlay for pressed rows and menu items."
+      },
+      "selected": {
+        "$value": "{palette.accent.50}",
+        "$description": "Background of selected rows and items."
+      },
+      "focus-ring": {
+        "$value": "{palette.accent.500}",
+        "$description": "Keyboard focus indicator. Use with border.width.focus."
+      },
+      "disabled-surface": {
+        "$value": "{palette.neutral.100}",
+        "$description": "Fill of disabled controls."
+      }
+    }
+  },
+  "elevation": {
+    "$type": "shadow",
+    "overlay": {
+      "$value": [
+        {
+          "color": "{palette.black-alpha.08}",
+          "offsetX": {
+            "value": 0,
+            "unit": "px"
+          },
+          "offsetY": {
+            "value": 1,
+            "unit": "px"
+          },
+          "blur": {
+            "value": 2,
+            "unit": "px"
+          },
+          "spread": {
+            "value": 0,
+            "unit": "px"
+          }
+        },
+        {
+          "color": "{palette.black-alpha.12}",
+          "offsetX": {
+            "value": 0,
+            "unit": "px"
+          },
+          "offsetY": {
+            "value": 4,
+            "unit": "px"
+          },
+          "blur": {
+            "value": 12,
+            "unit": "px"
+          },
+          "spread": {
+            "value": 0,
+            "unit": "px"
+          }
+        }
+      ],
+      "$description": "Menus and popovers. Only for surfaces that float over content."
+    },
+    "dialog": {
+      "$value": [
+        {
+          "color": "{palette.black-alpha.10}",
+          "offsetX": {
+            "value": 0,
+            "unit": "px"
+          },
+          "offsetY": {
+            "value": 2,
+            "unit": "px"
+          },
+          "blur": {
+            "value": 6,
+            "unit": "px"
+          },
+          "spread": {
+            "value": 0,
+            "unit": "px"
+          }
+        },
+        {
+          "color": "{palette.black-alpha.18}",
+          "offsetX": {
+            "value": 0,
+            "unit": "px"
+          },
+          "offsetY": {
+            "value": 16,
+            "unit": "px"
+          },
+          "blur": {
+            "value": 40,
+            "unit": "px"
+          },
+          "spread": {
+            "value": 0,
+            "unit": "px"
+          }
+        }
+      ],
+      "$description": "Dialogs. Only for surfaces that float over content."
+    }
+  }
+}

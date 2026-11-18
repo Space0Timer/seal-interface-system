@@ -1,0 +1,31 @@
+{
+  "$schema": "https://www.designtokens.org/schemas/2025.10/resolver.json",
+  "version": "2025.10",
+  "name": "design-system",
+  "description": "Combines base tokens, the active theme's palette, and one mode. To change brand, replace the theme source; nothing else changes.",
+  "sets": {
+    "base": {
+      "description": "Mode-independent tokens.",
+      "sources": [{ "$ref": "tokens.json" }]
+    },
+    "theme": {
+      "description": "Raw palette values. The reference theme is sample data, not design language.",
+      "sources": [{ "$ref": "tokens/reference-theme.json" }]
+    }
+  },
+  "modifiers": {
+    "mode": {
+      "description": "Light and dark each map semantic roles independently.",
+      "default": "light",
+      "contexts": {
+        "light": [{ "$ref": "tokens/light.json" }],
+        "dark": [{ "$ref": "tokens/dark.json" }]
+      }
+    }
+  },
+  "resolutionOrder": [
+    { "$ref": "#/sets/base" },
+    { "$ref": "#/sets/theme" },
+    { "$ref": "#/modifiers/mode" }
+  ]
+}
