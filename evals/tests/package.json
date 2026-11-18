@@ -1,0 +1,15 @@
+{
+  "name": "@ds/eval-tests",
+  "private": true,
+  "type": "module",
+  "description": "Shared behavior tests for eval briefs. Run against any condition's app with EVAL_BASE_URL, or against the built-in conformance app by default.",
+  "scripts": {
+    "test": "playwright test",
+    "conformance-app": "vite --config conformance-app/vite.config.ts",
+    "typecheck": "tsc -p ."
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "vite": "^8.3.8"
+  }
+}

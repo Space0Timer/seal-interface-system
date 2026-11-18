@@ -65,8 +65,13 @@ packages/tokens/       token validation, contrast check, and the
 packages/lint/         stylelint rule ds/token-values
 packages/react/        primitives, components, patterns         (empty)
 apps/playground/       reference screens, Storybook, e2e tests  (no screens yet)
-evals/                 briefs, starter, fixtures, rubric,       (not yet)
-                       runner, adapters, results
+evals/fixtures/        asset data, upload batch, mock API and
+                       its Vite plugin
+evals/briefs/          asset-library.md (held-out brief: not yet)
+evals/tests/           shared behavior tests, the contract-only
+                       conformance app, and meta tests
+evals/                 starter, rubric, runner, adapters,       (not yet)
+                       results
 .claude/agents/        Claude-only adapters, e.g. reviewer.md,  (not yet)
                        which points to evals/rubric/ and holds
                        no criteria of its own
@@ -257,6 +262,90 @@ Setup:
   only the skill provides; review scores the copy.
 - **Mobile interaction tests** run with touch emulation, so hover isn't
   available. They measure each control's clickable target, not its icon.
+- **Where the tests live:** `evals/tests/`. Set `EVAL_BASE_URL` to a
+  condition's app, served with the mock API plugin. Without it, the tests
+  run against the **conformance app**.
+- **The conformance app** is unstyled and written only from the brief's
+  contract. It proves the tests can be passed from the brief alone. It is
+  never given to generators and is not a design reference.
+- **Projects:** desktop at 1440 × 900 and mobile at 390 × 844 (Pixel 7
+  touch profile), each in light and dark.
+- **Checks:**
+  - The **initial batch** must send each ordinary file exactly once and
+    successfully, with its real byte count. Retries and replacements are
+    size-checked too. Uploads are scored only once every response is in.
+  - **Items are matched by computed accessible name.** That includes
+    `aria-labelledby`, `aria-label` and `title`, as well as text, so a
+    visually truncated filename still counts.
+  - **Pagination** starts from whatever renders first, with any page
+    size. Every asset must become reachable by scrolling or through a
+    pagination control: outside the asset items, not a menu trigger, and
+    named "more" or "next". Row actions such as "More actions" are
+    ignored, but a pager's or toolbar's own list (ul > li) is fine.
+    Lists are scrolled a viewport at a time, so virtualized rows are seen.
+    Success means new filenames appear, so prefetched pages count.
+  - **The large library** is watched for 3 seconds after its first render
+    before any interaction. No more than 1,000 assets may be requested in
+    that window, background fetches included. The brief publishes this
+    budget.
+  - **Search** for "invoice" must find exactly the two invoices,
+    following result pages if needed. No page may show anything else.
+  - **Bulk delete** selects across pages if fewer than three assets are
+    shown. All delete requests in the interaction together must remove
+    exactly the selected assets, and every other asset must remain in the
+    mock library.
+  - **Recovery checks** try every control (and menu item) in a failed
+    upload's item, each in a fresh mock session, and judge it by the
+    request log.
+    - A recovery counts only if, rechecked by filename, the failure is no
+      longer shown.
+    - The upload summary itself (the status region named "upload…") must
+      report the actual result, after the batch and after each recovery.
+      It must state, as numerals, the files uploaded and the batch size;
+      any other count up to the batch size must be the number still
+      failing. Wording is free. It must stay on screen while a failure
+      remains. Other live regions don't count.
+      *Owner decision, 2026-11-19:* keep this rule, even though it nudges
+      every condition toward the owner's "N of M uploaded" structure. A
+      machine-readable alternative (`data-uploaded` and `data-total`
+      attributes) was considered and not chosen.
+    - At least one working recovery must also work with Tab and Enter.
+    - Both failures must be recoverable in one batch, in either order.
+      After the first recovery, the other file keeps its failed item and
+      controls. The second recovery's control is found again by label,
+      since controls may reorder.
+  - **Touch targets** (mobile projects): every interactive element's
+    largest contiguous clickable area is measured; a control and its label
+    merge only when they touch. A hidden control (such as a file input) is
+    measured through its visible label. The result is written to
+    `evals/tests/test-results/<test>-mobile-*/touch-targets.json`, and a
+    summary line is printed. This is design-fit evidence for reviewers
+    (P6), not a behavior pass or fail.
+- **Meta tests** prove the checks can fail. These broken variants of the
+  conformance app must each fail for the right reason:
+  - `retry-everything`
+  - `stale-after-recovery`
+  - `stale-rerender`
+  - `stale-summary`
+  - `mouse-only-recovery`
+  - `empty-search`
+  - `search-loaded-only`
+  - `fetch-all-later`
+  - `json-body`
+  - `summary-vanishes`
+  - `retry-clears-all`
+  - `delete-extra`
+  - `wrong-summary`
+
+  These valid variations must pass:
+  - 5 per page with prefetching
+  - 1 per page
+  - names given only through `aria-labelledby`
+  - a "More actions" button on every row
+  - "Load more" inside a pagination list
+  - "Delete selected" inside a toolbar list
+  - recovery controls that reorder after the first recovery
+  - a virtualized list that renders 5 rows at a time
 - The owner makes the final call.
 - When conditions disagree, check skill loading, rule interpretation and
   implementation before revising a rule.
@@ -335,15 +424,19 @@ comparison.
   - lint rules
   - `pnpm check`
 
+- Asset-library eval inputs: the fixtures and mock API, the brief, and the
+  shared behavior tests, which pass against the conformance app.
+
 Next:
 1. Build these, following the eval protocol:
-   - `evals/starter/`, with the functional contract and the token
-     converter
-   - `evals/fixtures/` and `evals/rubric/`
+   - `evals/starter/`: Vite + React + TS, the mock API plugin, the token
+     converter, and `upload-files/` plus `replacement-files/` (written with
+     `writeUploadFiles` from `evals/fixtures/src/files.ts`)
+   - `evals/rubric/`, for the owner to approve
    - the runner and the Claude Code adapter
    - `.claude/agents/reviewer.md`, pointing to the rubric
-2. Write the fixtures and both briefs (see above). The held-out brief
-   stays out of the skill.
+2. The held-out workspace-members brief, with its fixtures and behavior
+   tests. It stays out of the skill.
 3. Don't install the skill machine-wide yet. When a real UI repo needs it,
    link `core/design-system` into that agent's skills folder (a directory
    junction on Windows), and confirm that baseline eval runs still can't
