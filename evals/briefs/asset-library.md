@@ -23,7 +23,8 @@ Team members use this screen many times a day to:
   recognize and compare assets; you decide which fields that is.
 - The library can hold 10,000 assets. The screen must stay usable at that
   size. Load assets in pages from the API; don't request all of them at once.
-- People can search by filename.
+- People can search by filename. Search covers the whole library, not only
+  the assets already loaded.
 - People can upload one or many files at once.
 - People can select several assets and delete them together.
 - The screen sits inside the app's global navigation, which has three

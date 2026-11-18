@@ -1,40 +1,33 @@
 import { expect, test } from '@playwright/test';
-import { assetsFor, DEFAULT_ASSETS, NO_RESULTS_QUERY } from '../../fixtures/src/data.ts';
-import { isSelected, libraryItem, loadMore, mockLog, openLibrary, selectItem, settleUploads, uploadFiles, visibleItems } from './helpers.ts';
+import { DEFAULT_ASSETS, NO_RESULTS_QUERY } from '../../fixtures/src/data.ts';
+import {
+  checkAllAssetsReachable,
+  checkLargeLibrary,
+  checkSearchFinds,
+  DEFAULT_NAMES,
+  isSelected,
+  libraryItem,
+  mockLog,
+  openLibrary,
+  searchField,
+  selectItem,
+  settleUploads,
+  uploadFiles,
+  visibleItems,
+  waitForItems,
+} from './helpers.ts';
 
-const DEFAULT_NAMES = DEFAULT_ASSETS.map((a) => a.filename);
-const FIRST_PAGE = DEFAULT_NAMES.slice(0, 10);
-const LARGE_NAMES = assetsFor('large').map((a) => a.filename);
-
-test('populated: the newest assets appear as items exposing their full filenames', async ({ page }) => {
+test('populated: assets render as items exposing their full filenames', async ({ page }) => {
   await openLibrary(page, 'default');
-  await expect.poll(() => visibleItems(page, FIRST_PAGE)).toEqual(FIRST_PAGE);
+  await waitForItems(page, DEFAULT_NAMES);
 });
 
 test('pagination: every asset in the default library can be reached', async ({ page }) => {
-  await openLibrary(page, 'default');
-  await expect.poll(() => visibleItems(page, FIRST_PAGE)).toEqual(FIRST_PAGE);
-  const seen = new Set<string>();
-  for (let i = 0; i < 20; i++) {
-    for (const name of await visibleItems(page, DEFAULT_NAMES)) seen.add(name);
-    if (seen.size === DEFAULT_NAMES.length || !(await loadMore(page))) break;
-  }
-  expect(DEFAULT_NAMES.filter((n) => !seen.has(n)), 'assets never shown').toEqual([]);
+  await checkAllAssetsReachable(page);
 });
 
 test('large library: loads in pages and reaches a later page', async ({ page }) => {
-  await openLibrary(page, 'large');
-  await expect.poll(() => visibleItems(page, LARGE_NAMES.slice(0, 10)), { timeout: 5_000 }).toHaveLength(10);
-  const requested = (await mockLog(page))
-    .filter((e) => e.path === '/api/assets')
-    .reduce((sum, e) => sum + Math.min(Number(e.query['limit'] ?? 50), 200), 0);
-  expect(requested, 'assets requested on first load').toBeLessThanOrEqual(1_000);
-
-  const scan = LARGE_NAMES.slice(0, 2_000);
-  const furthest = async () => Math.max(-1, ...(await visibleItems(page, scan)).map((n) => scan.indexOf(n)));
-  const before = await furthest();
-  expect(await loadMore(page), 'scrolling to the end, or a "more" or "next" control, requests a later page').toBe(true);
-  await expect.poll(furthest, { message: 'items from the later page appear' }).toBeGreaterThan(before);
+  await checkLargeLibrary(page);
 });
 
 test('empty: no items, and uploading a file adds it', async ({ page }) => {
@@ -50,19 +43,24 @@ test('empty: no items, and uploading a file adds it', async ({ page }) => {
   await expect(libraryItem(page, upload?.filename ?? '')).toBeVisible();
 });
 
+test('search: finds matching assets beyond the first page, and only those', async ({ page }) => {
+  await checkSearchFinds(page);
+});
+
 test('no results: a search with no matches shows no items, and clearing it restores them', async ({ page }) => {
   await openLibrary(page, 'default');
-  await expect.poll(() => visibleItems(page, FIRST_PAGE)).toEqual(FIRST_PAGE);
-  const search = page.getByRole('searchbox').or(page.getByRole('textbox', { name: /search/i })).first();
-  await search.fill(NO_RESULTS_QUERY);
+  const initial = await waitForItems(page, DEFAULT_NAMES);
+  await searchField(page).fill(NO_RESULTS_QUERY);
   await expect.poll(() => visibleItems(page, DEFAULT_NAMES)).toEqual([]);
-  await search.fill('');
-  await expect.poll(() => visibleItems(page, FIRST_PAGE)).toEqual(FIRST_PAGE);
+  await searchField(page).fill('');
+  await expect.poll(() => visibleItems(page, DEFAULT_NAMES)).toEqual(initial);
 });
 
 test('multi-select: three selected assets are deleted together', async ({ page }) => {
   await openLibrary(page, 'default');
-  const targets = DEFAULT_ASSETS.slice(1, 4);
+  const rendered = await waitForItems(page, DEFAULT_NAMES);
+  const targets = DEFAULT_ASSETS.filter((a) => rendered.includes(a.filename)).slice(0, 3);
+  expect(targets, 'at least three assets on the first page').toHaveLength(3);
   for (const asset of targets) {
     const item = libraryItem(page, asset.filename);
     await selectItem(item);

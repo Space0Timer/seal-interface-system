@@ -3,13 +3,21 @@
 // behavior tests can be passed without the design skill. It is NOT a design
 // reference and is never given to generators.
 //
-// The page size is 20, below the API default, so the tests must handle
-// pagination.
+// The page size defaults to 20, below the API default, so the tests must
+// handle pagination.
+//
+// Valid variations, which the meta tests check the shared tests accept:
+//   ?page=<n>     page size
+//   ?prefetch=1   fetch the next page ahead; "Load more" reveals it with no request
 //
 // Broken variants, which the meta tests check the shared tests reject:
 //   ?variant=retry-everything      Retry for every failure, even oversized files
-//   ?variant=stale-after-recovery  recovery uploads, but the screen still shows the failure
+//   ?variant=stale-after-recovery  recovery uploads, but the screen doesn't change
+//   ?variant=stale-rerender        recovery uploads, then re-renders the same failure
+//                                  and adds a "Retry sent" message
 //   ?variant=mouse-only-recovery   recovery controls can't be reached with Tab
+//   ?variant=empty-search          any non-empty search shows nothing
+//   ?variant=search-loaded-only    search filters only the pages already loaded
 
 interface Asset {
   id: string;
@@ -27,16 +35,25 @@ interface Upload {
 }
 
 const LIMIT_BYTES = 100 * 1024 * 1024;
-const PAGE = 20;
-const variant = new URLSearchParams(location.search).get('variant');
+const params = new URLSearchParams(location.search);
+const PAGE = Number(params.get('page') ?? 20);
+const prefetch = params.get('prefetch') === '1';
+const variant = params.get('variant');
 const retryEverything = variant === 'retry-everything';
 const staleAfterRecovery = variant === 'stale-after-recovery';
+const staleRerender = variant === 'stale-rerender';
 const mouseOnlyRecovery = variant === 'mouse-only-recovery';
+const emptySearch = variant === 'empty-search';
+const searchLoadedOnly = variant === 'search-loaded-only';
 
 const state = {
   query: '',
   items: [] as Asset[],
   total: 0,
+  /** Everything loaded without a query, for search-loaded-only. */
+  loaded: [] as Asset[],
+  /** A prefetched next page. */
+  buffer: [] as Asset[],
   selected: new Set<string>(),
   uploads: [] as Upload[],
   nextKey: 1,
@@ -73,15 +90,35 @@ document.body.append(
   el('main', {}, el('h1', {}, 'Assets'), search, ' ', upload, uploadsRegion, selectionRegion, listRegion),
 );
 
+async function fetchPage(offset: number): Promise<{ total: number; items: Asset[] }> {
+  const query = new URLSearchParams({ offset: String(offset), limit: String(PAGE) });
+  if (state.query) query.set('q', state.query);
+  const res = await fetch(`/api/assets?${query}`);
+  return (await res.json()) as { total: number; items: Asset[] };
+}
+
 async function load(append = false): Promise<void> {
-  const offset = append ? state.items.length : 0;
-  const params = new URLSearchParams({ offset: String(offset), limit: String(PAGE) });
-  if (state.query) params.set('q', state.query);
-  const res = await fetch(`/api/assets?${params}`);
-  const body = (await res.json()) as { total: number; items: Asset[] };
-  state.items = append ? [...state.items, ...body.items] : body.items;
-  state.total = body.total;
+  if (state.query && (emptySearch || searchLoadedOnly)) {
+    const q = state.query.toLowerCase();
+    state.items = emptySearch ? [] : state.loaded.filter((a) => a.filename.toLowerCase().includes(q));
+    state.total = state.items.length;
+    renderList();
+    return;
+  }
+  if (append && state.buffer.length) {
+    state.items = [...state.items, ...state.buffer];
+    state.buffer = [];
+  } else {
+    if (!append) state.buffer = [];
+    const page = await fetchPage(append ? state.items.length : 0);
+    state.items = append ? [...state.items, ...page.items] : page.items;
+    state.total = page.total;
+  }
+  if (!state.query) state.loaded = state.items;
   renderList();
+  if (prefetch && state.items.length < state.total && state.buffer.length === 0) {
+    state.buffer = (await fetchPage(state.items.length)).items;
+  }
 }
 
 function renderList(): void {
@@ -167,8 +204,18 @@ function renderUploads(): void {
   const failed = state.uploads.filter((u) => u.status === 'failed');
   const items = failed.map((entry) => {
     const actions: HTMLElement[] = [];
+    const snapshot = { file: entry.file, code: entry.code };
     const recovered = async () => {
       if (staleAfterRecovery) return;
+      if (staleRerender) {
+        // The upload succeeded, but the screen re-creates the same failure.
+        entry.file = snapshot.file;
+        entry.status = 'failed';
+        if (snapshot.code) entry.code = snapshot.code;
+        renderUploads();
+        uploadsRegion.append(el('p', { role: 'status' }, 'Retry sent'));
+        return;
+      }
       renderUploads();
       await load();
     };

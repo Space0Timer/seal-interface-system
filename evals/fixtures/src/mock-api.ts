@@ -213,9 +213,11 @@ export function createMockApi(): Handler {
       }
 
       if (path === '/api/uploads' && method === 'POST') {
+        // Log the filename as soon as the request starts; status stays 0
+        // until the body has arrived and the response is sent.
         const filename = url.searchParams.get('filename')?.trim() ?? '';
-        const sizeBytes = await countBytes(req);
         entry.filename = filename;
+        const sizeBytes = await countBytes(req);
         entry.sizeBytes = sizeBytes;
         if (!filename) return reply(400, { error: { code: 'filename_required' } });
 

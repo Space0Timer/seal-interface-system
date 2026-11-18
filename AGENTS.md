@@ -272,19 +272,31 @@ Setup:
   touch profile), each in light and dark.
 - **Checks:**
   - The **initial batch** must send each ordinary file exactly once and
-    successfully.
-  - **Pagination** must reach every asset by scrolling or through a
-    "more" or "next" control.
+    successfully. Uploads are scored only once every response is in.
+  - **Pagination** starts from whatever renders first, with any page
+    size. Every asset must become reachable by scrolling or through a
+    "more" or "next" control. Success means new filenames appear, so
+    prefetched pages count.
+  - **Search** for "invoice" must show exactly the two invoices, which sit
+    beyond any small first page.
   - **Recovery checks** try every control (and menu item) in a failed
     upload's item, each in a fresh mock session, and judge it by the
-    request log. A recovery counts only if the failed item and the status
-    region then stop showing the failure. At least one working recovery
-    must also work with Tab and Enter.
+    request log.
+    - A recovery counts only if, rechecked by filename, the failure is no
+      longer shown.
+    - The upload result's earlier status text must also be gone. A new
+      message added next to it doesn't count.
+    - At least one working recovery must also work with Tab and Enter.
 - **Meta tests** prove the checks can fail. These broken variants of the
   conformance app must each fail for the right reason:
   - `retry-everything`
   - `stale-after-recovery`
+  - `stale-rerender`
   - `mouse-only-recovery`
+  - `empty-search`
+  - `search-loaded-only`
+
+  A valid 5-per-page prefetching variation must pass.
 - The owner makes the final call.
 - When conditions disagree, check skill loading, rule interpretation and
   implementation before revising a rule.
