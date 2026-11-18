@@ -23,6 +23,12 @@ Team members use this screen many times a day to:
   recognize and compare assets; you decide which fields that is.
 - The library can hold 10,000 assets. The screen must stay usable at that
   size. Load assets in pages from the API; don't request all of them at once.
+  **Startup budget:** in the first 3 seconds after assets first appear, and
+  before the person scrolls or asks for more, request at most 1,000 assets
+  in total, background or prefetch requests included. Five pages of 200 is
+  the most that fits.
+- Uploads send the file's actual bytes. The mock API records the size of
+  each request body.
 - People can search by filename. Search covers the whole library, not only
   the assets already loaded.
 - People can upload one or many files at once.
@@ -164,9 +170,12 @@ For them to work:
 7. **The upload result is a named status region.** While a batch's
    failures are on screen, its result is shown in an element with
    `role="status"` whose accessible name contains "upload" (for example
-   through `aria-label` or `aria-labelledby`). Its text updates when a
-   failed file is recovered. Other live regions, such as an asset count,
-   don't count as the upload result.
+   through `aria-label` or `aria-labelledby`). It stays on screen while any
+   failure from the batch remains, and its text updates when a failed file
+   is recovered. Other live regions, such as an asset count, don't count as
+   the upload result.
 8. **More assets load predictably.** If the first page doesn't hold every
    asset, more load either when the list is scrolled to its end, or through
-   a button or link whose accessible name contains "more" or "next".
+   a pagination button or link. That control sits outside the asset items,
+   doesn't open a menu, and has an accessible name containing "more" or
+   "next". Row actions such as "More actions" can coexist with it.

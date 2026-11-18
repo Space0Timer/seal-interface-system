@@ -272,17 +272,20 @@ Setup:
   touch profile), each in light and dark.
 - **Checks:**
   - The **initial batch** must send each ordinary file exactly once and
-    successfully. Uploads are scored only once every response is in.
+    successfully, with its real byte count. Retries and replacements are
+    size-checked too. Uploads are scored only once every response is in.
   - **Items are matched by computed accessible name.** That includes
     `aria-labelledby`, `aria-label` and `title`, as well as text, so a
     visually truncated filename still counts.
   - **Pagination** starts from whatever renders first, with any page
     size. Every asset must become reachable by scrolling or through a
-    "more" or "next" control. Success means new filenames appear, so
-    prefetched pages count.
+    pagination control: outside the items, not a menu trigger, and named
+    "more" or "next". Row actions such as "More actions" are ignored.
+    Success means new filenames appear, so prefetched pages count.
   - **The large library** is watched for 3 seconds after its first render
     before any interaction. No more than 1,000 assets may be requested in
-    that window, background fetches included.
+    that window, background fetches included. The brief publishes this
+    budget.
   - **Search** for "invoice" must find exactly the two invoices,
     following result pages if needed. No page may show anything else.
   - **Bulk delete** selects across pages if fewer than three assets are
@@ -293,8 +296,13 @@ Setup:
     - A recovery counts only if, rechecked by filename, the failure is no
       longer shown.
     - The upload summary itself (the status region named "upload…") must
+      stay on screen, because the other failure remains, and its text must
       change. Other live regions changing doesn't count.
     - At least one working recovery must also work with Tab and Enter.
+  - **Touch targets** (mobile projects): every interactive element's
+    clickable size is attached as `touch-targets.json`, with an annotation
+    counting targets under 44 × 44 px. This is design-fit evidence for
+    reviewers (P6), not a behavior pass or fail.
 - **Meta tests** prove the checks can fail. These broken variants of the
   conformance app must each fail for the right reason:
   - `retry-everything`
@@ -305,11 +313,14 @@ Setup:
   - `empty-search`
   - `search-loaded-only`
   - `fetch-all-later`
+  - `json-body`
+  - `summary-vanishes`
 
   These valid variations must pass:
   - 5 per page with prefetching
   - 1 per page
   - names given only through `aria-labelledby`
+  - a "More actions" button on every row
 - The owner makes the final call.
 - When conditions disagree, check skill loading, rule interpretation and
   implementation before revising a rule.

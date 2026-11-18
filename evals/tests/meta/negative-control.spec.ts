@@ -47,6 +47,14 @@ test.describe('broken variants fail', () => {
     await expect(checkLargeLibrary(page, at('variant=fetch-all-later'))).rejects.toThrow(/assets requested up front/);
   });
 
+  test('json-body: uploads that lose the file contents are rejected', async ({ page }) => {
+    await expect(checkTransientRecovery(page, at('variant=json-body'))).rejects.toThrow(/expected one successful upload of \d+ bytes/);
+  });
+
+  test('summary-vanishes: removing the summary while a failure remains is rejected', async ({ page }) => {
+    await expect(checkTransientRecovery(page, at('variant=summary-vanishes'))).rejects.toThrow(/upload summary is gone although a failure remains/);
+  });
+
   test('mouse-only-recovery: the transient check rejects recovery that Tab cannot reach', async ({ page }) => {
     await expect(checkTransientRecovery(page, at('variant=mouse-only-recovery'))).rejects.toThrow(MOUSE_ONLY);
   });
@@ -96,4 +104,25 @@ test.describe('valid variations pass', () => {
   test('aria-labelledby names with truncated text: bulk delete finds and selects rows', async ({ page }) => {
     await checkBulkDelete(page, at('labelledby=1'));
   });
+
+  test('"More actions" on every row: pagination still finds the page\'s "Load more"', async ({ page }) => {
+    await checkAllAssetsReachable(page, at('row-actions=1'));
+  });
+
+  test('"More actions" on every row: transient recovery still passes', async ({ page }) => {
+    await checkTransientRecovery(page, at('row-actions=1'));
+  });
+});
+
+test('conformance app: double-clicking "Load more" with a slow response appends each page once', async ({ page }) => {
+  await page.route(/\/api\/assets\?.*offset=20/, async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    await route.continue();
+  });
+  await page.request.post('/__mock/reset', { data: { scenario: 'default' } });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Load more' }).dblclick();
+  await expect(page.locator('tbody tr')).toHaveCount(39);
+  await page.waitForTimeout(1_000);
+  await expect(page.locator('tbody tr')).toHaveCount(39);
 });

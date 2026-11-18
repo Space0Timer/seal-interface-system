@@ -11,6 +11,7 @@
 //   ?page=<n>        page size
 //   ?prefetch=1      fetch the next page ahead; "Load more" reveals it with no request
 //   ?labelledby=1    rows show a truncated filename; the full one comes from aria-labelledby
+//   ?row-actions=1   each row has a "More actions" button next to the page's "Load more"
 //
 // Broken variants, which the meta tests check the shared tests reject:
 //   ?variant=retry-everything      Retry for every failure, even oversized files
@@ -23,6 +24,9 @@
 //   ?variant=empty-search          any non-empty search shows nothing
 //   ?variant=search-loaded-only    search filters only the pages already loaded
 //   ?variant=fetch-all-later       renders the first page, then fetches all 10,000 in the background
+//   ?variant=json-body             uploads JSON.stringify(file) ("{}") instead of the file's bytes
+//   ?variant=summary-vanishes      after a recovery, the upload summary disappears although
+//                                  the other failure is still on screen
 
 interface Asset {
   id: string;
@@ -49,6 +53,7 @@ const params = new URLSearchParams(location.search);
 const PAGE = Number(params.get('page') ?? 20);
 const prefetch = params.get('prefetch') === '1';
 const labelledBy = params.get('labelledby') === '1';
+const rowActions = params.get('row-actions') === '1';
 const variant = params.get('variant');
 const is = (name: string) => variant === name;
 
@@ -65,6 +70,9 @@ const state = {
   selected: new Set<string>(),
   uploads: [] as Upload[],
   frozenSummary: null as string | null,
+  /** The query and offset of the append in flight, so a double click doesn't append twice. */
+  appending: null as string | null,
+  recoveredOnce: false,
   nextKey: 1,
 };
 
@@ -123,10 +131,19 @@ async function load(append = false): Promise<void> {
   }
   const generation = state.generation;
   const offset = append ? state.items.length : 0;
+  const key = `${query}@${offset}`;
+  if (append && state.appending === key) return; // already loading this page
+  if (append) state.appending = key;
   const buffered = state.buffer?.query === query && state.buffer.offset === offset ? state.buffer.items : null;
   state.buffer = null;
-  const page = buffered ? { total: state.total, items: buffered } : await fetchPage(query, offset);
+  let page: Page;
+  try {
+    page = buffered ? { total: state.total, items: buffered } : await fetchPage(query, offset);
+  } finally {
+    if (state.appending === key) state.appending = null;
+  }
   if (generation !== state.generation || state.query !== query) return;
+  if (append && state.items.length !== offset) return; // the list moved on while this was loading
 
   state.items = append ? [...state.items, ...page.items] : page.items;
   state.total = page.total;
@@ -177,6 +194,7 @@ function renderList(): void {
       el('td', {}, asset.mimeType),
       el('td', {}, String(asset.sizeBytes)),
       el('td', {}, asset.updatedAt),
+      ...(rowActions ? [el('td', {}, el('button', { type: 'button' }, 'More actions'))] : []),
     );
   });
   const table = el(
@@ -219,7 +237,7 @@ async function send(entry: Upload): Promise<void> {
   }
   const res = await fetch(`/api/uploads?filename=${encodeURIComponent(entry.file.name)}`, {
     method: 'POST',
-    body: entry.file,
+    body: is('json-body') ? JSON.stringify(entry.file) : entry.file,
     headers: { 'Content-Type': entry.file.type || 'application/octet-stream' },
   });
   if (res.ok) {
@@ -241,6 +259,7 @@ function renderUploads(): void {
     const actions: HTMLElement[] = [];
     const snapshot = { file: entry.file, code: entry.code };
     const recovered = async () => {
+      state.recoveredOnce = true;
       if (is('stale-after-recovery')) return;
       if (is('stale-rerender')) {
         // The upload succeeded, but the screen re-creates the same failure.
@@ -290,7 +309,9 @@ function renderUploads(): void {
     if (state.frozenSummary === null && !state.uploads.some((u) => u.status === 'pending')) state.frozenSummary = summary;
     summary = state.frozenSummary ?? summary;
   }
-  uploadsRegion.replaceChildren(el('p', { role: 'status', 'aria-label': 'Upload results' }, summary), el('ul', {}, ...items));
+  const list = el('ul', {}, ...items);
+  if (is('summary-vanishes') && state.recoveredOnce) uploadsRegion.replaceChildren(list);
+  else uploadsRegion.replaceChildren(el('p', { role: 'status', 'aria-label': 'Upload results' }, summary), list);
 }
 
 upload.addEventListener('change', async () => {
@@ -299,6 +320,7 @@ upload.addEventListener('change', async () => {
   const entries = files.map((file): Upload => ({ key: state.nextKey++, file, status: 'pending' }));
   state.uploads = entries;
   state.frozenSummary = null;
+  state.recoveredOnce = false;
   renderUploads();
   await Promise.all(entries.map(send));
   renderUploads();

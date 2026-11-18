@@ -143,13 +143,23 @@ export async function loadMore(page: Page, filenames: readonly string[]): Promis
   }, ITEM);
   if (await newItemsAppear(1_500)) return true;
 
-  const control = page
+  // The pagination control (brief requirement 8): outside the asset items,
+  // not a menu trigger, named "more" or "next". Row actions such as
+  // "More actions" are skipped.
+  const candidates = page
     .getByRole('button', { name: /more|next/i })
     .or(page.getByRole('link', { name: /more|next/i }))
-    .filter({ visible: true })
-    .first();
-  if ((await control.count()) === 0) return false;
-  await control.click({ timeout: 10_000 });
+    .filter({ visible: true });
+  const index = await candidates.evaluateAll(
+    (els, itemSelector) =>
+      els.findIndex((el) => {
+        const popup = el.getAttribute('aria-haspopup');
+        return !el.closest(itemSelector) && (popup === null || popup === 'false');
+      }),
+    ITEM,
+  );
+  if (index < 0) return false;
+  await candidates.nth(index).click({ timeout: 10_000 });
   return newItemsAppear(5_000);
 }
 
@@ -170,6 +180,45 @@ export async function isSelected(item: Locator): Promise<boolean> {
   const box = item.getByRole('checkbox');
   if ((await box.count()) > 0) return box.first().isChecked();
   return (await item.getAttribute('aria-selected')) === 'true';
+}
+
+export interface TouchTarget {
+  label: string;
+  tag: string;
+  width: number;
+  height: number;
+  meetsMinimum: boolean;
+}
+
+/** The touch-target minimum from Apple's HIG and the design system's size.target.touch. */
+export const TOUCH_TARGET_MIN = 44;
+
+/**
+ * Measures every visible interactive element's clickable area in CSS
+ * pixels. A form control's associated <label> counts toward its area.
+ * Design-fit evidence (P6), recorded rather than asserted.
+ */
+export async function measureTouchTargets(page: Page): Promise<TouchTarget[]> {
+  return page.evaluate((min) => {
+    const selector = 'button, a[href], input:not([type=hidden]), select, textarea, [role=button], [role=link], [role=checkbox], [role=menuitem], [tabindex]:not([tabindex="-1"])';
+    const targets: TouchTarget[] = [];
+    for (const el of document.querySelectorAll<HTMLElement>(selector)) {
+      if (el.getClientRects().length === 0) continue;
+      const rects = [el.getBoundingClientRect()];
+      for (const label of (el as HTMLInputElement).labels ?? []) rects.push(label.getBoundingClientRect());
+      const visible = rects.filter((r) => r.width > 0 && r.height > 0);
+      if (visible.length === 0) continue;
+      const left = Math.min(...visible.map((r) => r.left));
+      const right = Math.max(...visible.map((r) => r.right));
+      const top = Math.min(...visible.map((r) => r.top));
+      const bottom = Math.max(...visible.map((r) => r.bottom));
+      const width = Math.round((right - left) * 10) / 10;
+      const height = Math.round((bottom - top) * 10) / 10;
+      const label = (el.getAttribute('aria-label') ?? el.innerText ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
+      targets.push({ label, tag: el.tagName.toLowerCase(), width, height, meetsMinimum: width >= min && height >= min });
+    }
+    return targets;
+  }, TOUCH_TARGET_MIN);
 }
 
 /** The upload result: a status region whose accessible name contains "upload" (brief requirement 7). */
@@ -208,6 +257,7 @@ export async function settleUploads(page: Page, min: number): Promise<LogEntry[]
 }
 
 const SUCCEEDING = BATCH_NAMES.filter((n) => n !== TRANSIENT_FAILURE_FILENAME && n !== OVERSIZED_FILENAME);
+export const UPLOAD_SIZES = new Map(UPLOAD_BATCH.map((f) => [f.filename, f.sizeBytes]));
 
 /**
  * Uploads the 12-file batch and checks it went out as expected: each of the
@@ -221,16 +271,25 @@ export async function uploadBatch(page: Page): Promise<void> {
   await page.locator('input[type=file][multiple]').first().setInputFiles(uploadFiles.batch);
   const sent = uploadsIn(await settleUploads(page, before + UPLOAD_BATCH.length - 1)).slice(before);
 
+  // Every request must carry the file's real bytes, so sizes are checked too.
   const problems: string[] = [];
-  const statuses = (name: string) => sent.filter((e) => e.filename === name).map((e) => e.status);
+  const sentFor = (name: string) => sent.filter((e) => e.filename === name);
+  const show = (es: LogEntry[]) => `[${es.map((e) => `${e.status} with ${e.sizeBytes ?? '?'} bytes`).join(', ')}]`;
+  const fullSize = (name: string, es: LogEntry[]) => es.every((e) => e.sizeBytes === UPLOAD_SIZES.get(name));
   for (const name of SUCCEEDING) {
-    const s = statuses(name);
-    if (s.length !== 1 || s[0] !== 201) problems.push(`${name}: expected one successful upload, got [${s.join(', ')}]`);
+    const es = sentFor(name);
+    if (es.length !== 1 || es[0]?.status !== 201 || !fullSize(name, es)) {
+      problems.push(`${name}: expected one successful upload of ${UPLOAD_SIZES.get(name)} bytes, got ${show(es)}`);
+    }
   }
-  const transient = statuses(TRANSIENT_FAILURE_FILENAME);
-  if (transient.length !== 1 || transient[0] !== 503) problems.push(`${TRANSIENT_FAILURE_FILENAME}: expected one failed attempt, got [${transient.join(', ')}]`);
-  const oversized = statuses(OVERSIZED_FILENAME);
-  if (oversized.length > 1 || oversized.some((s) => s !== 413)) problems.push(`${OVERSIZED_FILENAME}: expected at most one rejected attempt, got [${oversized.join(', ')}]`);
+  const transient = sentFor(TRANSIENT_FAILURE_FILENAME);
+  if (transient.length !== 1 || transient[0]?.status !== 503 || !fullSize(TRANSIENT_FAILURE_FILENAME, transient)) {
+    problems.push(`${TRANSIENT_FAILURE_FILENAME}: expected one failed attempt of ${UPLOAD_SIZES.get(TRANSIENT_FAILURE_FILENAME)} bytes, got ${show(transient)}`);
+  }
+  const oversized = sentFor(OVERSIZED_FILENAME);
+  if (oversized.length > 1 || oversized.some((e) => e.status !== 413) || !fullSize(OVERSIZED_FILENAME, oversized)) {
+    problems.push(`${OVERSIZED_FILENAME}: expected at most one rejected attempt of ${UPLOAD_SIZES.get(OVERSIZED_FILENAME)} bytes, got ${show(oversized)}`);
+  }
   const unexpected = sent.filter((e) => !BATCH_NAMES.includes(e.filename ?? ''));
   if (unexpected.length) problems.push(`unexpected uploads: ${unexpected.map((e) => e.filename).join(', ')}`);
   expect(problems, 'the initial batch upload').toEqual([]);
@@ -394,9 +453,10 @@ interface Attempt {
 
 /**
  * After a successful recovery request, the screen must stop reporting the
- * failure (checked afresh, by filename) and the upload summary itself (the
- * status region named "upload…") must read differently or be gone. Other
- * live regions changing, such as an asset count, don't count.
+ * failure (checked afresh, by filename). The upload summary itself (the
+ * status region named "upload…") must still be on screen, because the other
+ * failure remains, and must read differently. Other live regions changing,
+ * such as an asset count, don't count.
  */
 async function waitUntilCleared(
   page: Page,
@@ -409,9 +469,16 @@ async function waitUntilCleared(
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     const still = await failureStillShown(page, filename, itemText, usedLabel);
-    const summaryChanged = (await summaryText(page)) !== summaryBefore;
-    if (!still && summaryChanged) return null;
-    reason = [still, !summaryChanged && `the upload summary still reads "${summaryBefore}"`].filter(Boolean).join(' and ');
+    // The other failure is still on screen, so the summary must be too.
+    const summary = await summaryText(page);
+    const summaryProblem =
+      summary === null || summary === ''
+        ? 'the upload summary is gone although a failure remains'
+        : summary === summaryBefore
+          ? `the upload summary still reads "${summaryBefore}"`
+          : null;
+    if (!still && !summaryProblem) return null;
+    reason = [still, summaryProblem].filter(Boolean).join(' and ');
     await page.waitForTimeout(200);
   }
   return reason;
@@ -484,7 +551,10 @@ function judgeTransient(a: Attempt): Verdict {
   const mine = a.uploads.filter((u) => u.filename === TRANSIENT_FAILURE_FILENAME);
   if (others.length) problems.push(`${describeAttempt(a)} also sent ${others.map((u) => u.filename).join(', ')}`);
   if (mine.length > 1) problems.push(`${describeAttempt(a)} sent ${TRANSIENT_FAILURE_FILENAME} ${mine.length} times`);
-  const sent = mine.length === 1 && mine[0]?.status === 201 && others.length === 0;
+  const expectedBytes = UPLOAD_SIZES.get(TRANSIENT_FAILURE_FILENAME);
+  const wrongSize = mine.filter((u) => u.sizeBytes !== expectedBytes);
+  if (wrongSize.length) problems.push(`${describeAttempt(a)} sent ${wrongSize[0]?.sizeBytes} bytes instead of ${expectedBytes}`);
+  const sent = mine.length === 1 && mine[0]?.status === 201 && others.length === 0 && wrongSize.length === 0;
   if (sent && a.notCleared) problems.push(`${describeAttempt(a)} uploaded the file, but ${a.notCleared}`);
   return { recovered: sent && !a.notCleared, problems };
 }

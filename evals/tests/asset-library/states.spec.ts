@@ -10,6 +10,7 @@ import {
   openLibrary,
   searchField,
   settleUploads,
+  UPLOAD_SIZES,
   uploadFiles,
   visibleItems,
   waitForItems,
@@ -38,6 +39,7 @@ test('empty: no items, and uploading a file adds it', async ({ page }) => {
   const entries = await settleUploads(page, 1);
   const upload = entries.find((e) => e.path === '/api/uploads');
   expect(upload?.status).toBe(201);
+  expect(upload?.sizeBytes, 'the upload carries the file’s bytes').toBe(UPLOAD_SIZES.get(upload?.filename ?? ''));
   await expect(libraryItem(page, upload?.filename ?? '')).toBeVisible();
 });
 
