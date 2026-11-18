@@ -305,6 +305,10 @@ Setup:
       any other count up to the batch size must be the number still
       failing. Wording is free. It must stay on screen while a failure
       remains. Other live regions don't count.
+      *Owner decision, 2026-11-19:* keep this rule, even though it nudges
+      every condition toward the owner's "N of M uploaded" structure. A
+      machine-readable alternative (`data-uploaded` and `data-total`
+      attributes) was considered and not chosen.
     - At least one working recovery must also work with Tab and Enter.
     - Both failures must be recoverable in one batch, in either order.
       After the first recovery, the other file keeps its failed item and
