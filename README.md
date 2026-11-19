@@ -23,9 +23,12 @@ Early and personal. What exists today:
   lint rules for product styles, and a single `pnpm check`.
 - **Asset-library eval inputs**: fixtures, a mock API, the brief, and shared
   behavior tests that pass against an unstyled conformance app.
+- **Eval starter**: the blank workspace every generator gets, and the script
+  that assembles one. It's proven by running the conformance app inside a
+  fresh workspace.
 
 Not built yet: React primitives and components, reference screens, the eval
-starter, rubric and runner, and the held-out workspace-members brief.
+rubric and runner, and the held-out workspace-members brief.
 [`AGENTS.md`](AGENTS.md) has the full plan.
 
 ## What's here
@@ -37,7 +40,7 @@ starter, rubric and runner, and the held-out workspace-members brief.
 | [`packages/lint/`](packages/lint/) | The stylelint rule `ds/token-values`, which rejects raw design values in product CSS, and the Oxlint plugin that forbids inline styles and raw colors in product code |
 | [`packages/react/`](packages/react/) | Layout primitives, components and patterns (empty for now) |
 | [`apps/playground/`](apps/playground/) | Reference screens, Storybook and end-to-end tests |
-| [`evals/`](evals/) | Briefs, fixtures, the mock API, and shared behavior tests |
+| [`evals/`](evals/) | Briefs, fixtures, the mock API, shared behavior tests, and the eval starter |
 | [`AGENTS.md`](AGENTS.md) | Canonical instructions for every coding agent, including the eval protocol |
 
 ## Getting started
