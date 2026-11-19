@@ -130,40 +130,6 @@
         "prefer-rest-params": "error",
         "prefer-spread": "error"
       }
-    },
-    {
-      "files": [
-        "apps/playground/src/**/*.{ts,tsx}",
-        "packages/react/src/**/*.{ts,tsx}"
-      ],
-      "rules": {
-        "react/rules-of-hooks": "error",
-        "react/exhaustive-deps": "warn",
-        "react/static-components": "error",
-        "react/use-memo": "error",
-        "react/void-use-memo": "error",
-        "react/preserve-manual-memoization": "error",
-        "react/incompatible-library": "warn",
-        "react/immutability": "error",
-        "react/globals": "error",
-        "react/refs": "error",
-        "react/set-state-in-effect": "error",
-        "react/error-boundaries": "error",
-        "react/purity": "error",
-        "react/set-state-in-render": "error",
-        "react/unsupported-syntax": "warn",
-        "ds/no-inline-style": "error",
-        "ds/no-raw-color": "error"
-      },
-      "plugins": [
-        "react"
-      ],
-      "env": {
-        "browser": true
-      },
-      "jsPlugins": [
-        "./packages/lint/oxlint-plugin.js"
-      ]
     }
   ]
 }

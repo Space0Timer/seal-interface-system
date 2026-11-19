@@ -9,11 +9,10 @@
   "scripts": {
     "tokens:check": "pnpm --filter @ds/tokens check",
     "tokens:build": "pnpm --filter @ds/tokens build",
-    "lint": "oxlint && stylelint \"**/*.css\"",
+    "lint": "oxlint && stylelint --allow-empty-input \"**/*.css\"",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
-    "build": "pnpm -r build",
-    "check": "pnpm tokens:check && pnpm tokens:build && pnpm lint && pnpm typecheck && pnpm test && pnpm build"
+    "check": "pnpm tokens:check && pnpm tokens:build && pnpm lint && pnpm typecheck && pnpm test"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

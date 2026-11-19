@@ -3,6 +3,9 @@
 Pull requests are welcome. This is a personal project, so the owner makes
 every design decision and the final call on each change.
 
+The React components and reference screens live in a separate private
+repo, so they aren't open to contributions.
+
 ## What needs the owner first
 
 Open an issue before you change any of these. A pull request that changes
@@ -10,8 +13,6 @@ them without agreement will be closed or reworked.
 
 - **Principles, bans and tokens** in `core/design-system/`. Every ban is
   confirmed by the owner before it is written down.
-- **Reference screens.** A screen becomes a reference only after the owner
-  approves it.
 - **Eval results, the rubric and the briefs.** The owner makes the final
   call on eval results.
 - **Anything listed as out of scope** in [`AGENTS.md`](AGENTS.md#out-of-scope):
@@ -30,14 +31,14 @@ pnpm install
 ```
 
 ```bash
-pnpm --filter @ds/playground exec playwright install chromium
+pnpm --filter @ds/eval-tests exec playwright install chromium
 ```
 
 ## Before you open a pull request
 
 `pnpm check` must pass. It runs token validation and contrast pairs, the
-token CSS build, Oxlint and stylelint, type checks, unit and Playwright
-tests, and the Vite and Storybook builds.
+token CSS build, Oxlint and stylelint, type checks, and unit and
+Playwright tests.
 
 ```bash
 pnpm check
