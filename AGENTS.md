@@ -242,6 +242,11 @@ workspace. It must be outside this repo for real runs. The workspace gets:
 - `template/`: a blank Vite + React + TS app that renders nothing, with no
   styles. Dependencies are pinned exactly and installed from its own
   lockfile.
+  - Only the files named in `TEMPLATE_FILES` in `materialize.ts` are
+    copied, one by one. Local extras in the template folder (`.env`
+    files, build output, OS junk) never reach a workspace.
+  - A test keeps `TEMPLATE_FILES` equal to the template's git-tracked
+    files, so add any new template file to both.
 - `tools/`: the mock API (Vite plugin) and the token converter, copied
   from their single sources (`evals/fixtures/src/`, `packages/tokens/src/`).
   - Generators can read these files, so their comments must stay neutral.
@@ -261,13 +266,19 @@ Every input is checked before anything is created:
 - `--brief` must be a single brief name from `evals/briefs`, not a path.
 - `--guidance-to` must name a folder strictly inside the workspace. The
   workspace root (`.`) is rejected.
-
-The template copy skips `node_modules`, `dist`, `.vite` and `.DS_Store`.
+- If the guidance contains tokens, they must land where `prepare.ts` will
+  find them: at most 4 folders deep, and not inside a skipped folder. A
+  destination such as `.claude/plugins/local/skills/design-system` (5
+  deep) or `src/design-system` is rejected, so a run can never silently go
+  without its tokens.
+- After copying, the workspace's own search confirms it finds those tokens.
 
 `pnpm dev` and `pnpm build` run `tools/prepare.ts`:
 - If any `tokens.resolver.json` is in the workspace, it writes
-  `src/design-tokens.css`. It searches 4 levels deep, follows linked
-  folders, and skips `.git`.
+  `src/design-tokens.css`. The search lives in `tools/find-tokens.ts`,
+  which the materializer also uses. It goes 4 folders deep, follows linked
+  folders, and skips `node_modules`, `dist`, `src`, `tools`, the upload
+  folders, `.git` and `.vite`.
 - Otherwise it removes only a stale file it generated itself, recognized by
   the converter's header. It never touches a file someone else wrote.
 - The README tells the app to import the file; it isn't loaded

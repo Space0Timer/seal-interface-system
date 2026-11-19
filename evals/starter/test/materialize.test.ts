@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { after, test } from 'node:test';
 import { REPLACEMENT_FILE, UPLOAD_BATCH } from '../../fixtures/src/data.ts';
-import { materialize, REPO, TEMPLATE } from '../src/materialize.ts';
+import { materialize, REPO, TEMPLATE, TEMPLATE_FILES } from '../src/materialize.ts';
 
 // Every temp folder this file creates is removed when the run ends.
 const temps: string[] = [];
@@ -155,21 +155,47 @@ test('guidance must land in a folder inside the workspace, never its root; an ex
   assert.throws(() => materialize({ out: ws, install: false }), /isn't empty/);
 });
 
-test('junk in the template folder (dist, .vite, .DS_Store) is never copied', () => {
-  const junk = [join(TEMPLATE, 'dist', 'index.html'), join(TEMPLATE, '.vite', 'deps.json'), join(TEMPLATE, '.DS_Store'), join(TEMPLATE, 'src', '.DS_Store')];
-  try {
-    for (const file of junk) {
-      mkdirSync(join(file, '..'), { recursive: true });
-      writeFileSync(file, 'junk');
-    }
-    const ws = materialize({ out: fresh(), install: false });
-    for (const file of junk) assert.ok(!existsSync(join(ws, relative(TEMPLATE, file))), relative(TEMPLATE, file));
-  } finally {
-    rmSync(join(TEMPLATE, 'dist'), { recursive: true, force: true });
-    rmSync(join(TEMPLATE, '.vite'), { recursive: true, force: true });
-    rmSync(join(TEMPLATE, '.DS_Store'), { force: true });
-    rmSync(join(TEMPLATE, 'src', '.DS_Store'), { force: true });
+test('the declared template files are exactly the template\'s tracked files', () => {
+  const tracked = execFileSync('git', ['ls-files'], { cwd: TEMPLATE, encoding: 'utf8' }).trim().split('\n').sort();
+  assert.deepEqual(tracked, [...TEMPLATE_FILES].sort());
+});
+
+test('only declared template files are copied; local extras (.env.local, dist, .vite, .DS_Store) stay out', () => {
+  // A temporary copy of the template, so the real one is never touched.
+  const template = temp('starter-template-');
+  for (const file of TEMPLATE_FILES) {
+    mkdirSync(join(template, file, '..'), { recursive: true });
+    copyFileSync(join(TEMPLATE, file), join(template, file));
   }
+  const extras = ['.env.local', 'dist/index.html', '.vite/deps.json', '.DS_Store', 'src/.DS_Store', 'src/notes.local.ts'];
+  for (const file of extras) {
+    mkdirSync(join(template, file, '..'), { recursive: true });
+    writeFileSync(join(template, file), 'local only');
+  }
+  const ws = materialize({ out: fresh(), install: false, templateDir: template });
+  for (const file of extras) assert.ok(!existsSync(join(ws, file)), file);
+  for (const file of TEMPLATE_FILES) assert.ok(existsSync(join(ws, file)), file);
+});
+
+test('guidance tokens that prepare would not find are rejected before anything is created', () => {
+  for (const to of ['.claude/plugins/local/skills/design-system', 'src/design-system', 'tools/design-system', 'a/b/c/d/e']) {
+    const out = fresh();
+    assert.throws(() => materialize({ out, install: false, guidance: { from: 'core/design-system', to } }), /wouldn't find the guidance tokens/, to);
+    assert.ok(!existsSync(out), to);
+  }
+  // Every accepted destination produces the token CSS.
+  for (const to of ['design-system', '.claude/skills/design-system', '.agents/skills/design-system', 'a/b/c/design-system']) {
+    const ws = materialize({ out: fresh(), install: false, guidance: { from: 'core/design-system', to } });
+    execFileSync(process.execPath, ['tools/prepare.ts'], { cwd: ws, stdio: 'pipe' });
+    assert.ok(existsSync(join(ws, 'src', 'design-tokens.css')), to);
+  }
+});
+
+test('guidance without tokens can go anywhere inside the workspace', () => {
+  const guidance = temp('starter-guidance-');
+  writeFileSync(join(guidance, 'SKILL.md'), '---\nname: x\n---\n');
+  const ws = materialize({ out: fresh(), install: false, guidance: { from: guidance, to: '.claude/plugins/local/skills/x' } });
+  assert.ok(existsSync(join(ws, '.claude', 'plugins', 'local', 'skills', 'x', 'SKILL.md')));
 });
 
 test('prepare follows a linked token folder and skips .git', () => {

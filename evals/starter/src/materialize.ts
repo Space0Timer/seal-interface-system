@@ -13,11 +13,12 @@
 // Example (my-skill condition, Claude Code project skill):
 //   --guidance-from core/design-system --guidance-to .claude/skills/design-system
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { writeUploadFiles } from '../../fixtures/src/files.ts';
+import { findResolver, isDiscoverable, MAX_DEPTH, RESOLVER, SKIP } from '../template/tools/find-tokens.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const REPO = resolve(here, '../../..');
@@ -34,8 +35,24 @@ export const TOOL_SOURCES: Record<string, string[]> = {
   ],
 };
 
-/** Never copied from the template, wherever they appear. */
-const TEMPLATE_SKIP = new Set(['node_modules', 'dist', '.vite', '.DS_Store']);
+/**
+ * The starter's files, copied one by one. Nothing else in the template
+ * folder (build output, .env files, editor or OS junk) ever reaches a
+ * workspace. A test keeps this list equal to the template's tracked files.
+ */
+export const TEMPLATE_FILES = [
+  'README.md',
+  'index.html',
+  'package.json',
+  'pnpm-lock.yaml',
+  'pnpm-workspace.yaml',
+  'tsconfig.json',
+  'vite.config.ts',
+  'src/App.tsx',
+  'src/main.tsx',
+  'tools/find-tokens.ts',
+  'tools/prepare.ts',
+];
 
 export interface Guidance {
   /** Directory to copy, absolute or relative to the repo. */
@@ -49,6 +66,8 @@ export interface MaterializeOptions {
   brief?: string;
   guidance?: Guidance | undefined;
   install?: boolean;
+  /** The template folder to copy from. Only tests change it. */
+  templateDir?: string;
 }
 
 const BRIEF_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -112,19 +131,45 @@ function assertNoLinks(dir: string): void {
   }
 }
 
-export function materialize({ out, brief = 'asset-library', guidance, install = true }: MaterializeOptions): string {
+/** Path of the first tokens.resolver.json in a guidance tree, relative to it, if any. */
+function resolverIn(dir: string, base = dir): string | undefined {
+  const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+  if (entries.some((e) => e.name === RESOLVER && statSync(join(dir, e.name)).isFile())) return relative(base, join(dir, RESOLVER));
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (!statSync(path).isDirectory()) continue;
+    const found = resolverIn(path, base);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+export function materialize({ out, brief = 'asset-library', guidance, install = true, templateDir = TEMPLATE }: MaterializeOptions): string {
   // Check every input before creating anything.
   const target = resolve(out);
   const briefPath = briefSource(brief);
   const destination = guidance ? guidanceDestination(target, guidance.to) : undefined;
   const guidancePath = guidance ? guidanceSource(guidance) : undefined;
+  const missing = TEMPLATE_FILES.filter((file) => !existsSync(join(templateDir, file)));
+  if (missing.length) throw new Error(`the template is missing ${missing.join(', ')}`);
+
+  // Guidance with tokens must land where tools/prepare.ts will find them;
+  // otherwise a run would silently go without its assigned tokens.
+  const resolverRel = guidancePath ? resolverIn(guidancePath) : undefined;
+  const tokensAt = destination && resolverRel ? relative(target, join(destination, resolverRel)) : undefined;
+  if (tokensAt && !isDiscoverable(tokensAt)) {
+    throw new Error(
+      `tools/prepare.ts wouldn't find the guidance tokens at ${tokensAt}: put the guidance at most ${MAX_DEPTH} folders deep, ` +
+        `and not inside ${[...SKIP].join(', ')}`,
+    );
+  }
   if (existsSync(target) && readdirSync(target).length > 0) throw new Error(`${target} already exists and isn't empty`);
   mkdirSync(target, { recursive: true });
 
-  cpSync(TEMPLATE, target, {
-    recursive: true,
-    filter: (src) => !relative(TEMPLATE, src).split(sep).some((part) => TEMPLATE_SKIP.has(part)),
-  });
+  for (const file of TEMPLATE_FILES) {
+    mkdirSync(dirname(join(target, file)), { recursive: true });
+    copyFileSync(join(templateDir, file), join(target, file));
+  }
 
   for (const [dir, sources] of Object.entries(TOOL_SOURCES)) {
     mkdirSync(join(target, dir), { recursive: true });
@@ -138,6 +183,11 @@ export function materialize({ out, brief = 'asset-library', guidance, install = 
     // Real files only: a link would point back into this checkout.
     cpSync(guidancePath, destination, { recursive: true, dereference: true });
     assertNoLinks(destination);
+    // Confirm with the workspace's own search that these tokens are the ones it finds.
+    if (tokensAt && findResolver(target) !== join(target, tokensAt)) {
+      rmSync(target, { recursive: true, force: true });
+      throw new Error(`tools/prepare.ts wouldn't use the guidance tokens at ${tokensAt}`);
+    }
   }
 
   if (install) {
