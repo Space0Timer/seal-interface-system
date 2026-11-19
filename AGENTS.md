@@ -62,7 +62,8 @@ core/design-system/    the skill
   contrast-pairs.json  foreground/background pairs and minimums
 packages/tokens/       token validation, contrast check, and the
                        DTCG-to-CSS converter (dist/tokens.css)
-packages/lint/         stylelint rule ds/token-values
+packages/lint/         stylelint rule ds/token-values and the
+                       Oxlint plugin for product code
 packages/react/        primitives, components, patterns         (empty)
 apps/playground/       reference screens, Storybook, e2e tests  (no screens yet)
 evals/fixtures/        asset data, upload batch, mock API and
@@ -78,7 +79,7 @@ evals/                 starter, rubric, runner, adapters,       (not yet)
 ```
 
 Root configs: `package.json` (scripts), `pnpm-workspace.yaml`,
-`tsconfig.base.json`, `eslint.config.js`, `stylelint.config.js`.
+`tsconfig.base.json`, `.oxlintrc.json`, `stylelint.config.js`.
 
 ### Commands
 
@@ -91,7 +92,7 @@ pnpm --filter @ds/playground exec playwright install chromium
 `pnpm check` is the one check. It runs, in order:
 1. token validation and contrast pairs
 2. the token CSS build
-3. ESLint and stylelint
+3. Oxlint and stylelint
 4. type checks
 5. unit tests and Playwright
 6. the Vite and Storybook builds
@@ -108,8 +109,9 @@ Others:
 - **Node 24 or later** runs the token tooling's TypeScript directly, with no
   build step. Use erasable syntax only: no enums, namespaces or parameter
   properties.
-- **TypeScript is pinned to 6.0** because typescript-eslint 8 supports only
-  versions below 6.1. Revisit when it supports TypeScript 7.
+- **TypeScript 7** is the native compiler. Its package has no stable
+  JavaScript compiler API, so tools that load `typescript` in-process
+  can't run here. typescript-eslint is one: it requires a version below 6.1.
 - **pnpm 12** runs install scripts only for packages listed under
   `allowBuilds` in `pnpm-workspace.yaml`, currently just esbuild.
 - **Lint**:
@@ -117,8 +119,12 @@ Others:
     token names. It rejects raw colors, lengths, type values, shadows,
     motion values and unknown custom properties, and allows structural
     CSS.
-  - ESLint forbids inline `style` props and raw color literals in product
-    code.
+  - Oxlint runs the JavaScript, TypeScript and React Hooks rules. In
+    product code, its `ds/no-inline-style` and `ds/no-raw-color` rules (a
+    JS plugin in `packages/lint/`) forbid inline `style` props and raw
+    color literals.
+  - Oxlint's JS plugin API is alpha and outside semver, so `oxlint` is
+    pinned to an exact version. The plugin's tests run in `pnpm check`.
 - **Playwright** has two projects: `desktop`, and `mobile-touch` (Pixel 7
   with touch emulation).
 - **Storybook** telemetry is disabled.
