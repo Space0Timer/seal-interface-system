@@ -1,0 +1,11 @@
+{
+  "name": "@ds/eval-starter",
+  "private": true,
+  "type": "module",
+  "description": "The identical starting workspace every eval generator gets, and the script that assembles it.",
+  "scripts": {
+    "materialize": "node src/materialize.ts",
+    "test": "node --test \"test/**/*.test.ts\" && node test/prove-conformance.ts",
+    "typecheck": "tsc -p ."
+  }
+}

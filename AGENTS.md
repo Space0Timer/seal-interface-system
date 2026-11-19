@@ -74,8 +74,10 @@ evals/fixtures/        asset data, upload batch, mock API and
 evals/briefs/          asset-library.md (held-out brief: not yet)
 evals/tests/           shared behavior tests, the contract-only
                        conformance app, and meta tests
-evals/                 starter, rubric, runner, adapters,       (not yet)
-                       results
+evals/starter/         template/ (the blank app every generator
+                       gets) and src/materialize.ts, which
+                       assembles a generator workspace
+evals/                 rubric, runner, adapters, results        (not yet)
 .claude/agents/        Claude-only adapters, e.g. reviewer.md,  (not yet)
                        which points to evals/rubric/ and holds
                        no criteria of its own
@@ -231,6 +233,37 @@ Setup:
   - In the my-skill condition it reads the workspace-local skill's tokens.
   - The other conditions get the same starter with no tokens to convert.
   - No condition has to build a token compiler.
+
+### The starter
+
+`evals/starter/src/materialize.ts --out <dir>` assembles one generator
+workspace. It must be outside this repo for real runs. The workspace gets:
+
+- `template/`: a blank Vite + React + TS app that renders nothing, with no
+  styles. Dependencies are pinned exactly and installed from its own
+  lockfile.
+- `tools/`: the mock API (Vite plugin) and the token converter, copied
+  from their single sources (`evals/fixtures/src/`, `packages/tokens/src/`).
+  Their comments must stay neutral, because generators can read them.
+- the brief, plus `upload-files/` and `replacement-files/`
+- optional design guidance, set with `--guidance-from <dir>` and
+  `--guidance-to <dir>`. For my-skill under Claude Code, that's
+  `core/design-system` → `.claude/skills/design-system`.
+
+`pnpm dev` and `pnpm build` run `tools/prepare.ts`. If any
+`tokens.resolver.json` is in the workspace, it writes
+`src/design-tokens.css`; otherwise it writes nothing.
+
+Tests (`pnpm --filter @ds/eval-starter test`):
+- **Contents:** a workspace contains exactly the expected files.
+- **No leaks:** nothing in a plain workspace has the owner's copy, or
+  words that reveal the eval (eval, condition, rubric, generator, SKILL.md
+  and others).
+- **Tokens:** the token file is generated only when tokens are present.
+- **Build:** the blank app installs and builds.
+- **Proof:** the conformance app, dropped into a fresh workspace and served
+  by its own dev server, passes the shared behavior tests. This proves the
+  starter itself can't make a condition fail.
 
 ### Scoring
 
@@ -435,12 +468,11 @@ comparison.
 
 - Asset-library eval inputs: the fixtures and mock API, the brief, and the
   shared behavior tests, which pass against the conformance app.
+- The eval starter and `materialize.ts`, proven by running the conformance
+  app inside a fresh workspace.
 
 Next:
 1. Build these, following the eval protocol:
-   - `evals/starter/`: Vite + React + TS, the mock API plugin, the token
-     converter, and `upload-files/` plus `replacement-files/` (written with
-     `writeUploadFiles` from `evals/fixtures/src/files.ts`)
    - `evals/rubric/`, for the owner to approve
    - the runner and the Claude Code adapter
    - `.claude/agents/reviewer.md`, pointing to the rubric

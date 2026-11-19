@@ -1,7 +1,7 @@
 // Converts resolved tokens to CSS custom properties.
-// Naming (documented in SKILL.md, keep in sync): a token path becomes a custom
-// property with dots replaced by hyphens; typography roles expand to one
-// property per field.
+// Naming: a token path becomes a custom property with dots replaced by
+// hyphens; typography roles expand to one property per field.
+// (This file is copied into generated workspaces; keep comments neutral.)
 import { isObject, type Json, type ResolvedMode, type Token } from './resolve.ts';
 
 /** Groups product code may use. palette.* and font.* primitives are never emitted. */

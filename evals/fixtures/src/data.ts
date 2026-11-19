@@ -1,7 +1,8 @@
-// Fixture data for the asset-library eval. Deterministic: the same data on
-// every run, for every condition. Deliberately messy: long and unicode
-// filenames, near-duplicates, missing thumbnails, a zero-byte file, sizes
-// from 1 KB to 4 GB, and a 10,000-asset scenario.
+// Asset library data for the mock API. Deterministic: the same data every
+// time. Realistically messy: long and unicode filenames, near-duplicates,
+// missing thumbnails, a zero-byte file, sizes from 1 KB to 4 GB, and a
+// 10,000-asset scenario.
+// (This file is copied into generated workspaces; keep comments neutral.)
 
 export const NOW = '2026-11-18T09:30:00Z';
 
@@ -211,7 +212,7 @@ export function assetsFor(scenario: Scenario): readonly Asset[] {
   return large;
 }
 
-/** The batch every generator and test uploads to reach partial upload failure. */
+/** The upload batch that reaches partial upload failure. */
 export interface UploadFile {
   filename: string;
   sizeBytes: number;

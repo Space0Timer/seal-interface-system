@@ -1,17 +1,17 @@
-// Mock asset API shared by every eval condition and the behavior tests.
-// A plain Node (req, res, next) handler, so it runs as Vite dev/preview
-// middleware or in any Node server.
+// Mock asset API. A plain Node (req, res, next) handler, so it runs as Vite
+// dev/preview middleware or in any Node server.
+// (This file is copied into generated workspaces; keep comments neutral.)
 //
-// State is per session (cookie "mock-session"), so parallel test runs don't
+// State is per session (cookie "mock-session"), so parallel sessions don't
 // interfere. Requests without the cookie share a "default" session.
 //
-// Product endpoints (documented in evals/briefs/asset-library.md):
+// Product endpoints (documented in the brief):
 //   GET  /api/assets?q=&offset=&limit=
 //   GET  /api/assets/:id
 //   POST /api/assets/delete           { "ids": [...] }
 //   POST /api/uploads?filename=...    raw file bytes as the body
 //   GET  /api/thumbnails/:id.svg
-// Control endpoints (for generators previewing states, and for tests):
+// Control endpoints (for previewing scenarios):
 //   GET  /__mock/reset?scenario=default|empty|large[&to=/path]
 //   POST /__mock/reset                { "scenario": "..." }
 //   GET  /__mock/log
