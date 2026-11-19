@@ -100,8 +100,7 @@ Pull requests are welcome. Design decisions stay with the owner. See
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). You may use,
-change and share it, including commercially. If you share it or a modified
-version, include the license and [`NOTICE`](NOTICE), keep the copyright
-notices, and mark the files you changed.
+change and share it, including commercially. See section 4 of the license
+for redistribution and attribution requirements.
 
 This project is not affiliated with or endorsed by Apple Inc.
