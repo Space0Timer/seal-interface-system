@@ -2,7 +2,6 @@
 // time. Realistically messy: long and unicode filenames, near-duplicates,
 // missing thumbnails, a zero-byte file, sizes from 1 KB to 4 GB, and a
 // 10,000-asset scenario.
-// (This file is copied into generated workspaces; keep comments neutral.)
 
 export const NOW = '2026-11-18T09:30:00Z';
 

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { createServer, type Server } from 'node:http';
+import { createServer, request, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { after, before, test } from 'node:test';
 import { DEFAULT_ASSETS, NO_RESULTS_QUERY, OVERSIZED_FILENAME, TRANSIENT_FAILURE_FILENAME, UPLOAD_LIMIT_BYTES } from '../src/data.ts';
-import { createMockApi, type LogEntry } from '../src/mock-api.ts';
+import { ABORTED_STATUS, createMockApi, type LogEntry } from '../src/mock-api.ts';
 
 let server: Server;
 let base: string;
@@ -111,6 +111,39 @@ test('GET reset sets the session cookie and redirects for previewing states in a
   assert.equal(res.headers.get('location'), '/library');
   assert.match(res.headers.get('set-cookie') ?? '', /^mock-session=[\w-]+; Path=\//);
   assert.equal((await fetch(`${base}/__mock/reset?scenario=nope`)).status, 400);
+});
+
+test('an upload whose connection closes mid-body is logged as aborted, not left in flight', async () => {
+  const cookie = await (async () => {
+    const res = await fetch(`${base}/__mock/reset`, { method: 'POST', body: JSON.stringify({ scenario: 'default' }) });
+    return (res.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
+  })();
+  const { port } = server.address() as AddressInfo;
+  const req = request({
+    host: '127.0.0.1',
+    port,
+    method: 'POST',
+    path: `/api/uploads?filename=${TRANSIENT_FAILURE_FILENAME}`,
+    headers: { cookie, 'content-length': '1000000' },
+  });
+  req.on('error', () => {});
+  req.write(Buffer.alloc(1000));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  req.destroy();
+
+  const logOf = async () =>
+    ((await (await fetch(`${base}/__mock/log`, { headers: { cookie } })).json()) as { entries: LogEntry[] }).entries;
+  let entry: LogEntry | undefined;
+  for (let i = 0; i < 40 && entry?.status !== ABORTED_STATUS; i++) {
+    entry = (await logOf()).find((e) => e.path === '/api/uploads');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(entry?.status, ABORTED_STATUS);
+  assert.equal(entry?.error, 'aborted');
+
+  // The aborted try doesn't count: the transient file still fails once first.
+  const retry = await fetch(`${base}/api/uploads?filename=${TRANSIENT_FAILURE_FILENAME}`, { method: 'POST', body: new Uint8Array(10), headers: { cookie } });
+  assert.equal(retry.status, 503);
 });
 
 test('thumbnails are deterministic SVG', async () => {

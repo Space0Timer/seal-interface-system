@@ -34,6 +34,9 @@ If this workspace contains DTCG design tokens (a `tokens.resolver.json`),
 token path becomes a CSS custom property with the dots replaced by hyphens,
 for example `--color-text-secondary`. Without tokens, nothing is generated.
 
+The file isn't loaded automatically. To use it, import it once, for example
+`import './design-tokens.css';` in `src/main.tsx`.
+
 ## Don't edit
 
 `tools/` holds the mock API and the token converter.

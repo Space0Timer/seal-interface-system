@@ -31,9 +31,11 @@ export const TOOL_SOURCES: Record<string, string[]> = {
     'evals/fixtures/src/mock-api.ts',
     'evals/fixtures/src/thumbnails.ts',
     'evals/fixtures/src/vite-plugin.ts',
-    'evals/fixtures/src/files.ts',
   ],
 };
+
+/** Never copied from the template, wherever they appear. */
+const TEMPLATE_SKIP = new Set(['node_modules', 'dist', '.vite', '.DS_Store']);
 
 export interface Guidance {
   /** Directory to copy, absolute or relative to the repo. */
@@ -59,7 +61,20 @@ function briefSource(brief: string): string {
   return path;
 }
 
-const isInside = (path: string, root: string) => path === root || path.startsWith(root + sep);
+/** True if `path` is `root` or inside it. Handles "..tmp" names and other drives. */
+export function isInside(path: string, root: string): boolean {
+  const rel = relative(root, path);
+  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
+}
+
+/** Where guidance lands: strictly inside the workspace, never the workspace root itself. */
+function guidanceDestination(target: string, to: string): string {
+  const destination = resolve(target, to);
+  if (!to || destination === target || !isInside(destination, target)) {
+    throw new Error(`guidance.to must be a folder inside the workspace, got "${to}"`);
+  }
+  return destination;
+}
 
 /**
  * Resolves the guidance directory (a link at its root is followed) and
@@ -67,8 +82,6 @@ const isInside = (path: string, root: string) => path === root || path.startsWit
  * at one of its own ancestors. Returns the real path to copy from.
  */
 function guidanceSource(guidance: Guidance): string {
-  const to = guidance.to;
-  if (!to || isAbsolute(to) || to.split(/[\\/]/).includes('..')) throw new Error('guidance.to must stay inside the workspace');
   const root = realpathSync(isAbsolute(guidance.from) ? guidance.from : join(REPO, guidance.from));
   if (!statSync(root).isDirectory()) throw new Error(`guidance.from must be a directory: ${guidance.from}`);
 
@@ -101,13 +114,17 @@ function assertNoLinks(dir: string): void {
 
 export function materialize({ out, brief = 'asset-library', guidance, install = true }: MaterializeOptions): string {
   // Check every input before creating anything.
-  const briefPath = briefSource(brief);
-  const guidancePath = guidance ? guidanceSource(guidance) : undefined;
   const target = resolve(out);
+  const briefPath = briefSource(brief);
+  const destination = guidance ? guidanceDestination(target, guidance.to) : undefined;
+  const guidancePath = guidance ? guidanceSource(guidance) : undefined;
   if (existsSync(target) && readdirSync(target).length > 0) throw new Error(`${target} already exists and isn't empty`);
   mkdirSync(target, { recursive: true });
 
-  cpSync(TEMPLATE, target, { recursive: true, filter: (src) => !src.split(sep).includes('node_modules') });
+  cpSync(TEMPLATE, target, {
+    recursive: true,
+    filter: (src) => !relative(TEMPLATE, src).split(sep).some((part) => TEMPLATE_SKIP.has(part)),
+  });
 
   for (const [dir, sources] of Object.entries(TOOL_SOURCES)) {
     mkdirSync(join(target, dir), { recursive: true });
@@ -117,9 +134,8 @@ export function materialize({ out, brief = 'asset-library', guidance, install = 
   copyFileSync(briefPath, join(target, `${brief}.md`));
   writeUploadFiles(target);
 
-  if (guidance && guidancePath) {
+  if (guidancePath && destination) {
     // Real files only: a link would point back into this checkout.
-    const destination = join(target, guidance.to);
     cpSync(guidancePath, destination, { recursive: true, dereference: true });
     assertNoLinks(destination);
   }
@@ -156,6 +172,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     guidance: from && to ? { from, to } : undefined,
     install: !values['skip-install'],
   });
-  const inside = !relative(REPO, target).startsWith('..');
+  const inside = isInside(target, REPO);
   console.log(`Workspace ready at ${target}${inside ? ' (warning: inside the repo; real runs must be outside it)' : ''}.`);
 }
