@@ -2,15 +2,11 @@
 // (served with the mock API plugin) to test it. Without it, the tests run
 // against the conformance app, plus the meta tests that check the tests
 // themselves.
-import { defineConfig, devices } from '@playwright/test';
+import { defineConfig } from '@playwright/test';
+import { PROJECTS } from './projects.ts';
 
 const external = process.env['EVAL_BASE_URL'];
 const port = 5299;
-
-// The brief's viewports. Mobile keeps the Pixel 7 profile (touch, mobile user
-// agent) at the brief's 390 × 844.
-const desktop = { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 900 } };
-const mobile = { ...devices['Pixel 7'], viewport: { width: 390, height: 844 } };
 
 export default defineConfig({
   testDir: '.',
@@ -30,10 +26,5 @@ export default defineConfig({
         },
       }),
   // Meta tests check the tests themselves, so one project is enough.
-  projects: [
-    { name: 'desktop-light', use: { ...desktop, colorScheme: 'light' } },
-    { name: 'desktop-dark', testIgnore: 'meta/**', use: { ...desktop, colorScheme: 'dark' } },
-    { name: 'mobile-light', testIgnore: 'meta/**', use: { ...mobile, colorScheme: 'light' } },
-    { name: 'mobile-dark', testIgnore: 'meta/**', use: { ...mobile, colorScheme: 'dark' } },
-  ],
+  projects: PROJECTS.map((project) => (project.name === 'desktop-light' ? project : { ...project, testIgnore: 'meta/**' })),
 });

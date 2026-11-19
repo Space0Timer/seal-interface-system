@@ -77,9 +77,17 @@ evals/briefs/          asset-library.md (held-out brief: not yet)
 evals/tests/           shared behavior tests, the contract-only
                        conformance app, and meta tests
 evals/starter/         template/ (the blank app every generator
-                       gets) and src/materialize.ts, which
-                       assembles a generator workspace
-evals/                 rubric, runner, adapters, results        (not yet)
+                       gets), src/materialize.ts, which
+                       assembles a generator workspace, and
+                       src/leaks.ts, the leak-word list
+evals/runner/          the agent-independent runner, its
+                       screenshots, and prompt.md (the one
+                       generator prompt)
+evals/adapters/        types.ts (the runner–adapter contract),
+                       fake/ and claude-code/
+evals/results/         one folder per run and mapping.jsonl
+                       (gitignored)
+evals/rubric/          the shared rubric                         (not yet)
 .claude/agents/        Claude-only adapters, e.g. reviewer.md,  (not yet)
                        which points to evals/rubric/ and holds
                        no criteria of its own
@@ -104,6 +112,8 @@ pnpm --filter @ds/eval-tests exec playwright install chromium
 5. unit tests and Playwright
 
 Others:
+- `node evals/runner/src/cli.ts run --brief asset-library --condition plain --adapter <name>`
+  runs one condition end to end. See "Running a condition".
 - `pnpm tokens:build` writes `packages/tokens/dist/tokens.css`. The file is
   generated and gitignored, and lint reads it, so build it before linting.
   The private repo's build writes the same file.
@@ -130,8 +140,9 @@ Others:
     rules, on its components and screens.
   - Oxlint's JS plugin API is alpha and outside semver, so `oxlint` is
     pinned to an exact version. The plugin's tests run in `pnpm check`.
-- **Playwright** runs the shared behavior tests in `evals/tests/`. Its
-  projects are listed under Scoring.
+- **Playwright** runs the shared behavior tests in `evals/tests/` and the
+  runner's screenshots. Both use the projects in `evals/tests/projects.ts`,
+  listed under Scoring.
 
 ### Skill rules
 
@@ -191,8 +202,12 @@ Others:
 - The runner is agent-independent. It owns workspace isolation, fixture
   setup, rendering, anonymization and result recording.
 - Agent-specific adapters handle skill discovery or installation, session
-  launch and invocation. Claude Code is the first planned adapter. No
-  adapter exists yet.
+  launch and invocation. Each implements `evals/adapters/types.ts`:
+  - `fake` copies the conformance app instead of calling a model, so the
+    whole pipeline runs inside `pnpm check`.
+  - `claude-code` runs Claude Code headless (see "Claude Code isolation").
+  - `claude-code-stub` runs the same CLI against a local stub model that
+    writes the conformance app. It costs nothing.
 - A fresh working directory alone doesn't establish isolation. For each
   run, verify which files, instruction files and global skills the session
   can access.
@@ -312,6 +327,173 @@ Tests (`pnpm --filter @ds/eval-starter test`):
   - `.git` and linked folders in `prepare.ts`
   - a full build with the skill installed
 - **Cleanup:** tests and the proof delete their temp workspaces.
+
+### Running a condition
+
+```
+node evals/runner/src/cli.ts run --brief asset-library --condition plain \
+  --adapter <fake|claude-code-stub|claude-code> [--model <id>] \
+  [--effort <level>] [--max-budget-usd <n>] [--timeout-minutes <n>] \
+  [--project <name> ...]
+```
+
+Conditions are `plain` (no guidance) and `my-skill`. The my-skill hook
+copies `core/design-system` to where the adapter's agent finds project
+skills: `.claude/skills/design-system` for Claude Code. frontend-design
+isn't wired up yet. A live adapter needs `--model` (an exact model ID) and
+`--max-budget-usd`. `--effort` pins the reasoning effort; without it the
+agent's default for the model applies. The manifest records both.
+
+Each run:
+1. Checks every input. Then it assembles a workspace with `materialize.ts`
+   in a new folder in the OS temp dir:
+   - `work-*/app`: the workspace
+   - `work-*/shared/notes.txt`: a canary with a random token, just
+     outside the workspace
+   - `work-*/state/`: the adapter's private state
+2. Calls the adapter with `evals/runner/prompt.md`:
+   - It's one neutral text for every condition. Only the brief's filename
+     is filled in.
+   - A test scans it with the starter's leak list (`evals/starter/src/leaks.ts`).
+3. Copies all of `src/`, and every other file the generator added or
+   changed, into the results. It never edits them. Links are recorded,
+   never copied.
+4. Runs `pnpm build`. A failed build is a brief-completion failure: it's
+   recorded, never fixed, and the run ends there.
+5. Serves the build with the workspace's own `vite preview`. This uses
+   `evals/starter/src/preview.ts`, shared with the proof.
+6. Runs the shared behavior tests in all four projects. It saves a JSON
+   report and the touch-target evidence.
+7. Takes full-page screenshots of the six states in all four projects
+   (`evals/runner/screenshots/`), with the clock fixed to the fixtures'
+   NOW.
+   - A PNG is saved only once its state is confirmed by the mock API's log
+     and by what renders.
+   - A state that can't be reached is recorded with the reason.
+8. Token lint: my-skill only. It isn't built yet, and the manifest says so.
+9. Writes `manifest.json`, then deletes the temp folder. This happens even
+   when a step fails or the run is stopped.
+
+Statuses:
+- `complete`: every applicable step ran. The build or tests may still have
+  failed.
+- `invalid`: an isolation check failed. Nothing was built or scored.
+- `error`: the runner itself failed.
+
+### Results
+
+```
+evals/results/            gitignored
+  mapping.jsonl           run ID → brief, condition, adapter, model. Kept
+                          apart from the run folders so they can be blinded,
+                          and never copied into a workspace.
+  <run-id>/               12 random hex characters
+    manifest.json
+    prompt.md             the exact prompt sent
+    generation/           the adapter's logs (Claude Code: invocation,
+                          transcript, probe and its recorded requests)
+    output/               the generator's files, byte for byte
+    build.log, preview.log
+    tests/                report.json, output.log, and artifacts/ with
+                          touch-targets.json for each mobile project
+    screenshots/          <project>/<state>.png and report.json
+```
+
+`manifest.json` holds:
+- the run ID, brief, condition, adapter and model
+- Node, pnpm, Playwright and agent versions
+- hashes:
+  - skill: a sha256 over `core/design-system`'s sorted files, or null for
+    plain
+  - the starter, the brief and the prompt
+- step timings
+- the isolation report
+- generation outcome, usage and cost
+- summaries of the output, build, tests and screenshots
+- every file, with its size and sha256
+
+### Claude Code isolation
+
+The adapter (`evals/adapters/claude-code/`) runs one `claude --print
+--output-format stream-json` session per run, in the workspace, with the
+prompt on stdin. The CLI is `claude` on PATH, or `CLAUDE_CODE_BIN`.
+
+- **Fixed:**
+  - `--model`, and `--effort` when given
+  - `--tools Read,Write,Edit,Glob,Grep,Bash,Skill`: no web tools, no
+    subagents
+  - `--permission-mode dontAsk`, with allow rules for those tools, and
+    `--permission-prompts none`
+  - `--max-budget-usd`
+- **Not loaded:**
+  - The owner's `~/.claude`, `~/.claude.json` and credentials. HOME and
+    `CLAUDE_CONFIG_DIR` are fresh folders in the run's private state.
+  - Any settings but the workspace's own `.claude/` (for project skills):
+    `--setting-sources project`.
+  - MCP: `--strict-mcp-config` with no servers, and claude.ai connectors
+    off.
+  - CLAUDE.md files, auto memory, bundled skills and the built-in plugins.
+  - Telemetry and auto-update.
+- **Sandboxed:**
+  - The file tools are blocked outside the workspace.
+  - Bash runs in the OS sandbox. It can't read the owner's home, the
+    system temp folder (which holds the canary) or Claude Code's shared
+    temp folder (`/tmp/claude-<uid>`, which holds other sessions' files).
+  - It can't write outside the workspace, and has no network except local
+    ports.
+- **Environment:** built from scratch. PATH holds only node, pnpm and
+  system folders, so no inherited variable carries the repo path.
+- **Auth:** the owner's subscription token from `claude setup-token`.
+  - The runner reads `CLAUDE_CODE_OAUTH_TOKEN` from the shell that starts
+    it and passes it only to the session.
+  - It's never written to the results.
+  - *Owner decision, 2026-11-19.*
+
+Some of these switches aren't in the public docs: `CLAUDE_CODE_TMPDIR`,
+`CLAUDE_CODE_DISABLE_BUNDLED_SKILLS` and the built-in plugin names. So
+before every real session, a **probe** session runs with the same command,
+settings and workspace against a local stub model, at no cost.
+- The stub makes the probe try to:
+  - read the canary and a repo file
+  - list the repo, the owner's home and the shared temp folder
+  - write outside the workspace
+  - reach the network
+- Then it runs node and pnpm and reads a workspace file.
+- Every forbidden attempt must fail and every ordinary step must work, or
+  the run stops before any model is called.
+
+**Isolation checks.** All are recorded in the manifest. Any failure makes
+the run `invalid`.
+- **Runner, for every adapter:**
+  - The workspace is outside the repo and the results.
+  - Its path, the prompt, and every workspace file except the condition's
+    guidance carry no leak words, owner copy or repo path.
+  - No file the generator wrote carries the canary's token.
+- **Init event,** for the probe and the session:
+  - the exact model and the fixed tool list
+  - no MCP servers and no plugins
+  - no skills except the condition's own, plus `doctor`, a user-only
+    command the probe confirms the model is never shown
+  - the workspace as working directory, dontAsk mode, and the expected
+    CLI version
+- **First request,** recorded by the stub:
+  - The system prompt and messages carry the prompt unchanged.
+  - They name no repo, results or `~/.claude` path, and carry no leak
+    words or owner copy.
+  - Reviewed lines of Claude Code's own system prompt are allowed, in
+    `SYSTEM_PROMPT_LINES_ALLOWED` (today only `# Harness`). A new match
+    fails until someone reviews it.
+- **Transcript:**
+  - Every path a tool call read or wrote is inside the workspace. Refused
+    attempts are listed, not failed.
+  - The canary's token and forbidden paths appear in no tool result.
+
+When Claude Code updates, the probe fails closed on anything new, such as a
+plugin, a skill or a system prompt line. Review it before adding it to an
+allowlist.
+
+`pnpm check` runs the fake adapter end to end. With `CLAUDE_CODE_BIN` set,
+it also runs `claude-code-stub` end to end.
 
 ### Scoring
 
@@ -519,17 +701,21 @@ comparison.
   shared behavior tests, which pass against the conformance app.
 - The eval starter and `materialize.ts`, proven by running the conformance
   app inside a fresh workspace.
+- The runner and the Claude Code adapter, with the isolation probe. The
+  fake adapter runs the whole pipeline inside `pnpm check`.
 - The React package and the playground moved to a private repo
   (2026-11-19), before any component or screen was written.
 
 Next:
-1. Build these, following the eval protocol:
+1. The first real plain run on asset-library, after the owner approves
+   the command, model and cost.
+2. Build these, following the eval protocol:
    - `evals/rubric/`, for the owner to approve
-   - the runner and the Claude Code adapter
    - `.claude/agents/reviewer.md`, pointing to the rubric
-2. The held-out workspace-members brief, with its fixtures and behavior
+   - anonymized review sets, and token lint for my-skill
+3. The held-out workspace-members brief, with its fixtures and behavior
    tests. It stays out of the skill.
-3. Don't install the skill machine-wide yet. The private repo links
+4. Don't install the skill machine-wide yet. The private repo links
    `core/design-system` into its `.claude/skills/design-system`. Link it
    the same way into any other UI repo that needs it (a directory junction
    on Windows), and confirm that baseline eval runs still can't see it.

@@ -26,9 +26,15 @@ Early and personal. What exists today:
 - **Eval starter**: the blank workspace every generator gets, and the script
   that assembles one. It's proven by running the conformance app inside a
   fresh workspace.
+- **Eval runner**: runs one condition end to end. It builds a workspace
+  outside the repo and lets an agent build the brief there. Then it builds,
+  serves, tests and screenshots the result, and records everything. The
+  Claude Code adapter isolates each session from the repo and the machine's
+  own Claude setup, and proves it on every run. A fake adapter runs the
+  whole pipeline inside `pnpm check`.
 
-Not built yet: the eval rubric and runner, and the held-out
-workspace-members brief. [`AGENTS.md`](AGENTS.md) has the full plan.
+Not built yet: the eval rubric and the held-out workspace-members brief.
+[`AGENTS.md`](AGENTS.md) has the full plan.
 
 The React components and reference screens are kept in a separate private
 repo.
@@ -40,7 +46,7 @@ repo.
 | [`core/design-system/`](core/design-system/) | The skill: principles, ban list, pattern specs and DTCG 2025.10 tokens. Language- and agent-agnostic. |
 | [`packages/tokens/`](packages/tokens/) | Token validation, contrast checks, and the DTCG-to-CSS converter |
 | [`packages/lint/`](packages/lint/) | The stylelint rule `ds/token-values`, which rejects raw design values in product CSS, and the Oxlint plugin that forbids inline styles and raw colors in product code |
-| [`evals/`](evals/) | Briefs, fixtures, the mock API, shared behavior tests, and the eval starter |
+| [`evals/`](evals/) | Briefs, fixtures, the mock API, shared behavior tests, the eval starter, the runner and its agent adapters |
 | [`AGENTS.md`](AGENTS.md) | Canonical instructions for every coding agent, including the eval protocol |
 
 ## Getting started

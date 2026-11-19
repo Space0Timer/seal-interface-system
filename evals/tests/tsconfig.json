@@ -6,5 +6,5 @@
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "types": ["node", "vite/client"]
   },
-  "include": ["asset-library", "meta", "conformance-app", "playwright.config.ts"]
+  "include": ["asset-library", "meta", "conformance-app", "playwright.config.ts", "projects.ts"]
 }
