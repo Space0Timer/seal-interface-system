@@ -27,9 +27,11 @@ Early and personal. What exists today:
   that assembles one. It's proven by running the conformance app inside a
   fresh workspace.
 
-Not built yet: React primitives and components, reference screens, the eval
-rubric and runner, and the held-out workspace-members brief.
-[`AGENTS.md`](AGENTS.md) has the full plan.
+Not built yet: the eval rubric and runner, and the held-out
+workspace-members brief. [`AGENTS.md`](AGENTS.md) has the full plan.
+
+The React components and reference screens are kept in a separate private
+repo.
 
 ## What's here
 
@@ -38,8 +40,6 @@ rubric and runner, and the held-out workspace-members brief.
 | [`core/design-system/`](core/design-system/) | The skill: principles, ban list, pattern specs and DTCG 2025.10 tokens. Language- and agent-agnostic. |
 | [`packages/tokens/`](packages/tokens/) | Token validation, contrast checks, and the DTCG-to-CSS converter |
 | [`packages/lint/`](packages/lint/) | The stylelint rule `ds/token-values`, which rejects raw design values in product CSS, and the Oxlint plugin that forbids inline styles and raw colors in product code |
-| [`packages/react/`](packages/react/) | Layout primitives, components and patterns (empty for now) |
-| [`apps/playground/`](apps/playground/) | Reference screens, Storybook and end-to-end tests |
 | [`evals/`](evals/) | Briefs, fixtures, the mock API, shared behavior tests, and the eval starter |
 | [`AGENTS.md`](AGENTS.md) | Canonical instructions for every coding agent, including the eval protocol |
 
@@ -52,25 +52,15 @@ pnpm install
 ```
 
 ```bash
-pnpm --filter @ds/playground exec playwright install chromium
+pnpm --filter @ds/eval-tests exec playwright install chromium
 ```
 
 `pnpm check` runs everything: token validation and contrast pairs, the
-token CSS build, Oxlint and stylelint, type checks, unit and Playwright
-tests, and the Vite and Storybook builds.
+token CSS build, Oxlint and stylelint, type checks, and unit and
+Playwright tests.
 
 ```bash
 pnpm check
-```
-
-To work on screens:
-
-```bash
-pnpm --filter @ds/playground dev
-```
-
-```bash
-pnpm --filter @ds/playground storybook
 ```
 
 ## Using the skill

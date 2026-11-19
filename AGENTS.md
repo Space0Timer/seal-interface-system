@@ -33,11 +33,14 @@ references. Carry over principles, not Apple-platform components.
 
    It is packaged as one skill following the agentskills.io spec, so Claude
    Code, Codex, Gemini CLI and Cursor can all use it.
-2. **Implementation** (React + TS):
+2. **Implementation** (React + TS), in a separate private repo:
    - `packages/react/`: layout primitives (Stack, Inline, Grid, Container),
      components (React Aria for complex controls), and patterns
    - `apps/playground/`: reference screens, which can own local
      components, plus Storybook
+
+   That repo links to `@ds/tokens`, `@ds/lint` and the skill from a
+   checkout of this repo next to it. Nothing from it is copied here.
 3. **Harness:**
    - **Checks:** lint raw color and spacing values in product styles, type
      checks, Storybook states, Playwright interaction tests for behavior,
@@ -46,7 +49,8 @@ references. Carry over principles, not Apple-platform components.
 
 ## Repo layout
 
-pnpm workspace in its own repo. No submodules.
+pnpm workspace in its own repo. No submodules. The React package and the
+playground live in the private repo (see Architecture).
 
 ```
 AGENTS.md              this file
@@ -67,8 +71,6 @@ packages/tokens/       token validation, contrast check, and the
                        DTCG-to-CSS converter (dist/tokens.css)
 packages/lint/         stylelint rule ds/token-values and the
                        Oxlint plugin for product code
-packages/react/        primitives, components, patterns         (empty)
-apps/playground/       reference screens, Storybook, e2e tests  (no screens yet)
 evals/fixtures/        asset data, upload batch, mock API and
                        its Vite plugin
 evals/briefs/          asset-library.md (held-out brief: not yet)
@@ -91,7 +93,7 @@ Root configs: `package.json` (scripts), `pnpm-workspace.yaml`,
 First run:
 ```
 pnpm install
-pnpm --filter @ds/playground exec playwright install chromium
+pnpm --filter @ds/eval-tests exec playwright install chromium
 ```
 
 `pnpm check` is the one check. It runs, in order:
@@ -100,14 +102,11 @@ pnpm --filter @ds/playground exec playwright install chromium
 3. Oxlint and stylelint
 4. type checks
 5. unit tests and Playwright
-6. the Vite and Storybook builds
 
 Others:
 - `pnpm tokens:build` writes `packages/tokens/dist/tokens.css`. The file is
   generated and gitignored, and lint reads it, so build it before linting.
-- `pnpm --filter @ds/playground dev` and
-  `pnpm --filter @ds/playground storybook` start the playground and
-  Storybook.
+  The private repo's build writes the same file.
 
 ### Toolchain notes
 
@@ -123,16 +122,16 @@ Others:
   - stylelint's `ds/token-values` checks product CSS against the generated
     token names. It rejects raw colors, lengths, type values, shadows,
     motion values and unknown custom properties, and allows structural
-    CSS.
-  - Oxlint runs the JavaScript, TypeScript and React Hooks rules. In
-    product code, its `ds/no-inline-style` and `ds/no-raw-color` rules (a
-    JS plugin in `packages/lint/`) forbid inline `style` props and raw
-    color literals.
+    CSS. This repo has no product CSS, so its run allows empty input.
+  - Oxlint runs the JavaScript and TypeScript rules. Its
+    `ds/no-inline-style` and `ds/no-raw-color` rules (a JS plugin in
+    `packages/lint/`) forbid inline `style` props and raw color literals
+    in product code. The private repo enables them, with the React Hooks
+    rules, on its components and screens.
   - Oxlint's JS plugin API is alpha and outside semver, so `oxlint` is
     pinned to an exact version. The plugin's tests run in `pnpm check`.
-- **Playwright** has two projects: `desktop`, and `mobile-touch` (Pixel 7
-  with touch emulation).
-- **Storybook** telemetry is disabled.
+- **Playwright** runs the shared behavior tests in `evals/tests/`. Its
+  projects are listed under Scoring.
 
 ### Skill rules
 
@@ -178,7 +177,7 @@ Others:
   an improvement to one should carry over to the other.
 - Write a pattern spec as: use when, not when, anatomy, rules, states,
   mobile, copy.
-- An approved reference screen is saved as:
+- An approved reference screen is saved in the private repo as:
   - a Storybook story
   - a screenshot baseline
   - a short note on why it looks this way
@@ -495,7 +494,8 @@ comparison.
 ### Later experiments
 
 - **Full harness:** the owner's components and reference screens, against
-  the same baselines.
+  the same baselines. They live in the private repo, so the runner takes a
+  path to its checkout.
 - **Cross-agent:** each agent gets its own plain baseline (same agent and
   model, plain vs. this skill). To see whether the decisions transfer,
   compare which individual principles each agent satisfies with the skill.
@@ -519,6 +519,8 @@ comparison.
   shared behavior tests, which pass against the conformance app.
 - The eval starter and `materialize.ts`, proven by running the conformance
   app inside a fresh workspace.
+- The React package and the playground moved to a private repo
+  (2026-11-19), before any component or screen was written.
 
 Next:
 1. Build these, following the eval protocol:
@@ -527,10 +529,10 @@ Next:
    - `.claude/agents/reviewer.md`, pointing to the rubric
 2. The held-out workspace-members brief, with its fixtures and behavior
    tests. It stays out of the skill.
-3. Don't install the skill machine-wide yet. When a real UI repo needs it,
-   link `core/design-system` into that agent's skills folder (a directory
-   junction on Windows), and confirm that baseline eval runs still can't
-   see it.
+3. Don't install the skill machine-wide yet. The private repo links
+   `core/design-system` into its `.claude/skills/design-system`. Link it
+   the same way into any other UI repo that needs it (a directory junction
+   on Windows), and confirm that baseline eval runs still can't see it.
 
 ## Out of scope
 
