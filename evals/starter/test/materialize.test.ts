@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { test } from 'node:test';
 import { REPLACEMENT_FILE, UPLOAD_BATCH } from '../../fixtures/src/data.ts';
-import { materialize } from '../src/materialize.ts';
+import { materialize, REPO } from '../src/materialize.ts';
 
 const fresh = () => join(mkdtempSync(join(tmpdir(), 'starter-')), 'workspace');
 
@@ -79,6 +79,57 @@ test('with the design-system skill installed, prepare generates design-tokens.cs
   assert.match(css, /--color-text-secondary: #/);
   assert.match(css, /--type-list-default-font-size: 13px;/);
   assert.doesNotMatch(css, /--palette-/);
+});
+
+function linksIn(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(dir, entry.name);
+    if (lstatSync(path).isSymbolicLink()) return [path];
+    return entry.isDirectory() && entry.name !== 'node_modules' ? linksIn(path) : [];
+  });
+}
+
+test('guidance given through a link is copied as real files, and its tokens still generate', () => {
+  const links = mkdtempSync(join(tmpdir(), 'starter-links-'));
+  symlinkSync(join(REPO, 'core', 'design-system'), join(links, 'design-system'));
+  const ws = materialize({ out: fresh(), install: false, guidance: { from: join(links, 'design-system'), to: '.claude/skills/design-system' } });
+  assert.deepEqual(linksIn(ws), []);
+  assert.ok(lstatSync(join(ws, '.claude', 'skills', 'design-system')).isDirectory());
+  execFileSync(process.execPath, ['tools/prepare.ts'], { cwd: ws, stdio: 'pipe' });
+  assert.match(readFileSync(join(ws, 'src', 'design-tokens.css'), 'utf8'), /--color-text-secondary: #/);
+});
+
+test('guidance with a link that escapes its own tree is rejected before anything is created', () => {
+  const guidance = mkdtempSync(join(tmpdir(), 'starter-guidance-'));
+  writeFileSync(join(guidance, 'SKILL.md'), '---\nname: x\n---\n');
+  symlinkSync(join(REPO, 'AGENTS.md'), join(guidance, 'notes.md'));
+  const out = fresh();
+  assert.throws(() => materialize({ out, install: false, guidance: { from: guidance, to: '.claude/skills/x' } }), /points outside the guidance/);
+  assert.ok(!existsSync(out));
+});
+
+test('the brief must be a single brief name; paths are rejected before anything is created', () => {
+  for (const brief of ['../../AGENTS', 'asset-library/../x', 'Asset Library', '']) {
+    const out = fresh();
+    assert.throws(() => materialize({ out, brief, install: false }), /single brief name/, brief);
+    assert.ok(!existsSync(out), brief);
+  }
+  assert.throws(() => materialize({ out: fresh(), brief: 'no-such-brief', install: false }), /no brief named/);
+});
+
+test('prepare never deletes a design-tokens.css it did not generate, but clears its own stale output', () => {
+  const plain = materialize({ out: fresh(), install: false });
+  const mine = join(plain, 'src', 'design-tokens.css');
+  writeFileSync(mine, ':root { --brand: red; }\n');
+  execFileSync(process.execPath, ['tools/prepare.ts'], { cwd: plain, stdio: 'pipe' });
+  assert.equal(readFileSync(mine, 'utf8'), ':root { --brand: red; }\n');
+
+  const skilled = materialize({ out: fresh(), install: false, guidance: { from: 'core/design-system', to: 'design-system' } });
+  execFileSync(process.execPath, ['tools/prepare.ts'], { cwd: skilled, stdio: 'pipe' });
+  assert.ok(existsSync(join(skilled, 'src', 'design-tokens.css')));
+  rmSync(join(skilled, 'design-system'), { recursive: true });
+  execFileSync(process.execPath, ['tools/prepare.ts'], { cwd: skilled, stdio: 'pipe' });
+  assert.ok(!existsSync(join(skilled, 'src', 'design-tokens.css')), 'stale generated output is removed');
 });
 
 test('guidance must stay inside the workspace, and an existing workspace is never overwritten', () => {

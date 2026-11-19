@@ -249,10 +249,19 @@ workspace. It must be outside this repo for real runs. The workspace gets:
 - optional design guidance, set with `--guidance-from <dir>` and
   `--guidance-to <dir>`. For my-skill under Claude Code, that's
   `core/design-system` → `.claude/skills/design-system`.
+  - It's copied as real files, never links, so nothing points back into
+    this checkout.
+  - A link inside the guidance that leaves its own tree, or loops back on
+    itself, is rejected.
 
-`pnpm dev` and `pnpm build` run `tools/prepare.ts`. If any
-`tokens.resolver.json` is in the workspace, it writes
-`src/design-tokens.css`; otherwise it writes nothing.
+Every input is checked before anything is created. `--brief` must be a
+single brief name from `evals/briefs`, not a path.
+
+`pnpm dev` and `pnpm build` run `tools/prepare.ts`:
+- If any `tokens.resolver.json` is in the workspace, it writes
+  `src/design-tokens.css`.
+- Otherwise it removes only a stale file it generated itself, recognized by
+  the converter's header. It never touches a file someone else wrote.
 
 Tests (`pnpm --filter @ds/eval-starter test`):
 - **Contents:** a workspace contains exactly the expected files.
@@ -264,6 +273,12 @@ Tests (`pnpm --filter @ds/eval-starter test`):
 - **Proof:** the conformance app, dropped into a fresh workspace and served
   by its own dev server, passes the shared behavior tests. This proves the
   starter itself can't make a condition fail.
+  - The server runs on an OS-assigned port with `--strictPort`, and the
+    tests target the URL that this process announces.
+  - If that Vite exits, the proof fails, so concurrent proofs in other
+    worktrees can't stand in for it.
+- **Guarding the fixes:** linked guidance, escaping links, path-like brief
+  names, and generator-written token CSS each have a test.
 
 ### Scoring
 

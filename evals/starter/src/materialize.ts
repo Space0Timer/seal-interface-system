@@ -13,7 +13,7 @@
 // Example (my-skill condition, Claude Code project skill):
 //   --guidance-from core/design-system --guidance-to .claude/skills/design-system
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -49,7 +49,60 @@ export interface MaterializeOptions {
   install?: boolean;
 }
 
+const BRIEF_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/** A brief is named, never a path: "asset-library" means evals/briefs/asset-library.md. */
+function briefSource(brief: string): string {
+  if (!BRIEF_NAME.test(brief)) throw new Error(`brief must be a single brief name such as "asset-library", got "${brief}"`);
+  const path = join(REPO, 'evals', 'briefs', `${brief}.md`);
+  if (!existsSync(path)) throw new Error(`no brief named "${brief}" in evals/briefs`);
+  return path;
+}
+
+const isInside = (path: string, root: string) => path === root || path.startsWith(root + sep);
+
+/**
+ * Resolves the guidance directory (a link at its root is followed) and
+ * rejects any link inside it that points outside the guidance tree, or back
+ * at one of its own ancestors. Returns the real path to copy from.
+ */
+function guidanceSource(guidance: Guidance): string {
+  const to = guidance.to;
+  if (!to || isAbsolute(to) || to.split(/[\\/]/).includes('..')) throw new Error('guidance.to must stay inside the workspace');
+  const root = realpathSync(isAbsolute(guidance.from) ? guidance.from : join(REPO, guidance.from));
+  if (!statSync(root).isDirectory()) throw new Error(`guidance.from must be a directory: ${guidance.from}`);
+
+  const walk = (dir: string, ancestors: string[]): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isSymbolicLink()) {
+        const real = realpathSync(path);
+        if (!isInside(real, root)) throw new Error(`guidance link ${relative(root, path)} points outside the guidance: ${real}`);
+        if (statSync(real).isDirectory()) {
+          if (ancestors.some((a) => isInside(a, real))) throw new Error(`guidance link ${relative(root, path)} creates a cycle`);
+          walk(real, [...ancestors, real]);
+        }
+      } else if (entry.isDirectory()) {
+        walk(path, [...ancestors, path]);
+      }
+    }
+  };
+  walk(root, [root]);
+  return root;
+}
+
+function assertNoLinks(dir: string): void {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (lstatSync(path).isSymbolicLink()) throw new Error(`the copied guidance still contains a link: ${path}`);
+    if (entry.isDirectory()) assertNoLinks(path);
+  }
+}
+
 export function materialize({ out, brief = 'asset-library', guidance, install = true }: MaterializeOptions): string {
+  // Check every input before creating anything.
+  const briefPath = briefSource(brief);
+  const guidancePath = guidance ? guidanceSource(guidance) : undefined;
   const target = resolve(out);
   if (existsSync(target) && readdirSync(target).length > 0) throw new Error(`${target} already exists and isn't empty`);
   mkdirSync(target, { recursive: true });
@@ -61,13 +114,14 @@ export function materialize({ out, brief = 'asset-library', guidance, install = 
     for (const source of sources) copyFileSync(join(REPO, source), join(target, dir, basename(source)));
   }
 
-  copyFileSync(join(REPO, 'evals', 'briefs', `${brief}.md`), join(target, `${brief}.md`));
+  copyFileSync(briefPath, join(target, `${brief}.md`));
   writeUploadFiles(target);
 
-  if (guidance) {
-    if (isAbsolute(guidance.to) || guidance.to.split(/[\\/]/).includes('..')) throw new Error('guidance.to must stay inside the workspace');
-    const from = isAbsolute(guidance.from) ? guidance.from : join(REPO, guidance.from);
-    cpSync(from, join(target, guidance.to), { recursive: true });
+  if (guidance && guidancePath) {
+    // Real files only: a link would point back into this checkout.
+    const destination = join(target, guidance.to);
+    cpSync(guidancePath, destination, { recursive: true, dereference: true });
+    assertNoLinks(destination);
   }
 
   if (install) {
