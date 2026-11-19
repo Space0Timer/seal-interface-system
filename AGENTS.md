@@ -51,6 +51,9 @@ pnpm workspace in its own repo. No submodules.
 ```
 AGENTS.md              this file
 CLAUDE.md              imports AGENTS.md for Claude Code
+README.md              overview for people visiting the repo
+CONTRIBUTING.md        how outside contributions work
+LICENSE, NOTICE        Apache-2.0 text and the copyright notice
 core/design-system/    the skill
   SKILL.md             thin entry point: name, description, what to read when
   principles.md        P1–P10: rule, why, do/don't, how it's checked
