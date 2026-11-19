@@ -6,7 +6,7 @@ import { createMockApi } from './mock-api.ts';
 export function mockApiPlugin(): Plugin {
   const handler = createMockApi();
   return {
-    name: 'ds-eval-mock-api',
+    name: 'mock-api',
     configureServer(server) {
       server.middlewares.use(handler);
     },

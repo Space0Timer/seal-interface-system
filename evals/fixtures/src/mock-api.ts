@@ -1,17 +1,16 @@
-// Mock asset API shared by every eval condition and the behavior tests.
-// A plain Node (req, res, next) handler, so it runs as Vite dev/preview
-// middleware or in any Node server.
+// Mock asset API. A plain Node (req, res, next) handler, so it runs as Vite
+// dev/preview middleware or in any Node server.
 //
-// State is per session (cookie "mock-session"), so parallel test runs don't
+// State is per session (cookie "mock-session"), so parallel sessions don't
 // interfere. Requests without the cookie share a "default" session.
 //
-// Product endpoints (documented in evals/briefs/asset-library.md):
+// Product endpoints (documented in the brief):
 //   GET  /api/assets?q=&offset=&limit=
 //   GET  /api/assets/:id
 //   POST /api/assets/delete           { "ids": [...] }
 //   POST /api/uploads?filename=...    raw file bytes as the body
 //   GET  /api/thumbnails/:id.svg
-// Control endpoints (for generators previewing states, and for tests):
+// Control endpoints (for previewing scenarios):
 //   GET  /__mock/reset?scenario=default|empty|large[&to=/path]
 //   POST /__mock/reset                { "scenario": "..." }
 //   GET  /__mock/log
@@ -91,17 +90,31 @@ function readJson(req: IncomingMessage): Promise<unknown> {
   });
 }
 
-/** Counts body bytes without buffering them; the oversized upload is 112 MB. */
-function countBytes(req: IncomingMessage): Promise<number> {
-  return new Promise((resolve, reject) => {
+/**
+ * Counts body bytes without buffering them (the oversized upload is 112 MB).
+ * `complete` is false when the connection closed before the body finished,
+ * for example because the page reloaded mid-upload.
+ */
+function countBytes(req: IncomingMessage): Promise<{ bytes: number; complete: boolean }> {
+  return new Promise((resolve) => {
     let bytes = 0;
+    let ended = false;
     req.on('data', (chunk: Buffer) => {
       bytes += chunk.length;
     });
-    req.on('end', () => resolve(bytes));
-    req.on('error', reject);
+    req.on('end', () => {
+      ended = true;
+      resolve({ bytes, complete: true });
+    });
+    req.on('error', () => resolve({ bytes, complete: false }));
+    req.on('close', () => {
+      if (!ended) resolve({ bytes, complete: false });
+    });
   });
 }
+
+/** Logged as the status of an upload whose connection closed before its body finished. */
+export const ABORTED_STATUS = 499;
 
 function isScenario(value: unknown): value is Scenario {
   return typeof value === 'string' && (SCENARIOS as readonly string[]).includes(value);
@@ -217,8 +230,15 @@ export function createMockApi(): Handler {
         // until the body has arrived and the response is sent.
         const filename = url.searchParams.get('filename')?.trim() ?? '';
         entry.filename = filename;
-        const sizeBytes = await countBytes(req);
+        const { bytes: sizeBytes, complete } = await countBytes(req);
         entry.sizeBytes = sizeBytes;
+        if (!complete) {
+          // Nobody is left to answer. Record a final status so the log never
+          // shows this upload as in flight, and don't count it as an attempt.
+          entry.status = ABORTED_STATUS;
+          entry.error = 'aborted';
+          return;
+        }
         if (!filename) return reply(400, { error: { code: 'filename_required' } });
 
         const attempt = (session.attempts.get(filename) ?? 0) + 1;
