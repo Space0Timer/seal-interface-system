@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, extname, join, relative } from 'node:path';
+import { parse, type DefaultTreeAdapterTypes } from 'parse5';
 import stylelint from 'stylelint';
 import { buildCss } from '../../../packages/tokens/src/css.ts';
 import { resolveTokens } from '../../../packages/tokens/src/resolve.ts';
@@ -8,7 +9,7 @@ import { REPO } from '../../starter/src/materialize.ts';
 
 export type TokenLint = { status: 'not-applicable' | 'not-run' } | {
   status: 'passed' | 'failed';
-  checked: { stylesheets: number; scripts: number };
+  checked: { stylesheets: number; scripts: number; html: number };
   report: string;
 };
 
@@ -20,6 +21,7 @@ interface Finding {
   column?: number | undefined;
 }
 
+const HTML = new Set(['.html', '.htm']);
 const SCRIPT = new Set(['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts']);
 
 // Comments that would switch rules off or reconfigure them inside the code
@@ -46,6 +48,16 @@ export function withoutDirectives(code: string): { code: string; directives: num
   return { code: inert, directives };
 }
 
+function* htmlElements(node: DefaultTreeAdapterTypes.Node): Generator<DefaultTreeAdapterTypes.Element> {
+  if ('tagName' in node) {
+    yield node;
+    if ('content' in node) yield* htmlElements(node.content as DefaultTreeAdapterTypes.DocumentFragment);
+  }
+  if ('childNodes' in node) {
+    for (const child of node.childNodes) yield* htmlElements(child);
+  }
+}
+
 export async function lintTokens(output: string, files: string[], out: string, state: string, skillDir: string): Promise<TokenLint> {
   const resolver = resolveTokens(join(REPO, 'core/design-system/tokens.resolver.json'));
   if (resolver.errors.length) throw new Error(`could not resolve lint tokens: ${resolver.errors.join(', ')}`);
@@ -54,9 +66,7 @@ export async function lintTokens(output: string, files: string[], out: string, s
   writeFileSync(tokensCss, css);
   const findings: Finding[] = [];
   let stylesheets = 0;
-  for (const file of files.filter((path) => extname(path) === '.css')) {
-    const code = readFileSync(join(output, file), 'utf8');
-    if (file === 'src/design-tokens.css' && code === css) continue;
+  const lintCss = async (file: string, code: string, startLine = 1, startCol = 1) => {
     stylesheets++;
     const result = await stylelint.lint({
       code, codeFilename: join(output, file), ignoreDisables: true,
@@ -66,7 +76,39 @@ export async function lintTokens(output: string, files: string[], out: string, s
       },
     });
     for (const sheet of result.results) {
-      for (const { rule, text, line, column } of sheet.warnings) findings.push({ file, rule, message: text, line, column });
+      for (const { rule, text, line, column } of sheet.warnings) {
+        findings.push({
+          file, rule, message: text,
+          line: line === undefined ? undefined : line + startLine - 1,
+          column: column === undefined ? undefined : column + (line === 1 ? startCol - 1 : 0),
+        });
+      }
+    }
+  };
+
+  for (const file of files.filter((path) => extname(path) === '.css')) {
+    const code = readFileSync(join(output, file), 'utf8');
+    if (file === 'src/design-tokens.css' && code === css) continue;
+    await lintCss(file, code);
+  }
+
+  const html = files.filter((file) => HTML.has(extname(file).toLowerCase()));
+  for (const file of html) {
+    const code = readFileSync(join(output, file), 'utf8');
+    const document = parse(code, { sourceCodeLocationInfo: true, scriptingEnabled: false });
+    for (const element of htmlElements(document)) {
+      const location = element.sourceCodeLocation;
+      const inline = location?.attrs?.['style'];
+      if (inline) {
+        findings.push({
+          file, rule: 'ds/no-inline-style', message: 'Use a class and a token-backed stylesheet for product styles.',
+          line: inline.startLine, column: inline.startCol,
+        });
+      }
+      if (element.tagName === 'style' && location?.startTag) {
+        const { endOffset, endLine, endCol } = location.startTag;
+        await lintCss(file, code.slice(endOffset, location.endTag?.startOffset ?? location.endOffset), endLine, endCol);
+      }
     }
   }
 
@@ -107,7 +149,7 @@ export async function lintTokens(output: string, files: string[], out: string, s
   }
   const result = {
     status: findings.length ? 'failed' as const : 'passed' as const,
-    checked: { stylesheets, scripts: scripts.length },
+    checked: { stylesheets, scripts: scripts.length, html: html.length },
     report: 'token-lint.json',
   };
   // Directives in the authored code are listed, and had no effect on the findings.

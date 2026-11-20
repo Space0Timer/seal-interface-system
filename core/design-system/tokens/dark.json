@@ -14,6 +14,14 @@
       "subtle": {
         "$value": "{palette.neutral.900}",
         "$description": "Quiet fill for a distinct object: thumbnail placeholder, drop zone, input well. Not for sections."
+      },
+      "sidebar": {
+        "$value": "{palette.neutral.900}",
+        "$description": "Background of the global navigation sidebar on wide layouts. Its tone sets the sidebar apart from the content, so it needs no divider. Not for other regions."
+      },
+      "scrim": {
+        "$value": "{palette.black-alpha.50}",
+        "$description": "Translucent layer that dims the page behind a modal dialog. Not a surface for content."
       }
     },
     "text": {

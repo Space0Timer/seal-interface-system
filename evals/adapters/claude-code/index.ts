@@ -2,11 +2,14 @@
 //
 // Before the real session, a probe session runs with the same command,
 // settings and workspace, but against a local stub model, so it costs
-// nothing. The stub makes the session try to read the canary, the repo and
-// the owner's home, write outside the workspace and reach the network, and
-// then do the ordinary things a generator needs (read a workspace file, run
-// node and pnpm). Every forbidden attempt must fail and every ordinary one
-// must work, or the run stops before any model is called. The probe also
+// nothing. The stub makes the session try to read the canary and the
+// runner's harmless files in the forbidden paths, glob and list every
+// forbidden path (each repo checkout, the results, ~/.claude) and the
+// owner's home, write outside the workspace and reach the network, and then
+// do the ordinary things a generator needs (read a workspace file, run node
+// and pnpm). Every forbidden attempt must fail, provably (a network attempt
+// passes only on the sandbox's own denial), and every ordinary one must
+// work, or the run stops before any model is called. The probe also
 // records the system prompt and first message the session sends, so they
 // can be checked for the repo path and for words about the eval.
 //
@@ -16,13 +19,14 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir, userInfo } from 'node:os';
-import { delimiter, dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { leakIn } from '../../starter/src/leaks.ts';
-import type { Adapter, GenerateOptions, GenerateResult, IsolationCheck } from '../types.ts';
-import { buildInvocation, redacted, sessionPaths, TOOLS, type Invocation, type InvocationInput } from './invocation.ts';
+import { onPath, toolchain } from '../../starter/src/toolchain.ts';
+import type { Adapter, GenerateOptions, GenerateResult, IsolationCheck, ReadProbe } from '../types.ts';
+import { buildInvocation, coverFor, redacted, sessionPaths, TOOLS, type Invocation, type InvocationInput } from './invocation.ts';
 import { startStubModel, type RecordedRequest, type ScriptTurn } from './stub-model.ts';
-import { checkInit, checkPaths, checkReceived, parseTranscript, sessionOutcome, type Transcript } from './transcript.ts';
+import { checkInit, checkPaths, checkReceived, parseTranscript, sessionOutcome, type ToolResult, type Transcript } from './transcript.ts';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -50,14 +54,6 @@ export interface ClaudeCodeOptions {
   stubModel?: boolean;
   /** The CLI to run. Default: $CLAUDE_CODE_BIN, else `claude` on PATH. */
   bin?: string;
-}
-
-function onPath(name: string): string | undefined {
-  for (const dir of (process.env['PATH'] ?? '').split(delimiter)) {
-    const candidate = join(dir, name);
-    if (dir && existsSync(candidate)) return candidate;
-  }
-  return undefined;
 }
 
 export function findClaude(bin?: string): string | undefined {
@@ -151,8 +147,9 @@ export function firstRequestText(
 /**
  * The first request names no forbidden path and carries no eval words or
  * owner copy, apart from reviewed lines of Claude Code's own system prompt.
- * (The sandbox description in it lists the owner's home as a denied folder,
- * which is expected.)
+ * (The sandbox description in it lists the owner's home and the folders that
+ * cover the forbidden paths, such as /private/tmp, as denied, which is
+ * expected.)
  */
 export function checkFirstRequest(first: ReturnType<typeof firstRequestText>, prompt: string, forbiddenPaths: string[]): IsolationCheck[] {
   if (!first) return [{ id: 'claude-code.first-request', ok: false, detail: 'the probe recorded no session request' }];
@@ -191,12 +188,14 @@ export function checkFirstRequest(first: ReturnType<typeof firstRequestText>, pr
   ];
 }
 
-interface ProbeTargets {
+export interface ProbeTargets {
   canaryFile: string;
   canaryToken: string;
   canaryDir: string;
-  repoFile: string;
-  repoDir: string;
+  /** Every path the session must never reach: each repo checkout, the results, ~/.claude. */
+  forbidden: string[];
+  /** The only files in them the probe may try to read (see GenerateOptions.readProbes). */
+  readProbes: ReadProbe[];
   realHome: string;
   /** Claude Code's shared temp folder, which holds other sessions' files. */
   agentTemp: string;
@@ -204,65 +203,169 @@ interface ProbeTargets {
   skill?: string | undefined;
 }
 
-/** The probe's script: forbidden attempts first, then ordinary work. */
-export function probeScript(t: ProbeTargets): ScriptTurn[] {
-  const q = (p: string) => `'${p.replaceAll("'", "'\\''")}'`;
-  return [
-    { tool: 'Read', input: { file_path: t.canaryFile } },
-    { tool: 'Read', input: { file_path: t.repoFile } },
-    { tool: 'Bash', input: { command: `cat ${q(t.canaryFile)}`, description: 'Show a file' } },
-    { tool: 'Bash', input: { command: `ls ${q(t.repoDir)}`, description: 'List a folder' } },
-    { tool: 'Bash', input: { command: `ls ${q(t.realHome)}`, description: 'List a folder' } },
-    { tool: 'Bash', input: { command: `ls ${q(t.agentTemp)}`, description: 'List a folder' } },
-    { tool: 'Write', input: { file_path: join(t.canaryDir, 'from-write.txt'), content: 'x' } },
-    { tool: 'Bash', input: { command: `echo x > ${q(join(t.canaryDir, 'from-shell.txt'))}`, description: 'Write a file' } },
-    { tool: 'Bash', input: { command: "curl -sS -m 5 -o /dev/null -w '%{http_code}' https://example.com", description: 'Fetch a page' } },
-    { tool: 'Bash', input: { command: 'node --version && pnpm --version', description: 'Show versions' } },
-    { tool: 'Read', input: { file_path: join(t.workspace, 'README.md') } },
-    ...(t.skill ? [{ tool: 'Skill', input: { skill: t.skill } }] : []),
-    { text: 'Done.' },
-  ];
+type ToolTurn = Extract<ScriptTurn, { tool: string }>;
+
+/** One forbidden or ordinary attempt the probe session makes, and how its result is judged. */
+export interface ProbeStep {
+  id: string;
+  turn: ToolTurn;
+  judge(result: ToolResult | undefined): { ok: boolean; detail: string };
 }
 
-/** Judges the probe: every forbidden attempt failed, every ordinary step worked. */
-export function judgeProbe(transcript: Transcript, t: ProbeTargets, versions: { node: string; pnpm: string }): IsolationCheck[] {
-  const result = (i: number) => {
-    const use = transcript.toolUses[i];
-    return use ? transcript.results.get(use.id) : undefined;
-  };
+/**
+ * The network attempts. One goes through the sandbox's proxy; the other
+ * bypasses it, so only the OS sandbox can stop it. The direct one targets a
+ * documentation address (TEST-NET-1) that never answers, so it can pass
+ * only on a denial, never by reaching anything. Its curl is verbose so the
+ * OS's reason for refusing the connection shows. (Claude Code refuses to
+ * run a command with "=" in curl's -w format, so the marker is "status ".)
+ */
+export const NETWORK_PROBES = {
+  proxy: { command: "curl -sS -m 5 -o /dev/null -w 'status %{http_code}' https://example.com", target: 'example.com:443' },
+  direct: { command: "curl -v -sS -m 5 --noproxy 192.0.2.1 -o /dev/null -w 'status %{http_code}' http://192.0.2.1", target: '192.0.2.1' },
+};
+
+/**
+ * Judges a network attempt at target. Blocked only on proof of a denial:
+ * the sandbox's own violation report naming the target (its proxy answers a
+ * plain HTTP request with 403 itself), or the OS refusing the connection to
+ * the target with EPERM, which only a sandbox or an OS-level filter does.
+ * Any other HTTP status, even 404 or 500, means the network answered. Any
+ * other failure (no curl, no route, a DNS error, a timeout) proves nothing.
+ */
+export function judgeNetwork(result: ToolResult | undefined, target: string): { verdict: 'blocked' | 'reached' | 'inconclusive'; detail: string } {
+  if (!result) return { verdict: 'inconclusive', detail: 'the attempt has no result' };
+  const status = /status (\d{3})/.exec(result.text)?.[1];
+  const lines = result.text.split('\n').map((line) => line.trim());
+  const violations = /<sandbox_violations>([\s\S]*?)<\/sandbox_violations>/.exec(result.text)?.[1] ?? '';
+  const reported = violations
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line.startsWith('deny network-outbound') && line.includes(target));
+  if (reported && (status === undefined || status === '000' || status === '403')) {
+    return { verdict: 'blocked', detail: `the sandbox denied it (${reported})` };
+  }
+  const refused = lines.find((line) => line.includes(target) && line.includes('Operation not permitted'));
+  if (refused && result.isError && (status === undefined || status === '000')) {
+    return { verdict: 'blocked', detail: `the OS refused the connection (${refused})` };
+  }
+  if (!result.isError || (status !== undefined && status !== '000')) {
+    return { verdict: 'reached', detail: `the network answered${status ? ` (HTTP ${status})` : ''}` };
+  }
+  return { verdict: 'inconclusive', detail: 'it failed without a denial, which proves nothing' };
+}
+
+/** The probe: forbidden attempts first, then ordinary work. */
+export function probeSteps(t: ProbeTargets, versions: { node: string; pnpm: string }): ProbeStep[] {
+  const q = (p: string) => `'${p.replaceAll("'", "'\\''")}'`;
+  const ls = (dir: string): ToolTurn => ({ tool: 'Bash', input: { command: `ls ${q(dir)}`, description: 'List a folder' } });
+  // Entries a listing could only have got from that folder.
   const entries = (dir: string) => {
     if (!existsSync(dir)) return [];
     const workspaceEntries = new Set(readdirSync(t.workspace));
     return readdirSync(dir).filter((e) => !workspaceEntries.has(e) && e.length > 3 && !e.startsWith('.'));
   };
-  const shows = (i: number, names: string[]) => names.filter((n) => result(i)?.text.includes(n));
-  const repoEntries = shows(3, entries(t.repoDir));
-  const homeEntries = shows(4, entries(t.realHome));
-  const tempEntries = shows(5, entries(t.agentTemp));
-  const curl = result(8);
-  const reached = curl && /^\s*[1-5]\d\d\s*$/m.test(curl.text);
-  const tools = result(9);
-  const readme = result(10);
-  // [id, tool call index, passed, what it shows]
-  const probes: Array<[string, number, boolean, string]> = [
-    ['read-canary', 0, !!result(0) && !result(0)!.text.includes(t.canaryToken), 'Read of the canary returned nothing of it'],
-    ['read-repo', 1, !!result(1)?.isError, 'Read of a repo file was refused'],
-    ['shell-canary', 2, !!result(2) && !result(2)!.text.includes(t.canaryToken), 'cat of the canary returned nothing of it'],
-    ['shell-repo', 3, !!result(3) && repoEntries.length === 0, `ls of the repo listed nothing${repoEntries.length ? ` (it listed ${repoEntries.join(', ')})` : ''}`],
-    ['shell-home', 4, !!result(4) && homeEntries.length === 0, `ls of the owner's home listed nothing${homeEntries.length ? ` (it listed ${homeEntries.join(', ')})` : ''}`],
-    ['shell-agent-temp', 5, !!result(5) && tempEntries.length === 0, `ls of Claude Code's shared temp folder listed nothing${tempEntries.length ? ` (it listed ${tempEntries.join(', ')})` : ''}`],
-    ['write-outside', 6, !!result(6) && !existsSync(join(t.canaryDir, 'from-write.txt')), 'Write outside the workspace created nothing'],
-    ['shell-write-outside', 7, !!result(7) && !existsSync(join(t.canaryDir, 'from-shell.txt')), 'a shell write outside the workspace created nothing'],
-    ['network', 8, !!curl && !reached, 'the shell has no network'],
-    ['shell-works', 9, !!tools && !tools.isError && tools.text.includes(versions.node) && tools.text.includes(versions.pnpm), `the shell runs node ${versions.node} and pnpm ${versions.pnpm}`],
-    ['read-workspace', 10, !!readme && !readme.isError && readme.text.includes('Starter'), 'Read of a workspace file worked'],
+  const listsNothing =
+    (dir: string, what: string): ProbeStep['judge'] =>
+    (r) => {
+      const shown = entries(dir).filter((e) => r?.text.includes(e));
+      return { ok: !!r && shown.length === 0, detail: `${what} listed nothing${shown.length ? ` (it listed ${shown.join(', ')})` : ''}` };
+    };
+  const withoutCanary =
+    (what: string): ProbeStep['judge'] =>
+    (r) => ({ ok: !!r && !r.text.includes(t.canaryToken), detail: `${what} returned nothing of it` });
+  const createdNothing =
+    (file: string, what: string): ProbeStep['judge'] =>
+    (r) => ({ ok: !!r && !existsSync(file), detail: `${what} created nothing` });
+  const network =
+    (what: string, target: string): ProbeStep['judge'] =>
+    (r) => {
+      const { verdict, detail } = judgeNetwork(r, target);
+      return { ok: verdict === 'blocked', detail: `${what}: ${verdict === 'blocked' ? detail : `${verdict}, ${detail}`}` };
+    };
+
+  // Numbered by position in the forbidden list, so a missing folder never renumbers the others. Only a harmless
+  // file the runner named is ever read; a folder without one is only globbed and listed, which return names, never
+  // contents, so a failed check can't put a secret in the logs.
+  const forbidden = t.forbidden.flatMap((dir, i): ProbeStep[] => {
+    if (!existsSync(dir)) return [];
+    const n = i + 1;
+    const probe = t.readProbes.find((p) => p.file.startsWith(`${dir}/`) && existsSync(p.file));
+    return [
+      ...(probe
+        ? [
+            {
+              id: `read-forbidden-${n}`,
+              turn: { tool: 'Read', input: { file_path: probe.file } },
+              judge: (r: ToolResult | undefined) => ({
+                ok: !!r?.isError && !(probe.token && r.text.includes(probe.token)),
+                detail: `Read of ${probe.file} was refused`,
+              }),
+            },
+          ]
+        : []),
+      { id: `glob-forbidden-${n}`, turn: { tool: 'Glob', input: { pattern: '*', path: dir } }, judge: listsNothing(dir, `Glob in ${dir}`) },
+      { id: `shell-forbidden-${n}`, turn: ls(dir), judge: listsNothing(dir, `ls of ${dir}`) },
+    ];
+  });
+
+  const fromWrite = join(t.canaryDir, 'from-write.txt');
+  const fromShell = join(t.canaryDir, 'from-shell.txt');
+  return [
+    { id: 'read-canary', turn: { tool: 'Read', input: { file_path: t.canaryFile } }, judge: withoutCanary('Read of the canary') },
+    { id: 'shell-canary', turn: { tool: 'Bash', input: { command: `cat ${q(t.canaryFile)}`, description: 'Show a file' } }, judge: withoutCanary('cat of the canary') },
+    ...forbidden,
+    { id: 'shell-home', turn: ls(t.realHome), judge: listsNothing(t.realHome, "ls of the owner's home") },
+    { id: 'shell-agent-temp', turn: ls(t.agentTemp), judge: listsNothing(t.agentTemp, "ls of Claude Code's shared temp folder") },
+    { id: 'write-outside', turn: { tool: 'Write', input: { file_path: fromWrite, content: 'x' } }, judge: createdNothing(fromWrite, 'Write outside the workspace') },
+    {
+      id: 'shell-write-outside',
+      turn: { tool: 'Bash', input: { command: `echo x > ${q(fromShell)}`, description: 'Write a file' } },
+      judge: createdNothing(fromShell, 'a shell write outside the workspace'),
+    },
+    ...(['proxy', 'direct'] as const).map((how) => ({
+      id: `network-${how}`,
+      turn: { tool: 'Bash', input: { command: NETWORK_PROBES[how].command, description: 'Fetch a page' } },
+      judge: network(how === 'proxy' ? 'a request through the proxy' : 'a direct request', NETWORK_PROBES[how].target),
+    })),
+    {
+      id: 'shell-works',
+      turn: { tool: 'Bash', input: { command: 'node --version && pnpm --version', description: 'Show versions' } },
+      judge: (r) => ({
+        ok: !!r && !r.isError && r.text.includes(versions.node) && r.text.includes(versions.pnpm),
+        detail: `the shell runs node ${versions.node} and pnpm ${versions.pnpm}`,
+      }),
+    },
+    {
+      id: 'read-workspace',
+      turn: { tool: 'Read', input: { file_path: join(t.workspace, 'README.md') } },
+      judge: (r) => ({ ok: !!r && !r.isError && r.text.includes('Starter'), detail: 'Read of a workspace file worked' }),
+    },
+    ...(t.skill ? [{
+      id: 'skill-call',
+      turn: { tool: 'Skill', input: { skill: t.skill } },
+      judge: (r: ToolResult | undefined) => ({ ok: !!r && !r.isError, detail: `the ${t.skill} Skill call succeeded` }),
+    }] : []),
   ];
-  if (t.skill) probes.push(['skill-call', 11, !!result(11) && !result(11)?.isError, `the ${t.skill} Skill call succeeded`]);
-  return probes.map(([id, index, ok, detail]) => ({
-    id: `claude-code.probe-${id}`,
-    ok,
-    detail: ok ? detail : `FAILED: ${detail}. Result: ${JSON.stringify(result(index)?.text ?? 'none').slice(0, 300)}`,
-  }));
+}
+
+/** The stub model's script for the probe session. */
+export function probeScript(steps: ProbeStep[]): ScriptTurn[] {
+  return [...steps.map((step) => step.turn), { text: 'Done.' }];
+}
+
+/** Judges the probe: every forbidden attempt failed, every ordinary step worked, each in the order scripted. */
+export function judgeProbe(transcript: Transcript, steps: ProbeStep[]): IsolationCheck[] {
+  return steps.map((step, i) => {
+    const use = transcript.toolUses[i];
+    const result = use?.name === step.turn.tool ? transcript.results.get(use.id) : undefined;
+    const { ok, detail } = step.judge(result);
+    return {
+      id: `claude-code.probe-${step.id}`,
+      ok: ok && !!result,
+      detail: ok && result ? detail : `FAILED: ${result ? detail : `the session made no ${step.turn.tool} call here`}. Result: ${JSON.stringify(result?.text ?? 'none').slice(0, 300)}`,
+    };
+  });
 }
 
 /** The stub generation: writes the conformance app and builds it, like a generator would. */
@@ -304,15 +407,9 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
       const realHome = homedir();
       const scratch = dirname(workspace);
       const canaryDir = dirname(opts.canary.file);
-      const nodeRoot = dirname(dirname(realpathSync(process.execPath)));
-      const pnpmBin = onPath('pnpm');
-      const pnpmRoot = pnpmBin ? dirname(dirname(realpathSync(pnpmBin))) : undefined;
-      // A corepack pnpm shim needs corepack's cache of the pinned pnpm, which lives under the real home.
-      const corepackHome = process.env['COREPACK_HOME'] ?? join(realHome, '.cache', 'node', 'corepack');
-      const corepack = existsSync(corepackHome) ? corepackHome : undefined;
+      const tools = toolchain();
       const sharedTemp = `/tmp/claude-${process.getuid?.() ?? 0}`;
       const agentTemp = existsSync(sharedTemp) ? realpathSync(sharedTemp) : join('/private', sharedTemp);
-      const repoDir = opts.forbiddenPaths[0]!;
       const versions = {
         node: process.version,
         pnpm: execFileSync('pnpm', ['--version'], { encoding: 'utf8' }).trim(),
@@ -327,11 +424,13 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
         effort: opts.effort,
         maxBudgetUsd: stub ? undefined : opts.maxBudgetUsd,
         hiddenRoots: [realHome, realpathSync(tmpdir()), agentTemp],
-        toolRoots: [...new Set([nodeRoot, ...(pnpmRoot ? [pnpmRoot] : []), ...(corepack ? [corepack] : [])])],
-        binDirs: [...new Set([dirname(process.execPath), ...(pnpmBin ? [dirname(pnpmBin)] : [])])],
+        agentTemp,
+        forbidden: opts.forbiddenPaths,
+        toolRoots: tools.roots,
+        binDirs: tools.binDirs,
         auth,
         user: userInfo().username,
-        toolEnv: corepack ? { COREPACK_HOME: corepack, COREPACK_ENABLE_NETWORK: '0', COREPACK_ENABLE_DOWNLOAD_PROMPT: '0' } : undefined,
+        toolEnv: Object.keys(tools.env).length ? tools.env : undefined,
       });
       const prepare = (stateDir: string) => {
         const paths = sessionPaths(stateDir);
@@ -345,23 +444,28 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
         cwd: workspace,
         version: cliVersion,
       });
-      const checks: IsolationCheck[] = [];
+      // 0. Every forbidden path must be hidden without being named in the settings the model is shown.
+      const probeState = join(opts.stateDir, 'probe');
+      const cover = coverFor(base(probeState, { stubUrl: 'http://127.0.0.1:0' }));
+      const named = opts.forbiddenPaths.filter((p) => cover.includes(p));
+      const checks: IsolationCheck[] = [
+        {
+          id: 'claude-code.forbidden-hidden',
+          ok: named.length === 0,
+          detail: named.length
+            ? `${named.join(', ')} can only be hidden from the session by naming it in the sandbox settings the model is shown, since every folder above it holds something the session needs. Move it into a folder of its own.`
+            : `every forbidden path is hidden under ${cover.join(', ')}`,
+        },
+      ];
+      if (named.length) return { ok: false, error: 'a forbidden path would be shown to the model; no session was started', logs: [], isolation: checks };
 
       // 1. The probe, against the stub model.
-      const probeTargets: ProbeTargets = {
-        canaryFile: opts.canary.file,
-        canaryToken: opts.canary.token,
-        canaryDir,
-        repoFile: join(repoDir, 'package.json'),
-        repoDir,
-        realHome,
-        agentTemp,
-        workspace,
-        skill: opts.skill?.name,
-      };
-      const probeState = join(opts.stateDir, 'probe');
+      const probe = probeSteps(
+        { canaryFile: opts.canary.file, canaryToken: opts.canary.token, canaryDir, forbidden: opts.forbiddenPaths, readProbes: opts.readProbes, realHome, agentTemp, workspace, skill: opts.skill?.name },
+        versions,
+      );
       prepare(probeState);
-      const probeStub = await startStubModel(probeScript(probeTargets), TOOLS);
+      const probeStub = await startStubModel(probeScript(probe), TOOLS);
       let probeRun: SessionRun;
       try {
         const invocation = buildInvocation(base(probeState, { stubUrl: probeStub.url }));
@@ -375,7 +479,7 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
       if (first) writeFileSync(log('probe-system-prompt.txt'), `${first.system}\n\n---- messages ----\n\n${first.messages}\n`);
       checks.push(
         ...checkInit(probeRun.transcript.init, expectedInit(model)).map((c) => ({ ...c, id: c.id.replace('claude-code.', 'claude-code.probe-') })),
-        ...judgeProbe(probeRun.transcript, probeTargets, versions),
+        ...judgeProbe(probeRun.transcript, probe),
         ...checkFirstRequest(first, prompt, opts.forbiddenPaths),
       );
       if (opts.skill) {

@@ -17,6 +17,7 @@ function comparisonInputs(run: Manifest): string {
     starter: run.hashes.starter,
     briefHash: run.hashes.brief,
     promptHash: run.hashes.prompt,
+    scoring: run.hashes.scoring,
     adapter: run.adapter,
     model: run.model,
     effort: run.effort,
@@ -30,6 +31,9 @@ function readRun(root: string, runId: string): Manifest {
   const run = JSON.parse(readFileSync(join(root, runId, 'manifest.json'), 'utf8')) as Manifest;
   if (run.runId !== runId || run.status !== 'complete' || !run.isolation.ok || !run.generation?.ok || !run.build) {
     throw new Error(`run ${runId} has no completed evaluation evidence`);
+  }
+  if (!/^[a-f0-9]{64}$/.test(run.hashes?.scoring ?? '')) {
+    throw new Error(`run ${runId} has no scoring source fingerprint`);
   }
   return run;
 }

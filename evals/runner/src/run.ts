@@ -4,6 +4,12 @@
 // everything in evals/results/<run-id>/. The temp workspace is deleted
 // afterwards, also when a step fails.
 //
+// The run stops before the adapter is called if the workspace or prompt
+// fails an isolation check, and before the build if generation failed or
+// the session wasn't isolated. The build runs the generated code confined
+// (see confine.ts). The build output is then served by the runner itself,
+// with its own mock API (see serve.ts).
+//
 // Agent-independent: everything agent-specific is in the adapter.
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -12,14 +18,15 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { Adapter, GenerateResult, IsolationCheck } from '../../adapters/types.ts';
 import { materialize, REPO } from '../../starter/src/materialize.ts';
-import { BuildOutputError, buildSandbox, collectBundle } from './build.ts';
+import { toolchain } from '../../starter/src/toolchain.ts';
 import { checkOutside, checkPrompt, checkWorkspacePath, scanWorkspace } from './checks.ts';
 import { conditionNamed } from './conditions.ts';
+import { confine, confineCopy, sandboxAvailable, type ConfinementRecord } from './confine.ts';
 import { copyFiles, diff, hashEntry, hashTree, sha256, snapshot, walk } from './files.ts';
-import { startEvalPreview } from './preview.ts';
 import { PROMPT_FILE, renderPrompt } from './prompt.ts';
 import { requireReport, summarizeReport, type TestSummary } from './report.ts';
 import { lintTokens, type TokenLint } from './token-lint.ts';
+import { copyBuild, serveBuild } from './serve.ts';
 
 export const RESULTS = join(REPO, 'evals', 'results');
 const TESTS = join(REPO, 'evals', 'tests');
@@ -32,6 +39,18 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 /** What the workspace snapshot skips: dependencies and build output, which the generator doesn't author. */
 const SNAPSHOT_SKIP = { skipAnywhere: ['node_modules', '.git'], skipPaths: ['dist', '.vite'] };
+
+/** Fingerprint the checked-out sources that produce the shared review evidence. */
+function scoringHash(): string {
+  const suites = hashTree(TESTS, {
+    skipAnywhere: ['node_modules', 'test-results', 'playwright-report'],
+    skipPaths: ['meta', 'conformance-app'],
+  });
+  const screenshots = hashTree(join(RUNNER, 'screenshots'));
+  const fixtures = hashTree(join(REPO, 'evals', 'fixtures', 'src'));
+  const evidence = ['playwright.config.ts', 'src/serve.ts', 'src/report.ts'].map((file) => hashEntry(join(RUNNER, file)));
+  return sha256([suites, screenshots, fixtures, ...evidence].join('\n'));
+}
 
 export interface RunOptions {
   brief: string;
@@ -77,7 +96,7 @@ export interface Manifest {
   startedAt: string;
   finishedAt?: string;
   versions: { node: string; pnpm: string; playwright: string | null; agent: string | null };
-  hashes: { skill: string | null; starter: string | null; brief: string; prompt: string };
+  hashes: { skill: string | null; starter: string | null; brief: string; prompt: string; scoring: string };
   skillRevision: string | null;
   prompt: string;
   /** The temp workspace, deleted after the run. Recorded so its removal can be checked. */
@@ -85,10 +104,20 @@ export interface Manifest {
   timings: Record<string, Step>;
   isolation: { ok: boolean; checks: IsolationCheck[]; settings?: Record<string, unknown> | undefined };
   generation: Omit<GenerateResult, 'isolation' | 'settings'> | null;
+  /** How the build was confined. */
+  confinement: ConfinementRecord | null;
   output: { dir: string; copied: string[]; added: string[]; changed: string[]; deleted: string[]; links: Array<{ path: string; target: string }> } | null;
-  /** Brief completion: a failed build is recorded, never fixed. */
-  build: { ok: boolean; exitCode: number; log: string; outputError?: string } | null;
-  preview: { url: string } | null;
+  /** Brief completion: a failed build, or one that wrote no dist/index.html, is recorded, never fixed. */
+  build: { ok: boolean; exitCode: number | null; log: string; error?: string } | null;
+  /** The runner's own server for the build: a confined copy of dist/ (links left out) and the canonical mock API. */
+  preview: {
+    url: string;
+    log: string;
+    copiedIn: ConfinementRecord['sandbox'];
+    files: number;
+    links: Array<{ path: string; target: string }>;
+    refused: Array<{ path: string; reason: string }>;
+  } | null;
   tests: (TestSummary & { report: string; log: string; touchTargets: string[] }) | null;
   screenshots: { expected: string[]; saved: string[]; missing: Array<{ file: string; reason: string }>; report: string } | null;
   tokenLint: TokenLint;
@@ -124,8 +153,13 @@ function repoRoots(): string[] {
   return [...new Set(roots)];
 }
 
-/** Runs a command to completion, capturing its output in a log file. Aborts with the run. */
-function runLogged(
+/**
+ * Runs a command to completion, capturing its output in a log file. Aborts
+ * with the run. When the command exits, whatever it left running in its
+ * process group is killed, so nothing from a build keeps changing the
+ * workspace; output still pending after a few seconds is cut off.
+ */
+export function runLogged(
   command: string,
   args: string[],
   { cwd, env, logFile, signal }: { cwd: string; env?: NodeJS.ProcessEnv; logFile: string; signal?: AbortSignal | undefined },
@@ -133,22 +167,37 @@ function runLogged(
   return new Promise((resolvePromise, reject) => {
     const child = spawn(command, args, { cwd, env: env ?? process.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     let output = '';
+    let exitCode: number | null = null;
+    let finished = false;
     child.stdout?.on('data', (chunk: Buffer) => (output += chunk.toString()));
     child.stderr?.on('data', (chunk: Buffer) => (output += chunk.toString()));
-    const kill = () => {
+    const killGroup = (signalName: NodeJS.Signals) => {
       try {
-        if (child.pid) process.kill(-child.pid, 'SIGTERM');
+        if (child.pid) process.kill(-child.pid, signalName);
       } catch {
-        child.kill('SIGTERM');
+        if (signalName === 'SIGTERM') child.kill('SIGTERM');
       }
+    };
+    const kill = () => killGroup('SIGTERM');
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      signal?.removeEventListener('abort', kill);
+      writeFileSync(logFile, output);
+      resolvePromise(exitCode);
     };
     signal?.addEventListener('abort', kill, { once: true });
     child.once('error', reject);
-    child.once('close', (code) => {
-      signal?.removeEventListener('abort', kill);
-      writeFileSync(logFile, output);
-      resolvePromise(code);
+    child.once('exit', (code) => {
+      exitCode = code;
+      killGroup('SIGKILL');
+      setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish();
+      }, 5_000).unref();
     });
+    child.once('close', finish);
   });
 }
 
@@ -168,6 +217,9 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
   if (effort && !EFFORTS.includes(effort)) throw new Error(`effort must be one of ${EFFORTS.join(', ')}`);
   if (adapter.live && !model) throw new Error(`the ${adapter.name} adapter calls a model: pass an exact model ID`);
   if (adapter.live && !(maxBudgetUsd && maxBudgetUsd > 0)) throw new Error(`the ${adapter.name} adapter calls a model: pass a spending cap`);
+  if (adapter.live && !sandboxAvailable()) {
+    throw new Error(`the ${adapter.name} adapter's output can only be built and served inside sandbox-exec, which needs macOS`);
+  }
   const briefPath = join(REPO, 'evals', 'briefs', `${brief}.md`);
   if (!existsSync(briefPath)) throw new Error(`no brief named "${brief}"`);
   const prompt = renderPrompt(brief);
@@ -176,6 +228,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     throw new Error(`the ${condition.skill.name} skill differs from its pinned revision ${condition.skill.pin.revision}`);
   }
   adapter.check?.();
+  const scoring = scoringHash();
 
   const resultsRoot = resolve(options.resultsRoot ?? RESULTS);
   mkdirSync(resultsRoot, { recursive: true });
@@ -206,6 +259,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
       starter: null,
       brief: hashEntry(briefPath),
       prompt: sha256(readFileSync(PROMPT_FILE)),
+      scoring,
     },
     skillRevision: condition.skill?.pin?.revision ?? null,
     prompt,
@@ -213,6 +267,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     timings: {},
     isolation: { ok: false, checks: [] },
     generation: null,
+    confinement: null,
     output: null,
     build: null,
     preview: null,
@@ -233,11 +288,19 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     }
   };
 
-  // The temp folder: the workspace, a canary just outside it, and the adapter's private state.
+  const invalid = (checks: IsolationCheck[], settings?: Record<string, unknown>) => {
+    manifest.isolation = { ok: false, checks, settings };
+    manifest.status = 'invalid';
+    manifest.error = `isolation failed: ${checks.filter((c) => !c.ok).map((c) => c.id).join(', ')}`;
+    return manifest;
+  };
+
+  // The temp folder: the workspace, a canary just outside it, the adapter's private state and the build's.
   const scratch = mkdtempSync(join(realpathSync(tmpdir()), 'work-'));
   const workspace = join(scratch, 'app');
   manifest.workspace = workspace;
-  let server: Awaited<ReturnType<typeof startEvalPreview>> | undefined;
+  let server: Awaited<ReturnType<typeof serveBuild>> | undefined;
+  let removeMarker = () => {};
 
   try {
     const forbiddenPaths = [...repoRoots(), realpathSync(resultsRoot), join(homedir(), '.claude')];
@@ -246,18 +309,18 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     await step('materialize', () =>
       materialize({ out: workspace, brief, guidance: condition.skill && skillDir ? { from: condition.skill.from, to: skillDir } : undefined }),
     );
-    const sandbox = buildSandbox(workspace, join(scratch, 'build-state'));
-    const sandboxLog = join(out, 'build-sandbox.log');
-    const probe = await step('build-sandbox', () => runLogged(sandbox.command, sandbox.probe, {
-      cwd: workspace, env: sandbox.env, logFile: sandboxLog, signal,
-    }));
-    if (probe !== 0) throw new Error(`could not start the build sandbox: ${readFileSync(sandboxLog, 'utf8').trim()}`);
     manifest.hashes.starter = hashTree(workspace, { skipAnywhere: ['node_modules'], skipPaths: skillDir ? [skillDir] : [] });
     const canary = { file: join(scratch, 'shared', 'notes.txt'), token: `note-${randomBytes(16).toString('hex')}` };
     mkdirSync(dirname(canary.file));
     writeFileSync(canary.file, `${canary.token}\n`);
     const stateDir = join(scratch, 'state');
     mkdirSync(stateDir);
+    // Files the adapter may try reading to prove the forbidden paths are unreadable: a marker in the results, and
+    // each checkout's package.json, which is published with the repo. Never anything else in a forbidden path.
+    const marker = { file: join(out, 'isolation-marker.txt'), token: `marker-${randomBytes(16).toString('hex')}` };
+    writeFileSync(marker.file, `${marker.token}\n`);
+    removeMarker = () => rmSync(marker.file, { force: true });
+    const readProbes = [marker, ...repoRoots().map((root) => ({ file: join(root, 'package.json') })).filter((p) => existsSync(p.file))];
 
     const checks: IsolationCheck[] = [
       checkOutside(workspace, forbiddenPaths),
@@ -265,12 +328,17 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
       checkPrompt(prompt, forbiddenPaths),
       scanWorkspace(workspace, { guidanceDir: skillDir, forbiddenPaths }),
     ];
-    if (!checks.every((check) => check.ok)) {
-      manifest.isolation = { ok: false, checks };
-      manifest.status = 'invalid';
-      manifest.error = `isolation failed: ${checks.filter((c) => !c.ok).map((c) => c.id).join(', ')}`;
-      return manifest;
-    }
+    // Nothing reaches the adapter, and nothing is spent, unless these pass.
+    if (!checks.every((c) => c.ok)) return invalid(checks);
+    const tools = toolchain();
+    const confinement = confine({ workspace, stateDir: join(scratch, 'build'), forbidden: forbiddenPaths, toolchain: tools });
+    manifest.confinement = confinement.record;
+    const sandboxLog = join(out, 'build-sandbox.log');
+    const [probeCommand, probeArgs] = confinement.wrap('pnpm', ['--version']);
+    const probe = await step('build-sandbox', () => runLogged(probeCommand, probeArgs, {
+      cwd: workspace, env: confinement.env, logFile: sandboxLog, signal,
+    }));
+    if (probe !== 0) throw new Error(`could not start the build sandbox: ${readFileSync(sandboxLog, 'utf8').trim()}`);
     const before = snapshot(workspace, SNAPSHOT_SKIP);
 
     // 2. Generate.
@@ -284,12 +352,14 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
         stateDir,
         canary,
         forbiddenPaths,
+        readProbes,
         skill: condition.skill && skillDir ? { name: condition.skill.name, dir: skillDir } : undefined,
         maxBudgetUsd,
         timeoutMs,
         signal,
       }),
     );
+    removeMarker();
     const { isolation: adapterChecks, settings, ...generation } = generated;
     manifest.generation = generation;
 
@@ -301,20 +371,20 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     const copied = await step('copy-output', () => copyFiles(workspace, outputDir, toCopy));
     manifest.output = { dir: 'output', ...copied, ...changes };
 
-    // The canary's token must not have travelled into the workspace either.
-    const carried = toCopy.filter((rel) => lstatSync(join(workspace, rel)).isFile() && readFileSync(join(workspace, rel)).includes(canary.token));
+    // Neither the canary's token nor the marker's may have travelled into the workspace either.
+    const carried = toCopy.filter((rel) => {
+      if (!lstatSync(join(workspace, rel)).isFile()) return false;
+      const text = readFileSync(join(workspace, rel));
+      return text.includes(canary.token) || text.includes(marker.token);
+    });
     checks.push({
       id: 'runner.canary-absent',
       ok: carried.length === 0,
-      detail: carried.length ? `the canary's token is in ${carried.join(', ')}` : 'the canary token is in no file the generator wrote',
+      detail: carried.length ? `the canary's or the marker's token is in ${carried.join(', ')}` : 'the canary and marker tokens are in no file the generator wrote',
     });
     checks.push(...adapterChecks);
-    manifest.isolation = { ok: checks.every((c) => c.ok), checks, settings };
-    if (!manifest.isolation.ok) {
-      manifest.status = 'invalid';
-      manifest.error = `isolation failed: ${checks.filter((c) => !c.ok).map((c) => c.id).join(', ')}`;
-      return manifest;
-    }
+    if (!checks.every((c) => c.ok)) return invalid(checks, settings);
+    manifest.isolation = { ok: true, checks, settings };
     // A session that stopped early (budget, time limit, error result) left
     // unfinished work. It's recorded, with its output copied above, but not
     // built or scored. Stopping the run itself is a runner error instead.
@@ -328,32 +398,26 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     // 4. Build. A failure is a brief-completion failure, recorded and never fixed.
     const buildLog = join(out, 'build.log');
     rmSync(join(workspace, 'dist'), { recursive: true, force: true });
-    const buildCode = await step('build', () => runLogged(sandbox.command, sandbox.args, {
-      cwd: workspace, env: sandbox.env, logFile: buildLog, signal,
-    }));
+    const [buildCommand, buildArgs] = confinement.wrap('pnpm', ['build']);
+    const buildCode = await step('build', () => runLogged(buildCommand, buildArgs, { cwd: workspace, env: confinement.env, logFile: buildLog, signal }));
     if (buildCode === null) throw new Error('the isolated build process was interrupted');
     manifest.build = { ok: buildCode === 0, exitCode: buildCode, log: 'build.log' };
+    // The build's output leaves the workspace only through the confined copy, never with the runner's own permissions.
+    const servedDir = join(scratch, 'serve');
+    const copier = confineCopy({ from: join(workspace, 'dist'), to: servedDir, nodeRoot: tools.nodeRoot, forbidden: forbiddenPaths });
+    const built = manifest.build.ok ? await step('copy-build', () => copyBuild(join(workspace, 'dist'), servedDir, copier)) : undefined;
+    if (built?.missing) manifest.build = { ...manifest.build, ok: false, error: built.missing };
 
-    if (manifest.build.ok) {
-      // 5. Serve only the static build, with a runner-owned fixture server.
-      let bundle: Map<string, Buffer>;
-      try {
-        bundle = await step('collect-build', () => collectBundle(workspace, sandbox));
-      } catch (error) {
-        if (!(error instanceof BuildOutputError)) throw error;
-        manifest.build.ok = false;
-        manifest.build.outputError = error.message;
-        manifest.status = 'complete';
-        return manifest;
-      }
-      const preview = await step('serve', () => startEvalPreview(bundle));
+    if (built && !built.missing) {
+      if (scoringHash() !== scoring) throw new Error('the scoring sources changed before scoring');
+      // 5. Serve the build: the runner's own server and mock API, never the workspace's.
+      const preview = await step('serve', () => serveBuild(servedDir, built));
       server = preview;
-      manifest.preview = { url: preview.url };
-      const browserEnv = {
-        ...process.env,
-        EVAL_BASE_URL: preview.url,
-        EVAL_MOCK_ADMIN_TOKEN: preview.admin,
+      manifest.preview = { url: preview.url, log: 'preview.log', copiedIn: copier.sandbox, files: built.copied.length, links: built.links, refused: built.refused };
+      const serverAlive = (when: string) => {
+        if (preview.gone()) throw new Error(`the build's server stopped ${when}:\n${preview.output()}`);
       };
+      const browserEnv = { ...process.env, EVAL_BASE_URL: preview.url, EVAL_MOCK_ADMIN_TOKEN: preview.admin };
 
       // 6. The shared behavior tests.
       const testsDir = join(out, 'tests');
@@ -373,6 +437,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
             .map((rel) => `tests/artifacts/${rel}`)
         : [];
       manifest.tests = { ...summarizeReport(join(testsDir, 'report.json')), report: 'tests/report.json', log: 'tests/output.log', touchTargets };
+      serverAlive('during the tests');
       requireReport(manifest.tests, 'behavior tests', testsCode, projects);
 
       // 7. Screenshots of every state, in every project.
@@ -391,6 +456,8 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
           signal,
         }),
       );
+      serverAlive('during the screenshots');
+      if (scoringHash() !== scoring) throw new Error('the scoring sources changed during scoring');
       const expected = projects.flatMap((p) => states.map((s) => `screenshots/${p}/${s}.png`));
       const saved = expected.filter((rel) => existsSync(join(out, rel)));
       const screenshotReport = summarizeReport(join(shotsDir, 'report.json'));
@@ -417,7 +484,11 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     manifest.error = error instanceof Error ? error.message : String(error);
     return manifest;
   } finally {
-    server?.stop();
+    if (server) {
+      server.stop();
+      writeFileSync(join(out, 'preview.log'), server.output());
+    }
+    removeMarker();
     rmSync(scratch, { recursive: true, force: true });
     // 9. The manifest, with every output file.
     manifest.finishedAt = new Date().toISOString();

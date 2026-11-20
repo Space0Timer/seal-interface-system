@@ -1,16 +1,14 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { MOCK_ADMIN_HEADER } from '../../tests/mock-admin.ts';
-import { buildSandbox, collectBundle } from '../src/build.ts';
-import { startEvalPreview } from '../src/preview.ts';
+import { serveBuild } from '../src/serve.ts';
 import { requireReport, summarizeReport } from '../src/report.ts';
 import { lintTokens } from '../src/token-lint.ts';
+import { exportReview } from '../src/review.ts';
+import type { Manifest } from '../src/run.ts';
 
 function scratch(t: { after(fn: () => void): void }) {
   const dir = mkdtempSync(join(tmpdir(), 'runner-evidence-'));
@@ -18,48 +16,12 @@ function scratch(t: { after(fn: () => void): void }) {
   return dir;
 }
 
-test('the build cannot read or write outside its directories or reach the network', { skip: process.platform !== 'darwin' }, async (t) => {
-  const root = scratch(t);
-  const workspace = join(root, 'app');
-  const state = join(root, 'state');
-  mkdirSync(workspace);
-  const sentinel = join(root, 'outside.txt');
-  writeFileSync(sentinel, 'private');
-  symlinkSync(sentinel, join(workspace, 'linked.txt'));
-  let requests = 0;
-  const listener = createServer((_req, res) => { requests++; res.end('outside'); });
-  await new Promise<void>((done) => listener.listen(0, '127.0.0.1', done));
-  t.after(() => { listener.close(); listener.closeAllConnections(); });
-  const { port } = listener.address() as AddressInfo;
-  const sandbox = buildSandbox(workspace, state);
-  writeFileSync(join(workspace, 'package.json'), JSON.stringify({
-    name: 'proof', scripts: { build: 'node check.mjs' },
-  }));
-  writeFileSync(join(workspace, 'check.mjs'), `
-    import assert from 'node:assert/strict';
-    import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-    assert.throws(() => readFileSync('../outside.txt'));
-    assert.throws(() => readFileSync('linked.txt'));
-    assert.throws(() => writeFileSync('../outside.txt', 'modified'));
-    await assert.rejects(fetch('http://127.0.0.1:${port}'));
-    assert.equal(process.env.HOME, ${JSON.stringify(sandbox.env.HOME)});
-    mkdirSync('dist');
-    writeFileSync('dist/index.html', '<h1>Built</h1>');
-  `);
-  execFileSync(sandbox.command, sandbox.args, { cwd: workspace, env: sandbox.env });
-  assert.equal(requests, 0);
-  assert.equal(readFileSync(sentinel, 'utf8'), 'private');
-  const bundle = await collectBundle(workspace, sandbox);
-  assert.equal(bundle.get('/index.html')?.toString(), '<h1>Built</h1>');
-  symlinkSync('../linked.txt', join(workspace, 'dist', 'asset.txt'));
-  await assert.rejects(collectBundle(workspace, sandbox), /unsupported build output/);
-});
-
 test('preview uses trusted fixtures and refuses browser access to log and reset controls', async (t) => {
-  const preview = await startEvalPreview(new Map([
-    ['/index.html', Buffer.from('<h1>Built</h1>')],
-    ['/api/assets', Buffer.from('forged assets')],
-  ]));
+  const root = scratch(t);
+  mkdirSync(join(root, 'api'));
+  writeFileSync(join(root, 'index.html'), '<h1>Built</h1>');
+  writeFileSync(join(root, 'api/assets'), 'forged assets');
+  const preview = await serveBuild(root, { copied: ['index.html', 'api/assets'], links: [], refused: [] });
   t.after(preview.stop);
   const request = (path: string, init?: RequestInit) => fetch(preview.url + path, init);
   assert.equal(await (await request('/')).text(), '<h1>Built</h1>');
@@ -140,4 +102,60 @@ test('token lint ignores disable and config comments in the scripts it checks, a
   assert.deepEqual(found('ds/no-raw-color'), [4, 6]);
   assert.deepEqual(report.ignoredDirectives, [{ file, count: 4 }]);
   assert.match(readFileSync(join(output, file), 'utf8'), /eslint-disable-next-line/, 'the authored file is never changed');
+});
+
+test('token lint checks CSS blocks and style attributes in authored HTML', async (t) => {
+  const root = scratch(t);
+  const file = 'index.html';
+  const path = join(root, file);
+  const lint = () => lintTokens(root, [file], root, root, '.claude/skills/design-system');
+  writeFileSync(path, '<style>.page { color: var(--color-text-primary); }</style><main class="page">Assets</main>');
+  assert.equal((await lint()).status, 'passed');
+  writeFileSync(path, [
+    '<!-- <p style="color: red">comment</p> -->',
+    '<script type="text/plain"><style>.page { color: red; }</style></script>',
+    '<style>/* stylelint-disable */ .page { color: #abc; }</style>',
+    '<style>',
+    '.title { margin: 13px; }',
+    '</style>',
+    "<main STYLE = 'color: &#35;fff'>Assets</main>",
+    '<template><p style=color:red>example</p></template>',
+  ].join('\n'));
+  const result = await lint();
+  assert.equal(result.status, 'failed');
+  if (result.status !== 'failed') return;
+  assert.deepEqual(result.checked, { stylesheets: 2, scripts: 0, html: 1 });
+  const { findings } = JSON.parse(readFileSync(join(root, result.report), 'utf8')) as {
+    findings: Array<{ file: string; rule: string; line: number; column: number }>;
+  };
+  assert.deepEqual(findings.map(({ file, rule, line }) => [file, rule, line]), [
+    [file, 'ds/token-values', 3],
+    [file, 'ds/token-values', 5],
+    [file, 'ds/no-inline-style', 7],
+    [file, 'ds/no-inline-style', 8],
+  ]);
+  assert.equal(findings[2]?.column, 7);
+  assert.ok((findings[0]?.column ?? 0) > 7, 'same-line CSS offsets include the opening tag');
+});
+
+test('blinded export rejects mismatched and missing scoring fingerprints', (t) => {
+  const root = scratch(t);
+  const first = '000000000001';
+  const second = '000000000002';
+  const writeRun = (runId: string, scoring?: string) => {
+    mkdirSync(join(root, runId), { recursive: true });
+    const manifest = {
+      runId, status: 'complete', isolation: { ok: true }, generation: { ok: true },
+      build: { ok: false }, projects: ['desktop-light'],
+      hashes: { scoring },
+    } satisfies Pick<Manifest, 'runId' | 'status' | 'projects'> & Record<string, unknown>;
+    writeFileSync(join(root, runId, 'manifest.json'), JSON.stringify(manifest));
+  };
+  const out = join(root, 'packet');
+  writeRun(first, 'a'.repeat(64));
+  writeRun(second, 'b'.repeat(64));
+  assert.throws(() => exportReview(root, out, [first, second]), /different comparison inputs/);
+  writeRun(second);
+  assert.throws(() => exportReview(root, out, [first, second]), /no scoring source fingerprint/);
+  assert.ok(!existsSync(out));
 });

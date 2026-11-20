@@ -358,40 +358,64 @@ Each run:
    - `work-*/shared/notes.txt`: a canary with a random token, just
      outside the workspace
    - `work-*/state/`: the adapter's private state
-2. Calls the adapter with `evals/runner/prompt.md`:
+   - `work-*/build/`: the build's fresh home and temp folder
+2. Runs the runner's isolation checks on the workspace and the prompt. If
+   one fails, the run ends as `invalid` before the adapter is called, so
+   nothing reaches the agent and nothing is spent.
+3. Calls the adapter with `evals/runner/prompt.md`:
    - It's one neutral text for every condition. Only the brief's filename
      is filled in.
    - A test scans it with the starter's leak list (`evals/starter/src/leaks.ts`).
-3. Copies all of `src/`, and every other file the generator added or
+4. Copies all of `src/`, and every other file the generator added or
    changed, into the results. It never edits them. Links are recorded,
-   never copied.
-4. Runs `pnpm build` with a fresh environment. The OS sandbox allows
-   workspace and private build-state writes, reads from the workspace and
-   the toolchain, and denies network access. A product build failure is
-   recorded for brief completion.
-5. Collects the static `dist/` output inside that sandbox. The runner
-   serves a snapshot of those files and its canonical mock API on one
-   loopback origin. The browser loads resources from that origin. The
-   Node-side test code authenticates reset and log requests.
-6. Runs the shared behavior tests in all four projects. It saves a JSON
+   never copied. This happens even when generation failed, so a partial
+   output can be diagnosed. Then the run ends, unscored:
+   - as `invalid` if an isolation check failed
+   - as `incomplete` if generation failed (a crash, timeout, budget stop or
+     error result)
+5. Runs `pnpm build`, confined (see "The build"). A failed build, or one
+   that wrote no `dist/index.html`, is a brief-completion failure: it's
+   recorded, never fixed, and the run ends there.
+6. Serves the build with the runner's own server
+   (`evals/runner/src/serve.ts`), never the workspace's `vite preview`:
+   - `dist/` is copied into a runner-owned folder by a separate helper,
+     confined like the build: it can read only `dist/`, the Node install
+     and the OS runtime, and write only that folder. It opens each file
+     without following links and checks the type of what it opened. Links
+     and anything it refuses are recorded in the manifest and
+     `preview.log`, never followed. The runner never reads the workspace
+     with its own permissions, so a build process that swaps a file for a
+     link mid-copy gets nothing from the host.
+   - The server reads only that copy.
+   - The mock API is the runner's own, from `evals/fixtures/src`. The
+     generator could have edited its workspace's Vite config and its copy
+     of the mock API, so every condition is judged against the same API
+     this way.
+   - Paths without an extension that match no file get `index.html`, as
+     Vite's preview does for a single-page app.
+   - The browser loads resources from that origin. The Node-side test
+     code authenticates reset and log requests.
+   - No generated code runs outside the browser after the build.
+7. Runs the shared behavior tests in all four projects. It saves a JSON
    report and the touch-target evidence.
-7. Takes full-page screenshots of the six states in all four projects
+8. Takes full-page screenshots of the six states in all four projects
    (`evals/runner/screenshots/`), with the clock fixed to the fixtures'
    NOW.
    - A PNG is saved only once its state is confirmed by the mock API's log
      and by what renders.
    - A state that can't be reached is recorded with the reason.
-8. Runs the repo's CSS token and product-code lint rules for my-skill.
+9. Runs the repo's CSS token and product-code lint rules for my-skill.
+   This includes stylesheets, scripts, HTML style blocks and style attributes.
    Findings describe authored code. The rubric also checks how the
    rendered app uses semantic roles.
    - Disable and config comments in the authored code have no effect.
      Stylelint ignores its own; scripts are linted from copies where
      `eslint-disable`, `oxlint-disable` and `/* eslint … */` comments are
      made inert. `token-lint.json` lists them under `ignoredDirectives`.
-9. Writes `manifest.json`, then deletes the temp folder. This happens even
-   when a step fails or the run is stopped.
+10. Deletes the temp folder and writes `manifest.json`. This happens even
+    when a step fails or the run is stopped.
 
-Statuses:
+Statuses (the CLI exits non-zero for all but `complete`):
 - `complete`: every applicable step ran. The build or tests may still have
   failed.
 - `invalid`: an isolation check failed. Nothing was built or scored.
@@ -401,6 +425,29 @@ Statuses:
 - `error`: the runner itself failed, including when a Playwright command
   produces no report or has a global execution error, or when the run is
   stopped.
+
+**The build.** `pnpm build` runs code the generator could have written
+(the build script, the Vite config and its plugins) outside the
+generation sandbox. `evals/runner/src/confine.ts` confines it:
+- The environment is an explicit allowlist: PATH with only node, pnpm and
+  system folders, a fresh HOME and TMPDIR in `work-*/build/`, LANG and
+  corepack's settings. Nothing else is inherited, so
+  `CLAUDE_CODE_OAUTH_TOKEN` never reaches generated code or its log.
+- On macOS it runs in `sandbox-exec`:
+  - Reads are denied by default. It may read only the OS runtime (system
+    binaries, libraries and frameworks, `/etc`, time zones, devices), the
+    node and pnpm installs, the workspace and its build state. The repo
+    checkouts, the results and `~/.claude` stay unreadable even inside
+    those. So the home folder, mounted volumes and shared folders are
+    out of reach.
+  - writes only to the workspace and its build state
+  - no outbound network, no other process's details, no keychain
+- When `pnpm build` exits, anything it left running in its process group
+  is killed, and its output isn't waited for past a few seconds.
+- Elsewhere only the environment is confined, so a live adapter refuses
+  to run there.
+- The manifest records the environment, everything readable and the
+  sandbox profile.
 
 ### Results
 
@@ -428,9 +475,12 @@ evals/results/            gitignored
   - skill: a SHA-256 over the assigned skill's sorted files, plus the
     pinned upstream revision when applicable
   - the starter, the brief and the prompt
+  - the scoring sources: shared tests, project settings, fixtures,
+    screenshot suite, preview server and report reader
 - step timings
 - the isolation report
 - generation outcome, usage and cost
+- how the build was confined, and which links in `dist/` weren't served
 - summaries of the output, build, tests and screenshots
 - every file, with its size and sha256
 
@@ -441,7 +491,8 @@ node evals/runner/src/cli.ts export-review --out <new-dir> <run-id> ...
 ```
 
 Export checks that the runs share the brief, starter, prompt, model
-settings, limits, versions, and browser projects. It randomizes sample
+settings, limits, versions, browser projects, and scoring fingerprint. Runs
+without a scoring fingerprint need to be rerun. Export randomizes sample
 order and includes the brief, rubric, principles, ban list, screenshots,
 test outcomes, and touch measurements. Give reviewers only the exported
 directory. Keep the alias key and raw results private until every sample's
@@ -476,6 +527,16 @@ prompt on stdin. The CLI is `claude` on PATH, or `CLAUDE_CODE_BIN`.
     temp folder (`/tmp/claude-<uid>`, which holds other sessions' files).
   - It can't write outside the workspace, and has no network except local
     ports.
+  - Every forbidden path (each repo checkout, the results, `~/.claude`)
+    is denied to Bash and the file tools wherever it is, including outside
+    the home and temp folders. Claude Code shows the model its sandbox
+    settings, so a forbidden path is never denied by name. It's covered by
+    the hidden folder that holds it, else by its highest ancestor that
+    holds nothing the session needs (for a checkout in
+    `/private/tmp/review/repo`, that's `/private/tmp/review`, since the
+    session's shell writes into `/tmp/claude-<uid>`). A path that can only
+    be hidden by its own name, such as a checkout directly in `/tmp`, stops
+    the run before the probe.
 - **Environment:** built from scratch. PATH holds only node, pnpm and
   system folders, so no inherited variable carries the repo path.
 - **Auth:** the owner's subscription token from `claude setup-token`.
@@ -489,19 +550,31 @@ Some of these switches aren't in the public docs: `CLAUDE_CODE_TMPDIR`,
 before every real session, a **probe** session runs with the same command,
 settings and workspace against a local stub model, at no cost.
 - The stub makes the probe try to:
-  - read the canary and a repo file
-  - list the repo, the owner's home and the shared temp folder
+  - read the canary
+  - glob and list every forbidden path: each repo checkout, the results
+    and `~/.claude`. These return names, never contents.
+  - read only files the runner names as harmless: a marker with a random
+    token in the results, and each checkout's own `package.json`. No
+    other file in a forbidden path is ever read, so a failed check can't
+    have put a secret in the logs.
+  - list the owner's home and the shared temp folder
   - write outside the workspace
-  - reach the network
+  - reach the network through the sandbox's proxy, and directly
 - Then it runs node and pnpm, reads a workspace file, and invokes the
   assigned skill when present. The probe verifies that the stub receives
   the skill body.
 - Every forbidden attempt must fail and every ordinary step must work, or
   the run stops before any model is called.
+- A network attempt passes only on proof of a denial: the sandbox's own
+  violation report naming the target, or the OS refusing the connection
+  with EPERM. Any HTTP status (even 404 or 500) means the network
+  answered. Any other failure, such as a missing curl, a DNS error or a
+  timeout, proves nothing and fails the check too.
 
 **Isolation checks.** All are recorded in the manifest. Any failure makes
 the run `invalid`.
-- **Runner, for every adapter:**
+- **Runner, for every adapter.** The first two run before the adapter is
+  called:
   - The workspace is outside the repo and the results.
   - Its path, the prompt, and every workspace file except the condition's
     guidance carry no leak words, owner copy or repo path.
