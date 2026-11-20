@@ -28,9 +28,9 @@
 // - The environment is built from scratch: no inherited variable can carry
 //   the repo path into the session.
 // - Bash commands start through a zsh wrapper in the private state
-//   (CLAUDE_CODE_SHELL), which registers each shell with the runner before
-//   it runs, so the runner can tell which processes are the session's (see
-//   leftovers.ts).
+//   (CLAUDE_CODE_SHELL), which checks in with the runner before and after
+//   each command, so the runner can tell which processes are the session's
+//   (see leftovers.ts).
 //
 // Some of these switches (CLAUDE_CODE_TMPDIR, CLAUDE_CODE_DISABLE_BUNDLED_SKILLS,
 // the built-in plugin names) aren't in the public docs. The probe session in
@@ -182,7 +182,7 @@ export function buildEnv(input: InvocationInput): Record<string, string> {
     ...auth,
     // Claude Code's own scratch files go to the private state, not the shared temp folder.
     CLAUDE_CODE_TMPDIR: agentTmp,
-    // Bash commands start through the wrapper that registers them (see leftovers.ts).
+    // Bash commands start through the wrapper that checks them in (see leftovers.ts).
     CLAUDE_CODE_SHELL: shell,
     CLAUDE_CODE_DISABLE_BUNDLED_SKILLS: '1',
     CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1',

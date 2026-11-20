@@ -7,24 +7,27 @@
 // Nothing a process says about itself proves it's the session's: anyone can
 // start a process with the session's HOME, in its workspace. So ownership
 // comes from the process tree, checked while the session runs:
-// - The CLI's own process group is the session's: the CLI starts in a
-//   session of its own, and a process group never spans sessions.
-// - Every shell Claude Code starts is a small zsh wrapper (watchShells),
-//   which registers its PID and waits. The runner checks in the process
-//   table that the shell descends from the CLI, records its process group,
-//   and only then lets it run. Every process the command leaves in that
-//   group is the session's.
-// - So is any child of a process that is the session's.
-// When the CLI exits, the runner finds candidates: processes whose
-// environment sets the session's HOME, or that work in the workspace or that
-// HOME. A recorded group is killed when its first process is still the
-// shell that registered, or when one of its members is a candidate, so a
-// group whose number was reused by now is never mistaken for it. A
-// candidate that isn't shown to be the session's is reported and left
-// running: it could be the session's, or a diagnostic someone started.
-// macOS only: `ps -E` and lsof show the candidates.
+// - Every shell Claude Code starts is a small zsh wrapper (watchShells).
+//   It runs the real zsh as its child, and checks in with the runner before
+//   and after: it sends its PID and the PID of a waiter it started, and
+//   waits. The runner checks in the process table that the shell descends
+//   from the CLI and that the waiter is its child. Then it records every
+//   process in the shell's process group as a witness, by PID and start
+//   time, and kills the waiter, which lets the shell go on. The runner
+//   never writes to a path the session could replace.
+// - A process is the session's while it's a recorded witness: same PID,
+//   same start time. Its process group is then the session's too: a group's
+//   number can't be handed out again while the group has a member. So is
+//   any child of the session's processes.
+// When the CLI exits, the runner kills those processes and groups. A group
+// with no witness left alive can't be shown to be the same group, so its
+// members aren't killed. Neither are candidates (processes whose environment
+// sets the session's HOME, or that work in the workspace or that HOME) that
+// aren't shown to be the session's: they're reported and left running. They
+// could be the session's, or a diagnostic someone started. macOS only: ps
+// and lsof show the candidates.
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, closeSync, constants, mkdirSync, openSync, writeFileSync, writeSync } from 'node:fs';
+import { constants, fstatSync, mkdirSync, openSync, writeFileSync } from 'node:fs';
 import { Socket } from 'node:net';
 import { dirname, join } from 'node:path';
 
@@ -33,7 +36,7 @@ export interface Leftovers {
   stopped: string[];
   /** The session's, but still running after every attempt, in the same form. */
   remaining: string[];
-  /** Candidates not shown to be the session's, so left running, in the same form. */
+  /** Not shown to be the session's, so left running, in the same form. */
   unverified: string[];
 }
 
@@ -41,97 +44,111 @@ interface Proc {
   pid: number;
   ppid: number;
   pgid: number;
+  /** When it started, to the second. With the PID, it tells one process from a later one that reused the PID. */
+  start: string;
   command: string;
 }
+
+/** Processes shown to be the session's, by PID, with when each started. */
+export type Witnesses = Map<number, string>;
 
 const CALL = { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 10_000 } as const;
 const uid = () => String(process.getuid?.() ?? '');
 const inside = (path: string, dir: string) => path === dir || path.startsWith(`${dir}/`);
 const describe = (procs: Iterable<Proc>) => [...procs].map((p) => `${p.pid} ${p.command.slice(0, 200)}`);
 const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
+const ps = (args: string[]) => execFileSync('ps', ['-ww', '-U', uid(), ...args], { ...CALL, env: { ...process.env, LC_ALL: 'C' } });
 
 /** This user's processes, without their environments. */
-function processTable(): Map<number, Proc> {
+export function processTable(): Map<number, Proc> {
+  const commands = new Map<number, string>();
+  for (const line of ps(['-o', 'pid=,command=']).split('\n')) {
+    const match = /^\s*(\d+)\s(.*)$/.exec(line);
+    if (match) commands.set(Number(match[1]), match[2] ?? '');
+  }
   const table = new Map<number, Proc>();
-  for (const line of execFileSync('ps', ['-ww', '-U', uid(), '-o', 'pid=,ppid=,pgid=,command='], CALL).split('\n')) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s(.*)$/.exec(line);
-    if (match) table.set(Number(match[1]), { pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), command: match[4] ?? '' });
+  for (const line of ps(['-o', 'pid=,ppid=,pgid=,lstart=']).split('\n')) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S.*\S)\s*$/.exec(line);
+    const pid = Number(match?.[1]);
+    const command = commands.get(pid);
+    if (match && command !== undefined) table.set(pid, { pid, ppid: Number(match[2]), pgid: Number(match[3]), start: match[4] ?? '', command });
   }
   return table;
 }
 
-/** When a process started, or undefined if it isn't running. */
-function startOf(pid: number): string | undefined {
-  const ps = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], CALL);
-  return ps.status === 0 ? ps.stdout.trim() || undefined : undefined;
-}
-
-/** The shell wrapper's script. It registers its PID, waits for the runner (at most 10 seconds), then runs zsh. */
-function wrapper(dir: string): string {
+/** The shell wrapper's script: it checks in, runs zsh, checks in again, and exits with zsh's status. */
+function wrapper(register: string): string {
   return `#!/bin/zsh -f
-# Registers this shell, then runs zsh.
-ready=${quote(join(dir, 'ready'))}.$$
-if mkfifo "$ready" 2>/dev/null && exec 3<>"$ready"; then
-  print -r -- $$ >> ${quote(join(dir, 'register'))}
-  read -r -t 10 -u 3 _
-  exec 3<&-
-  rm -f "$ready"
-fi
-exec /bin/zsh "$@"
+# Checks in before and after running zsh.
+checkin() {
+  sleep 10 < /dev/null > /dev/null 2>&1 &
+  local waiter=$!
+  print -r -- "$$ $waiter" >> ${quote(register)} 2>/dev/null && wait $waiter 2>/dev/null
+  kill $waiter 2>/dev/null
+}
+checkin
+/bin/zsh "$@"
+code=$?
+checkin
+exit $code
 `;
 }
 
 export interface Shells {
-  /** Process groups of the shells shown to descend from the CLI, with when each group's first process started. */
-  groups: Map<number, string | undefined>;
+  /** The session's processes seen so far: shells and every member of their process groups when they checked in. */
+  witnesses: Witnesses;
+  /** The process groups of the shells that checked in. */
+  groups: Set<number>;
   close(): void;
 }
 
 /**
- * Writes the shell wrapper at shell and listens for its registrations. A
- * shell is recorded only if the process table shows it descends from the
- * CLI, whose PID cli returns once it has started. Whatever registers is let
- * run, so a registration someone else wrote can't hold anything up, and
- * can't get anything recorded either.
+ * Writes the shell wrapper at shell, in a folder that must not exist yet,
+ * and listens for check-ins. They're only taken from a shell the process
+ * table shows descends from the CLI, whose PID cli returns once it has
+ * started, so a check-in someone else wrote records nothing and lets
+ * nothing go on.
  */
 export function watchShells(shell: string, cli: () => number | undefined): Shells {
   const dir = dirname(shell);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(shell, wrapper(dir));
-  chmodSync(shell, 0o755);
+  mkdirSync(dirname(dir), { recursive: true });
+  mkdirSync(dir);
+  writeFileSync(shell, wrapper(join(dir, 'register')), { flag: 'wx', mode: 0o755 });
   const register = join(dir, 'register');
   execFileSync('mkfifo', [register], CALL);
-  // Open for reading and writing, so it never reaches end of file between shells.
-  const pipe = new Socket({ fd: openSync(register, constants.O_RDWR | constants.O_NONBLOCK), readable: true, writable: false });
-  const groups = new Map<number, string | undefined>();
+  // Open for reading and writing, so it never reaches end of file between shells. It's opened once, before the
+  // session starts; nothing in the folder is opened again.
+  const fd = openSync(register, constants.O_RDWR | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  if (!fstatSync(fd).isFIFO()) throw new Error(`${register} is not the pipe the runner made`);
+  const pipe = new Socket({ fd, readable: true, writable: false });
+  const witnesses: Witnesses = new Map();
+  const groups = new Set<number>();
   let pending = '';
   pipe.on('data', (chunk: Buffer) => {
     pending += chunk.toString();
     const lines = pending.split('\n');
     pending = lines.pop() ?? '';
     for (const line of lines) {
-      if (!/^\d+$/.test(line)) continue;
-      const pid = Number(line);
-      const table = processTable();
+      const match = /^(\d+) (\d+)$/.exec(line);
       const cliPid = cli();
-      let current = pid;
+      if (!match || !cliPid) continue;
+      const table = processTable();
+      const shellProc = table.get(Number(match[1]));
+      const waiter = table.get(Number(match[2]));
+      let current = shellProc?.pid ?? 0;
       for (let depth = 0; depth < 10 && current > 1 && current !== cliPid; depth++) current = table.get(current)?.ppid ?? 0;
-      const group = table.get(pid)?.pgid;
-      if (cliPid && current === cliPid && group && group !== cliPid && !groups.has(group)) groups.set(group, startOf(group));
+      if (!shellProc || !waiter || current !== cliPid || waiter.ppid !== shellProc.pid) continue;
+      groups.add(shellProc.pgid);
+      for (const p of table.values()) if (p.pgid === shellProc.pgid) witnesses.set(p.pid, p.start);
       try {
-        const ready = openSync(join(dir, `ready.${pid}`), constants.O_WRONLY | constants.O_NONBLOCK);
-        try {
-          writeSync(ready, '\n');
-        } finally {
-          closeSync(ready);
-        }
+        process.kill(waiter.pid, 'SIGTERM');
       } catch {
-        // No shell is waiting under that PID.
+        // It's gone already, and the shell has gone on.
       }
     }
   });
   pipe.on('error', () => undefined);
-  return { groups, close: () => pipe.destroy() };
+  return { witnesses, groups, close: () => pipe.destroy() };
 }
 
 /**
@@ -142,7 +159,7 @@ export function watchShells(shell: string, cli: () => number | undefined): Shell
  */
 function withHome(home: string, table: Map<number, Proc>): Set<number> {
   const found = new Set<number>();
-  for (const line of execFileSync('ps', ['-ww', '-E', '-U', uid(), '-o', 'pid=,command='], CALL).split('\n')) {
+  for (const line of ps(['-E', '-o', 'pid=,command=']).split('\n')) {
     const [, pid = '', shown = ''] = /^\s*(\d+)\s(.*)$/.exec(line) ?? [];
     const command = table.get(Number(pid))?.command;
     if (command === undefined || !shown.startsWith(`${command} `)) continue;
@@ -171,67 +188,53 @@ export interface Session {
   home: string;
   /** The folders it works in: the workspace and its HOME. */
   folders: string[];
-  /** The CLI's process group. */
-  cliGroup: number;
-  /** The shells' process groups, from watchShells. */
-  shells: Map<number, string | undefined>;
-}
-
-/** What's shown to be the session's so far. Kept across rounds, since a parent killed in one round can't vouch for its child in the next. */
-interface Owned {
-  pids: Set<number>;
-  groups: Set<number>;
-}
-
-/** The session's processes, and the candidates not shown to be the session's. Adds what it finds to owned. */
-export function sessionProcesses(session: Session, owned: Owned): { owned: Map<number, Proc>; unverified: Map<number, Proc> } {
-  const table = processTable();
-  const selfGroup = table.get(process.pid)?.pgid;
-  const candidates = new Set([...withHome(session.home, table), ...workingIn(session.folders)]);
-  candidates.delete(process.pid);
-  owned.groups.add(session.cliGroup);
-  for (const [group, start] of session.shells) {
-    if (owned.groups.has(group)) continue;
-    const members = [...table.values()].filter((p) => p.pgid === group);
-    const sameLeader = start !== undefined && table.has(group) && startOf(group) === start;
-    if (members.length && (sameLeader || members.some((p) => candidates.has(p.pid)))) owned.groups.add(group);
-  }
-  owned.groups.delete(selfGroup ?? -1);
-  const ours = new Map<number, Proc>();
-  // Group members and children of the session's processes, until nothing new turns up.
-  let grew = true;
-  while (grew) {
-    grew = false;
-    for (const p of table.values()) {
-      if (ours.has(p.pid) || p.pid === process.pid || p.pgid === selfGroup) continue;
-      if (owned.groups.has(p.pgid) || owned.pids.has(p.pid) || owned.pids.has(p.ppid)) {
-        ours.set(p.pid, p);
-        owned.pids.add(p.pid);
-        owned.groups.add(p.pgid);
-        grew = true;
-      }
-    }
-  }
-  // A recorded shell's group that can't be shown to be the same group any more is reported, not killed.
-  const unconfirmed = [...table.values()].filter((p) => session.shells.has(p.pgid) && !owned.groups.has(p.pgid));
-  const unverified = new Map<number, Proc>();
-  for (const p of [...[...candidates].flatMap((pid) => table.get(pid) ?? []), ...unconfirmed]) {
-    if (!ours.has(p.pid)) unverified.set(p.pid, p);
-  }
-  return { owned: ours, unverified };
+  /** From watchShells. Witnesses are added as more are found. */
+  shells: Pick<Shells, 'witnesses' | 'groups'>;
 }
 
 /**
- * Kills the session's processes and their process groups, and looks again,
- * since one may have started another just before it was killed. Stops after
- * a few rounds or at the deadline, and reports what's left.
+ * The session's processes and process groups now, and what may be the
+ * session's but isn't shown to be. Records what it finds as witnesses.
+ */
+export function sessionProcesses(session: Session): { owned: Map<number, Proc>; groups: Set<number>; unverified: Map<number, Proc> } {
+  const { witnesses } = session.shells;
+  const table = processTable();
+  const selfGroup = table.get(process.pid)?.pgid;
+  const owned = new Map<number, Proc>();
+  const groups = new Set<number>();
+  const own = (p: Proc) => {
+    if (owned.has(p.pid) || p.pid === process.pid || p.pgid === selfGroup) return false;
+    owned.set(p.pid, p);
+    groups.add(p.pgid);
+    return true;
+  };
+  for (const p of table.values()) if (witnesses.get(p.pid) === p.start) own(p);
+  // Members of the groups those are in, and children of the session's processes, until nothing new turns up.
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const p of table.values()) if ((groups.has(p.pgid) || owned.has(p.ppid)) && own(p)) grew = true;
+  }
+  for (const p of owned.values()) witnesses.set(p.pid, p.start);
+  const candidates = [...withHome(session.home, table), ...workingIn(session.folders)];
+  const unverified = new Map<number, Proc>();
+  for (const p of [...candidates.flatMap((pid) => table.get(pid) ?? []), ...[...table.values()].filter((q) => session.shells.groups.has(q.pgid))]) {
+    if (!owned.has(p.pid) && p.pid !== process.pid) unverified.set(p.pid, p);
+  }
+  return { owned, groups, unverified };
+}
+
+/**
+ * Kills the session's processes and process groups, and looks again, since
+ * one may have started another just before it was killed. Each round kills
+ * only what that round's process table showed. Stops after a few rounds or
+ * at the deadline, and reports what's left.
  */
 export async function stopLeftovers(session: Session, { deadline = Date.now() + 30_000, rounds = 10 }: { deadline?: number; rounds?: number } = {}): Promise<Leftovers> {
-  const owned: Owned = { pids: new Set(), groups: new Set() };
   const stopped = new Map<number, Proc>();
-  let found = sessionProcesses(session, owned);
+  let found = sessionProcesses(session);
   for (let round = 0; found.owned.size && round < rounds && Date.now() < deadline; round++) {
-    for (const target of [...found.owned.keys(), ...[...owned.groups].map((group) => -group)]) {
+    for (const target of [...found.owned.keys(), ...[...found.groups].map((group) => -group)]) {
       try {
         process.kill(target, 'SIGKILL');
       } catch {
@@ -240,7 +243,7 @@ export async function stopLeftovers(session: Session, { deadline = Date.now() + 
     }
     for (const [pid, p] of found.owned) if (!stopped.has(pid)) stopped.set(pid, p);
     await new Promise((resolve) => setTimeout(resolve, 100));
-    found = sessionProcesses(session, owned);
+    found = sessionProcesses(session);
   }
   return {
     stopped: describe([...stopped.values()].filter((p) => !found.owned.has(p.pid))),

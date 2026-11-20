@@ -88,8 +88,8 @@ export interface SessionRun {
 
 /**
  * Runs one session, streaming its transcript and stderr into the log
- * folder. While it runs, every shell it starts is checked and its process
- * group recorded. When the CLI exits, the time limit stops applying and
+ * folder. While it runs, every shell it starts checks in, and the processes
+ * in the shell's group are recorded. When the CLI exits, the time limit stops applying and
  * whatever the session left running is stopped, with a deadline of its
  * own: the CLI's process group is killed, and so is every process shown to
  * be the session's (see leftovers.ts). Output still pending a few seconds
@@ -108,7 +108,7 @@ export function runSession(
   const shell = invocation.env['CLAUDE_CODE_SHELL'];
   if (!home || !shell) throw new Error('the session needs a HOME and a shell of its own, which is how what it leaves running is found');
   return new Promise((resolvePromise, reject) => {
-    // Registrations arrive only once the CLI has started a shell, by which time child is set.
+    // Check-ins arrive only once the CLI has started a shell, by which time child is set.
     const shells = watchShells(shell, () => child.pid);
     const child = spawn(bin, invocation.args, { cwd: workspace, env: invocation.env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     let stdout = '';
@@ -155,23 +155,27 @@ export function runSession(
       // The session is over, so it can no longer time out, and stopping it isn't interrupted.
       clearTimeout(timer);
       signal?.removeEventListener('abort', kill);
+      // The CLI has just been reaped, and process IDs are handed out in order, so its group's number still names
+      // its group. What's in it is killed at once, and given a moment to go before the rest is looked for.
       killGroup('SIGKILL');
-      const session = { home, folders: [workspace, home], cliGroup: child.pid ?? -1, shells: shells.groups };
-      stopLeftovers(session, { deadline: Date.now() + 30_000 }).then(
-        (result) => {
-          leftovers = result;
-          if (closed) return finish();
-          setTimeout(() => {
-            child.stdout?.destroy();
-            child.stderr?.destroy();
-            finish();
-          }, 5_000).unref();
-        },
-        (error: unknown) => {
-          shells.close();
-          reject(new Error(`could not stop what the session left running: ${error instanceof Error ? error.message : String(error)}`));
-        },
-      );
+      const deadline = Date.now() + 30_000;
+      groupGone(child.pid, Date.now() + 2_000)
+        .then(() => stopLeftovers({ home, folders: [workspace, home], shells }, { deadline }))
+        .then(
+          (result) => {
+            leftovers = result;
+            if (closed) return finish();
+            setTimeout(() => {
+              child.stdout?.destroy();
+              child.stderr?.destroy();
+              finish();
+            }, 5_000).unref();
+          },
+          (error: unknown) => {
+            shells.close();
+            reject(new Error(`could not stop what the session left running: ${error instanceof Error ? error.message : String(error)}`));
+          },
+        );
     });
     child.once('close', () => {
       closed = true;
@@ -179,6 +183,18 @@ export function runSession(
     });
     child.stdin?.end(prompt);
   });
+}
+
+/** Resolves once no process is left in the group, or at the deadline. */
+async function groupGone(group: number | undefined, deadline: number): Promise<void> {
+  while (group && Date.now() < deadline) {
+    try {
+      process.kill(-group, 0);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 /** Nothing the session started is still running, and nothing that may be its own is left unexplained. */

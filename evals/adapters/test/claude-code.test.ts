@@ -1,7 +1,7 @@
 // The Claude Code adapter's isolation checks, each shown to fail on the
 // evidence it exists to catch, plus the invocation and the stub model.
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -21,6 +21,7 @@ import {
   type ProbeTargets,
 } from '../claude-code/index.ts';
 import { buildInvocation, redacted, sandboxCover, TOOLS, type InvocationInput } from '../claude-code/invocation.ts';
+import { watchShells } from '../claude-code/leftovers.ts';
 import { startStubModel } from '../claude-code/stub-model.ts';
 import { checkInit, checkPaths, checkReceived, outsidePaths, parseTranscript, sessionOutcome, type InitEvent } from '../claude-code/transcript.ts';
 
@@ -100,7 +101,7 @@ test('the session environment is built from scratch: fresh home, no repo path, n
   const { env } = buildInvocation(input);
   assert.equal(env['HOME'], `${input.stateDir}/home`);
   assert.equal(env['CLAUDE_CONFIG_DIR'], `${input.stateDir}/home/.claude`);
-  assert.equal(env['CLAUDE_CODE_SHELL'], `${input.stateDir}/shell/zsh`, 'shells start through the wrapper that registers them');
+  assert.equal(env['CLAUDE_CODE_SHELL'], `${input.stateDir}/shell/zsh`, 'shells start through the wrapper that checks them in');
   assert.equal(env['CLAUDE_CODE_OAUTH_TOKEN'], 'secret-token');
   assert.equal(env['ANTHROPIC_API_KEY'], undefined, 'an API key would override the subscription token');
   assert.equal(env['ANTHROPIC_BASE_URL'], undefined);
@@ -386,19 +387,31 @@ if (how !== 'wait') c.unref();`);
 require('node:fs').writeFileSync('child.pid', String(c.pid));
 require('node:fs').writeFileSync('parent.pid', String(process.pid));
 setInterval(() => {}, 1000);`);
+  // orphan.cjs waits until its shell has checked in for the last time, starts sleep in its own process group, and
+  // exits, so nothing the runner saw is left alive in that group.
+  writeFileSync(join(dir, 'orphan.cjs'), `setTimeout(() => {
+  const c = require('node:child_process').spawn('sleep', ['64'], { stdio: 'ignore' });
+  require('node:fs').writeFileSync('orphan.pid', String(c.pid));
+  c.unref();
+}, 1000);`);
+  const register = join(dir, 'state', 'shell', 'register');
   // A stand-in for the CLI, which leaves processes running and exits:
   // - in-group: in the CLI's own process group
   // - parent and child: left by a command run through the shell, in the shell's process group
-  // - diagnostic: started on its own, not through the shell, with the session's HOME, in the workspace. It isn't
-  //   shown to be the session's, though its PID is registered as if it were a shell: it's reported and left running.
+  // - orphan: left in another shell's process group, but started after the shell's last check-in, by a process that
+  //   has exited since. That group can't be shown to be the same group any more: reported and left running.
+  // - diagnostic: started on its own, not through the shell, with the session's HOME, in the workspace, and checked
+  //   in as if it were a shell. It isn't shown to be the session's: reported and left running.
   // - outside: another HOME, outside the session's folders, holding the output open. Not the session's: left alone,
   //   and the output it holds is cut off.
   const script = [
     'sleep 60 & echo $! > in-group.pid',
     `node start.cjs shell.pid wait "$CLAUDE_CODE_SHELL" -c 'node leave.cjs > /dev/null 2>&1 &'`,
     'until [ -s child.pid ]; do sleep 0.1; done',
+    `node start.cjs orphan-shell.pid wait "$CLAUDE_CODE_SHELL" -c 'node orphan.cjs > /dev/null 2>&1 &'`,
+    'until [ -s orphan.pid ]; do sleep 0.1; done',
     `node start.cjs diagnostic.pid - node -e 'setInterval(() => {}, 1000)'`,
-    `cat diagnostic.pid >> ${join(dir, 'state', 'shell', 'register')} && echo >> ${join(dir, 'state', 'shell', 'register')}`,
+    `echo "$(cat diagnostic.pid) $(cat diagnostic.pid)" >> ${register}`,
     `cd / && HOME=${home}-other node ${join(dir, 'start.cjs')} ${join(dir, 'outside.pid')} hold sleep 63`,
   ].join('\n');
   const pid = (file: string) => Number(readFileSync(join(dir, file), 'utf8').trim());
@@ -411,30 +424,44 @@ setInterval(() => {}, 1000);`);
       dir,
       '',
       { transcript: join(dir, 'transcript.jsonl'), stderr: join(dir, 'stderr.log') },
-      3_000,
+      5_000,
     );
-    assert.ok(Date.now() - started > 5_000 && Date.now() - started < 10_000, `returned after ${Date.now() - started} ms`);
+    assert.ok(Date.now() - started > 5_000 && Date.now() - started < 15_000, `returned after ${Date.now() - started} ms`);
     assert.equal(run.exitCode, 0);
     assert.equal(run.timedOut, false, 'the time limit stops applying when the CLI exits');
     assert.deepEqual(run.leftovers.remaining, []);
     for (const p of [pid('parent.pid'), pid('child.pid')]) assert.ok(run.leftovers.stopped.some((s) => s.startsWith(`${p} `)), `${p} in ${run.leftovers.stopped.join('; ')}`);
-    assert.deepEqual(run.leftovers.unverified, [`${pid('diagnostic.pid')} node -e setInterval(() => {}, 1000)`]);
+    assert.deepEqual(run.leftovers.unverified.sort(), [`${pid('diagnostic.pid')} node -e setInterval(() => {}, 1000)`, `${pid('orphan.pid')} sleep 64`].sort());
     const gone = ['in-group.pid', 'parent.pid', 'child.pid'].map(pid);
     for (let i = 0; i < 20 && gone.some(alive); i++) await new Promise((resolve) => setTimeout(resolve, 100));
     assert.deepEqual(gone.filter(alive), [], 'nothing shown to be the session\'s is still running');
+    assert.equal(alive(pid('orphan.pid')), true, 'a process in a group that can\'t be shown to be the same any more is left running');
     assert.equal(alive(pid('diagnostic.pid')), true, 'a process with the session\'s HOME, started elsewhere, is left running');
     assert.equal(alive(pid('outside.pid')), true, 'a process that is not the session\'s is left alone');
     const check = checkStopped('claude-code.session-stopped', run.leftovers);
     assert.equal(check.ok, false, 'a process that may be the session\'s, left running, fails the check');
-    assert.match(check.detail, /not shown to be the session's, so left running: \d+ node -e setInterval/);
+    assert.match(check.detail, /not shown to be the session's, so left running: /);
   } finally {
-    for (const file of ['diagnostic.pid', 'outside.pid']) {
+    for (const file of ['diagnostic.pid', 'outside.pid', 'orphan.pid']) {
       try {
         process.kill(pid(file), 'SIGKILL');
       } catch {
         // Already gone.
       }
     }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the shell wrapper is set up only in a folder of its own, never through one that is already there', () => {
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'shells-'));
+  try {
+    mkdirSync(join(dir, 'host'));
+    mkdirSync(join(dir, 'state'));
+    symlinkSync(join(dir, 'host'), join(dir, 'state', 'shell'));
+    assert.throws(() => watchShells(join(dir, 'state', 'shell', 'zsh'), () => undefined), /EEXIST/);
+    assert.deepEqual(readdirSync(join(dir, 'host')), [], 'nothing is written through the link');
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

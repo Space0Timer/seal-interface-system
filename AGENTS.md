@@ -562,27 +562,35 @@ prompt on stdin. The CLI is `claude` on PATH, or `CLAUDE_CODE_BIN`.
   session, the time limit stops applying and everything the session
   started is stopped, with a deadline of its own
   (`evals/adapters/claude-code/leftovers.ts`):
-  - The CLI's process group is killed.
+  - The CLI's process group is killed at once. The CLI has just been
+    reaped, and macOS hands out process IDs in order, so the group's
+    number still names its group.
   - Claude Code runs each Bash command in a process group (and session) of
     its own, so a background process outlives the CLI. Nothing a process
     says about itself, such as its HOME, proves it's the session's, so
     ownership comes from the process tree, checked while the session runs.
-    `CLAUDE_CODE_SHELL` points at a zsh wrapper in the session's private
-    state. Each shell registers its PID and waits. The runner checks in
-    the process table that it descends from the CLI, records its process
-    group, and only then lets it run.
-  - The session's processes are the CLI's group, the recorded groups, and
-    any child of one of the session's processes. A process group never
-    spans sessions, so nothing started elsewhere can join one. The adapter
-    kills them with their groups, and looks again until none is left.
-  - A recorded group counts only if its first process is still the shell
-    that registered, or if one of its members has the session's HOME
-    (`ps -E`, which shows no environment for Apple's own binaries) or
-    works in the workspace or that HOME (lsof). So a group number reused
-    by now isn't mistaken for it.
-  - A process with the session's HOME, or working in those folders, that
-    isn't shown to be the session's is left running and fails the check
-    below. It could be the session's, or a diagnostic someone started.
+  - `CLAUDE_CODE_SHELL` points at a zsh wrapper in the session's private
+    state. It runs the real zsh as its child, and checks in before and
+    after: it sends its PID and the PID of a waiter it started, through a
+    pipe the runner opened before the session, and waits. The runner checks
+    in the process table that the shell descends from the CLI and that the
+    waiter is its child. Then it records every process in the shell's
+    process group as a witness, by PID and start time, and kills the waiter
+    to let the shell go on. The runner never writes to a path the session
+    could replace.
+  - The session's processes are the witnesses still alive (same PID, same
+    start time), every member of their process groups (a group's number
+    can't be handed out again while it has a member), and any child of
+    one of them. The adapter kills them with their groups, each round only
+    what that round's process table showed, and looks again until none is
+    left.
+  - A shell's group with no witness left alive can't be shown to be the
+    same group any more, so its members aren't killed. Neither are
+    candidates: processes whose environment sets the session's HOME
+    (`ps -E`, which shows no environment for Apple's own binaries) or that
+    work in the workspace or that HOME (lsof). Either is left running and
+    fails the check below. It could be the session's, or a diagnostic
+    someone started.
   - Output isn't waited for past a few seconds after that.
 - **Auth:** the owner's subscription token from `claude setup-token`.
   - The runner reads `CLAUDE_CODE_OAUTH_TOKEN` from the shell that starts
