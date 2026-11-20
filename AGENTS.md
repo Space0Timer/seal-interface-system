@@ -408,8 +408,15 @@ Each run:
      this way.
    - Paths without an extension that match no file get `index.html`, as
      Vite's preview does for a single-page app.
-   - The browser loads resources from that origin. The Node-side test
-     code authenticates reset and log requests.
+   - The browser can reach only that origin. Chromium's own proxy flags
+     send every other request, other local ports included, to a proxy
+     that each test worker holds on 127.0.0.1 and that closes every
+     connection (`evals/tests/browser.ts`). The port has to be held: on
+     macOS any process can listen on an unused port such as 9 on all
+     interfaces, and would then answer as the proxy. Playwright never
+     pauses the app's own requests, which include uploads of more than
+     100 MB. The Node-side test code reaches the server directly and
+     authenticates reset and log requests.
    - No generated code runs outside the browser after the build.
 7. Runs the shared behavior tests in all four projects. It saves a JSON
    report and the touch-target evidence.
@@ -789,6 +796,11 @@ CLI against the local stub and verifies the blinded export.
   - "Delete selected" inside a toolbar list
   - recovery controls that reorder after the first recovery
   - a virtualized list that renders 5 rows at a time
+
+  A meta test also shows that the browser hold works: without it, the
+  same server under `localhost` and another local port both answer the
+  page; with it, neither does, a server listening at the proxy's port on
+  all interfaces gets nothing, and the test code still reaches all three.
 - The owner makes the final call.
 - When conditions disagree, check skill loading, rule interpretation and
   implementation before revising a rule.
