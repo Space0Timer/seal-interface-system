@@ -6,14 +6,16 @@
 //
 // The run stops before the adapter is called if the workspace or prompt
 // fails an isolation check, and before the build if generation failed or
-// the session wasn't isolated. The build runs the generated code confined
-// (see confine.ts). The build output is then served by the runner itself,
-// with its own mock API (see serve.ts).
+// the session wasn't isolated. Once the session has started, the runner
+// never reads or changes the workspace with its own permissions: files
+// leave it only through a confined copy (see copy.ts), and the build runs
+// the generated code confined (see confine.ts). The build output is then
+// served by the runner itself, with its own mock API (see serve.ts).
 //
 // Agent-independent: everything agent-specific is in the adapter.
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { Adapter, GenerateResult, IsolationCheck } from '../../adapters/types.ts';
@@ -22,7 +24,8 @@ import { toolchain } from '../../starter/src/toolchain.ts';
 import { checkOutside, checkPrompt, checkWorkspacePath, scanWorkspace } from './checks.ts';
 import { conditionNamed } from './conditions.ts';
 import { confine, confineCopy, sandboxAvailable, type ConfinementRecord } from './confine.ts';
-import { copyFiles, diff, hashEntry, hashTree, sha256, snapshot, walk } from './files.ts';
+import { confinedCopy } from './copy.ts';
+import { diff, hashEntry, hashTree, sha256, snapshot, walk } from './files.ts';
 import { PROMPT_FILE, renderPrompt } from './prompt.ts';
 import { requireReport, summarizeReport, type TestSummary } from './report.ts';
 import { lintTokens, type TokenLint } from './token-lint.ts';
@@ -48,7 +51,7 @@ function scoringHash(): string {
   });
   const screenshots = hashTree(join(RUNNER, 'screenshots'));
   const fixtures = hashTree(join(REPO, 'evals', 'fixtures', 'src'));
-  const evidence = ['playwright.config.ts', 'src/serve.ts', 'src/report.ts'].map((file) => hashEntry(join(RUNNER, file)));
+  const evidence = ['playwright.config.ts', 'src/serve.ts', 'src/copy.ts', 'src/report.ts'].map((file) => hashEntry(join(RUNNER, file)));
   return sha256([suites, screenshots, fixtures, ...evidence].join('\n'));
 }
 
@@ -106,7 +109,17 @@ export interface Manifest {
   generation: Omit<GenerateResult, 'isolation' | 'settings'> | null;
   /** How the build was confined. */
   confinement: ConfinementRecord | null;
-  output: { dir: string; copied: string[]; added: string[]; changed: string[]; deleted: string[]; links: Array<{ path: string; target: string }> } | null;
+  /** The generator's files, copied out of the workspace by the confined copy: all of src/, and every other file it added or changed. */
+  output: {
+    dir: string;
+    copiedIn: ConfinementRecord['sandbox'];
+    copied: string[];
+    added: string[];
+    changed: string[];
+    deleted: string[];
+    links: Array<{ path: string; target: string }>;
+    refused: Array<{ path: string; reason: string }>;
+  } | null;
   /** Brief completion: a failed build, or one that wrote no dist/index.html, is recorded, never fixed. */
   build: { ok: boolean; exitCode: number | null; log: string; error?: string } | null;
   /** The runner's own server for the build: a confined copy of dist/ (links left out) and the canonical mock API. */
@@ -363,18 +376,21 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     const { isolation: adapterChecks, settings, ...generation } = generated;
     manifest.generation = generation;
 
-    // 3. Copy the output exactly as the generator left it.
-    const after = snapshot(workspace, SNAPSHOT_SKIP);
-    const changes = diff(before, after);
-    const toCopy = [...new Set([...[...after.keys()].filter((rel) => rel.startsWith('src/')), ...changes.added, ...changes.changed])].sort();
-    const outputDir = join(out, 'output');
-    const copied = await step('copy-output', () => copyFiles(workspace, outputDir, toCopy));
-    manifest.output = { dir: 'output', ...copied, ...changes };
+    // 3. Copy the output exactly as the generator left it: all of src/, and every other file it added or changed.
+    // A process the session left running could still swap a file or folder for a link to the host, so the
+    // workspace is read only by the confined copy, which also takes the snapshot the changes are found from.
+    // A real path: the sandbox matches the folders it allows against real paths.
+    const outputDir = join(realpathSync(out), 'output');
+    mkdirSync(outputDir);
+    const outputCopier = confineCopy({ from: workspace, to: outputDir, nodeRoot: tools.nodeRoot, forbidden: forbiddenPaths });
+    const copied = await step('copy-output', () => confinedCopy(workspace, outputDir, outputCopier, { ...SNAPSHOT_SKIP, before, keep: ['src'] }));
+    if (!copied.found) throw new Error('the workspace is no longer a folder');
+    const changes = diff(before, copied.hashes);
+    manifest.output = { dir: 'output', copiedIn: outputCopier.sandbox, copied: copied.copied, links: copied.links, refused: copied.refused, ...changes };
 
     // Neither the canary's token nor the marker's may have travelled into the workspace either.
-    const carried = toCopy.filter((rel) => {
-      if (!lstatSync(join(workspace, rel)).isFile()) return false;
-      const text = readFileSync(join(workspace, rel));
+    const carried = copied.copied.filter((rel) => {
+      const text = readFileSync(join(outputDir, rel));
       return text.includes(canary.token) || text.includes(marker.token);
     });
     checks.push({
@@ -397,7 +413,12 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
 
     // 4. Build. A failure is a brief-completion failure, recorded and never fixed.
     const buildLog = join(out, 'build.log');
-    rmSync(join(workspace, 'dist'), { recursive: true, force: true });
+    // A dist/ the session left is deleted confined like the build. With the runner's own permissions the delete
+    // could reach the host: a process the session left running could have replaced the workspace folder itself
+    // with a link, which the session's sandbox allows.
+    const [clearCommand, clearArgs] = confinement.wrap('rm', ['-rf', join(workspace, 'dist')]);
+    const cleared = spawnSync(clearCommand, clearArgs, { env: confinement.env, encoding: 'utf8', timeout: 120_000 });
+    if (cleared.status !== 0) throw new Error(`could not delete the workspace's dist/ before the build: ${cleared.stderr || cleared.error?.message || ''}`);
     const [buildCommand, buildArgs] = confinement.wrap('pnpm', ['build']);
     const buildCode = await step('build', () => runLogged(buildCommand, buildArgs, { cwd: workspace, env: confinement.env, logFile: buildLog, signal }));
     if (buildCode === null) throw new Error('the isolated build process was interrupted');
@@ -489,6 +510,9 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
       writeFileSync(join(out, 'preview.log'), server.output());
     }
     removeMarker();
+    // The session can't write the temp folder that holds scratch, but it could swap a folder inside scratch for a
+    // link. rmSync removes such a link instead of following it, also one swapped in during the delete: on Node 24 it
+    // walks the tree by file descriptor, not by path.
     rmSync(scratch, { recursive: true, force: true });
     // 9. The manifest, with every output file.
     manifest.finishedAt = new Date().toISOString();

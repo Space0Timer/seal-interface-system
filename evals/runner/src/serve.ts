@@ -6,17 +6,14 @@
 // Here every condition is judged against the same API, and no generated
 // code runs outside the browser.
 //
-// dist/ is first copied into a runner-owned folder, by a separate helper
-// process confined like the build (see confineCopy): it can read only
-// dist/, the Node install and the OS runtime, and write only that folder.
-// The runner never reads the workspace with its own permissions, so a build
-// process left running that swaps a file or folder in dist/ for a link
-// between two steps of the copy gets nothing from the host. The helper also
-// opens each file without following links and checks the type of what it
-// opened. Links are recorded, never copied or followed, and the server then
-// reads only the runner-owned copy.
+// dist/ is first copied into a runner-owned folder by the confined copy
+// helper (see copy.ts): it can read only dist/, the Node install and the OS
+// runtime, and write only that folder. The runner never reads the workspace
+// with its own permissions, so a build process left running that swaps a
+// file or folder in dist/ for a link between two steps of the copy gets
+// nothing from the host. Links are recorded, never copied or followed, and
+// the server then reads only the runner-owned copy.
 import { randomBytes } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
 import { createReadStream, existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -24,6 +21,7 @@ import { extname, join, normalize, sep } from 'node:path';
 import { createMockApi } from '../../fixtures/src/mock-api.ts';
 import { MOCK_ADMIN_HEADER } from '../../tests/mock-admin.ts';
 import type { Launch } from './confine.ts';
+import { confinedCopy } from './copy.ts';
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -60,76 +58,12 @@ export interface BuildCopy {
   missing?: string | undefined;
 }
 
-/** The copy helper, run as `node -e HELPER <from> <to>`. Self-contained, so it reads nothing of the repo. */
-export const COPY_HELPER = `
-const fs = require('node:fs');
-const path = require('node:path');
-const [from, to] = process.argv.slice(1);
-const out = { copied: [], links: [], refused: [] };
-const reason = (error) => (error && error.code) || String(error);
-const copyFile = (rel) => {
-  let fd;
-  try {
-    // Never through a link at the last step, and the type checked on what was opened, so nothing can swap in between.
-    fd = fs.openSync(path.join(from, rel), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    if (!fs.fstatSync(fd).isFile()) return out.refused.push({ path: rel, reason: 'not a regular file' });
-    const data = fs.readFileSync(fd);
-    const target = path.join(to, rel);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, data, { flag: 'wx' });
-    out.copied.push(rel);
-  } catch (error) {
-    out.refused.push({ path: rel, reason: reason(error) });
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd);
-  }
-};
-const visit = (rel, depth) => {
-  if (depth > 32) return out.refused.push({ path: rel, reason: 'nested too deep' });
-  let entries;
-  try {
-    entries = fs.readdirSync(path.join(from, rel), { withFileTypes: true });
-  } catch (error) {
-    return out.refused.push({ path: rel || '.', reason: reason(error) });
-  }
-  for (const entry of entries) {
-    if (out.copied.length + out.links.length + out.refused.length >= 20000) return out.refused.push({ path: rel || '.', reason: 'too many files' });
-    const child = rel ? rel + '/' + entry.name : entry.name;
-    if (entry.isSymbolicLink()) {
-      let target = '';
-      try {
-        target = fs.readlinkSync(path.join(from, child));
-      } catch {}
-      out.links.push({ path: child, target });
-    } else if (entry.isDirectory()) visit(child, depth + 1);
-    else if (entry.isFile()) copyFile(child);
-    else out.refused.push({ path: child, reason: 'not a regular file' });
-  }
-};
-const copyAll = () => {
-  let top;
-  try {
-    top = fs.lstatSync(from);
-  } catch {}
-  if (!top || !top.isDirectory()) return 'the build wrote no dist/ folder';
-  visit('', 0);
-  return out.copied.includes('index.html') ? undefined : 'the build wrote no dist/index.html';
-};
-const missing = copyAll();
-out.copied.sort();
-out.links.sort((a, b) => (a.path < b.path ? -1 : 1));
-out.refused.sort((a, b) => (a.path < b.path ? -1 : 1));
-// No process.exit: a report larger than the pipe's buffer is still being written. Node exits once it's flushed.
-process.stdout.write(JSON.stringify(missing ? { missing, ...out } : out));
-`;
-
-/** Copies dist into root, which must not exist yet, with the confined helper. */
+/** Copies dist into root, which must not exist yet, with the confined helper (see copy.ts). */
 export function copyBuild(dist: string, root: string, launch: Launch): BuildCopy {
   mkdirSync(root);
-  const [command, args] = launch.wrap(process.execPath, ['-e', COPY_HELPER, dist, root]);
-  const result = spawnSync(command, args, { env: launch.env, encoding: 'utf8', timeout: 120_000, maxBuffer: 64 * 1024 * 1024 });
-  if (result.status !== 0) throw new Error(`copying the build failed (exit ${result.status ?? result.signal}): ${result.stderr || result.error?.message || ''}`);
-  return JSON.parse(result.stdout) as BuildCopy;
+  const { found, copied, links, refused } = confinedCopy(dist, root, launch);
+  const missing = !found ? 'the build wrote no dist/ folder' : copied.includes('index.html') ? undefined : 'the build wrote no dist/index.html';
+  return missing ? { missing, copied, links, refused } : { copied, links, refused };
 }
 
 /** The file a request path maps to inside root, or undefined. Never leaves root. */

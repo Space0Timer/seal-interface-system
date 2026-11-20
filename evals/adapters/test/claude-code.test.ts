@@ -1,9 +1,9 @@
 // The Claude Code adapter's isolation checks, each shown to fail on the
 // evidence it exists to catch, plus the invocation and the stub model.
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { leakIn } from '../../starter/src/leaks.ts';
 import {
@@ -14,6 +14,7 @@ import {
   NETWORK_PROBES,
   probeScript,
   probeSteps,
+  runSession,
   SYSTEM_PROMPT_LINES_ALLOWED,
   type ProbeStep,
   type ProbeTargets,
@@ -355,5 +356,59 @@ test('the stub model replays its script for the session and records what it was 
     assert.ok(!JSON.stringify(stub.requests).includes('secret'), 'headers are never recorded');
   } finally {
     await stub.close();
+  }
+});
+
+test('when the CLI exits, nothing the session started is still running, in its process group or in one of its own', { skip: process.platform === 'darwin' ? false : 'reads other processes with macOS ps and lsof' }, async () => {
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'session-'));
+  const home = join(dir, 'home');
+  mkdirSync(home);
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // Starts a command in a new process group, as Claude Code runs each Bash command, holding the CLI's output open.
+  const detached = ([command, ...args]: string[], pidFile: string) =>
+    `node -e 'const c = require("node:child_process").spawn(${JSON.stringify(command)}, ${JSON.stringify(args)}, { detached: true, stdio: ["ignore", "inherit", "ignore"] }); console.error(c.pid); c.unref()' 2> ${pidFile}`;
+  // A stand-in for the CLI, which leaves processes running and exits: one in its own process group, and two in
+  // groups of their own. One of those is an Apple binary, whose environment ps doesn't show, in the workspace; the
+  // other has the session's HOME, but runs elsewhere. A fourth process runs elsewhere with a HOME that only starts
+  // like the session's: it isn't the session's, so it's left running, and the output it holds is cut off.
+  const script = [
+    'sleep 60 & echo $! > in-group.pid',
+    detached(['sleep', '61'], 'in-workspace.pid'),
+    `cd / && ${detached([process.execPath, '-e', 'setInterval(() => {}, 1000)'], `${dir}/elsewhere.pid`)}`,
+    `HOME=${home}-other ${detached(['sleep', '62'], `${dir}/other.pid`)}`,
+  ].join('\n');
+  const pid = (file: string) => Number(readFileSync(join(dir, file), 'utf8').trim());
+  try {
+    const started = Date.now();
+    const run = await runSession(
+      '/bin/sh',
+      { args: ['-c', script], env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home }, settings: {} },
+      dir,
+      '',
+      { transcript: join(dir, 'transcript.jsonl'), stderr: join(dir, 'stderr.log') },
+      60_000,
+    );
+    assert.ok(Date.now() - started < 8_000, `returned after ${Date.now() - started} ms`);
+    assert.equal(run.exitCode, 0);
+    assert.deepEqual(run.leftovers.remaining, []);
+    const gone = ['in-group.pid', 'in-workspace.pid', 'elsewhere.pid'].map(pid);
+    for (const p of gone.slice(1)) assert.ok(run.leftovers.stopped.some((s) => s.startsWith(`${p} `)), `${p} in ${run.leftovers.stopped.join('; ')}`);
+    for (let i = 0; i < 20 && gone.some(alive); i++) await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(gone.filter(alive), [], 'nothing the session started is still running');
+    assert.equal(alive(pid('other.pid')), true, 'a process that is not the session\'s is left alone');
+  } finally {
+    try {
+      process.kill(pid('other.pid'), 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+    rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -98,7 +98,9 @@ test('a full fake run: isolated, built, tested in every project, screenshotted, 
   assert.equal(m.hashes.skill, null);
   assert.match(m.hashes.starter ?? '', /^[0-9a-f]{64}$/);
 
-  // The output is the generator's files, untouched.
+  // The output is the generator's files, untouched, and it left the workspace only through the confined copy.
+  assert.equal(m.output?.copiedIn, sandboxAvailable() ? 'sandbox-exec' : 'none');
+  assert.deepEqual([m.output?.links, m.output?.refused], [[], []]);
   assert.deepEqual(m.output?.added.sort(), ['main.ts']);
   assert.deepEqual(m.output?.changed, ['index.html']);
   assert.equal(readFileSync(join(out, 'output', 'main.ts'), 'utf8'), readFileSync(join(REPO, 'evals/tests/conformance-app/main.ts'), 'utf8'));
@@ -262,6 +264,9 @@ test('all three conditions through the real Claude Code CLI against the local st
     assert.equal(m.status, 'complete', `${m.error}\n${JSON.stringify(m.isolation.checks.filter((c) => !c.ok), null, 2)}`);
     assert.deepEqual(failed(m), []);
     assert.equal(m.isolation.checks.find((c) => c.id === 'claude-code.probe-skill-content')?.ok, condition.skill ? true : undefined);
+    // The stub's generation leaves a process running in the background, which is stopped when the session ends.
+    assert.match(m.isolation.checks.find((c) => c.id === 'claude-code.session-stopped')?.detail ?? '', /^stopped what the session left running: \d+ node -e setInterval/);
+    assert.equal(m.isolation.checks.find((c) => c.id === 'claude-code.probe-stopped')?.detail, 'the session left nothing running');
     assert.equal(m.build?.ok, true);
     assert.deepEqual(m.tests?.failures, []);
     assert.deepEqual(m.screenshots?.missing, []);
