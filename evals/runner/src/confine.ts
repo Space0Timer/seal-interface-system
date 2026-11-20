@@ -14,10 +14,12 @@
 // (in the home folder, on a mounted volume, in a shared folder) nor copy
 // them into the build log the run keeps.
 //
-// The build's output is copied out of the workspace by a helper confined
-// the same way, which can read only dist/, the Node install and the OS
-// runtime, and write only the folder the runner serves (see serve.ts). So a
-// build process left running can't swap a host file into what's served.
+// Files leave the workspace only through a helper confined the same way
+// (see copy.ts): the generator's output into the results, and the build's
+// output into the folder the runner serves. It can read only the folder it
+// copies from, the Node install and the OS runtime, and write only the
+// folder it copies to. So a process left running can't swap a host file
+// into either.
 //
 // Elsewhere only the environment is confined, so live runs refuse to start
 // there (see runEval). The runner serves the copy itself, so no other
@@ -163,18 +165,18 @@ export function confine(input: ConfineInput, { sandbox = sandboxAvailable() }: {
 }
 
 export interface CopyInput {
-  /** The build output. Real path. */
+  /** The folder copied from: the workspace, or the build output. Real path. */
   from: string;
-  /** The folder the runner serves, which only the copy may write. Real path. */
+  /** The folder copied to, which only the copy may write. Real path. */
   to: string;
   nodeRoot: string;
   forbidden: string[];
 }
 
 /**
- * How to run the copy of the build output: Node with no inherited
- * environment, reading only the build output, the Node install and the OS
- * runtime, and writing only the served folder.
+ * How to run a copy out of the workspace: Node with no inherited
+ * environment, reading only the folder copied from, the Node install and
+ * the OS runtime, and writing only the folder copied to.
  */
 export function confineCopy(input: CopyInput, { sandbox = sandboxAvailable() }: { sandbox?: boolean } = {}): Launch & { sandbox: ConfinementRecord['sandbox'] } {
   const env = { LANG: 'en_US.UTF-8' };

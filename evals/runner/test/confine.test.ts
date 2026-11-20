@@ -3,7 +3,7 @@
 // blocks outbound network access and from other processes.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -148,6 +148,16 @@ test('sandboxed: nothing unnamed or forbidden is readable, no writes outside, no
   );
   assert.equal(seen['home'], join(input.stateDir, 'home'));
   assert.ok(!existsSync(join(root, 'outside.txt')));
+
+  // The runner deletes the workspace's dist/ this way before the build. Through a link to a host folder, as if a
+  // process left running had replaced the workspace folder with one, it deletes nothing there.
+  mkdirSync(join(unnamedDir, 'dist'));
+  writeFileSync(join(unnamedDir, 'dist', 'index.html'), 'a host file');
+  symlinkSync(unnamedDir, join(workspace, 'replaced'));
+  const cleared = run('rm', ['-rf', join(workspace, 'replaced', 'dist')]);
+  assert.notEqual(cleared.status, 0);
+  assert.match(cleared.stderr, /Operation not permitted/);
+  assert.ok(existsSync(join(unnamedDir, 'dist', 'index.html')));
 
   // Another process's arguments and environment (here, this test's) stay out of reach.
   const ps = run('/bin/ps', ['-E', '-o', 'command=', '-p', String(process.pid)]);

@@ -1,8 +1,8 @@
-// File helpers for runs: content hashes, workspace snapshots and diffs, and
-// copying the generator's output without following links.
+// File helpers for runs: content hashes, and workspace snapshots and diffs.
+// Copying out of the workspace is copy.ts's job.
 import { createHash } from 'node:crypto';
-import { copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync } from 'node:fs';
-import { dirname, join, relative, sep } from 'node:path';
+import { lstatSync, readdirSync, readFileSync, readlinkSync } from 'node:fs';
+import { join, relative, sep } from 'node:path';
 
 export interface WalkOptions {
   /** Folder names skipped at any depth. */
@@ -62,26 +62,4 @@ export function diff(before: Snapshot, after: Snapshot): Diff {
   const changed = [...after.keys()].filter((rel) => before.has(rel) && before.get(rel) !== after.get(rel));
   const deleted = [...before.keys()].filter((rel) => !after.has(rel));
   return { added, changed, deleted };
-}
-
-export interface CopyResult {
-  copied: string[];
-  /** Links found among the files, recorded but never copied or followed. */
-  links: Array<{ path: string; target: string }>;
-}
-
-/** Copies the given files from one root to another, byte for byte. Links are recorded, not copied. */
-export function copyFiles(from: string, to: string, files: string[]): CopyResult {
-  const result: CopyResult = { copied: [], links: [] };
-  for (const rel of files) {
-    const source = join(from, rel);
-    if (lstatSync(source).isSymbolicLink()) {
-      result.links.push({ path: rel, target: readlinkSync(source) });
-      continue;
-    }
-    mkdirSync(dirname(join(to, rel)), { recursive: true });
-    copyFileSync(source, join(to, rel));
-    result.copied.push(rel);
-  }
-  return result;
 }

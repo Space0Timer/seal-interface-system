@@ -208,7 +208,8 @@ Others:
     whole pipeline runs inside `pnpm check`.
   - `claude-code` runs Claude Code headless (see "Claude Code isolation").
   - `claude-code-stub` runs the same CLI against a local stub model that
-    writes the conformance app. It costs nothing.
+    writes the conformance app and leaves a process running in the
+    background, which the adapter must stop. It costs nothing.
 - A fresh working directory alone doesn't establish isolation. For each
   run, verify which files, instruction files and global skills the session
   can access.
@@ -367,25 +368,39 @@ Each run:
      is filled in.
    - A test scans it with the starter's leak list (`evals/starter/src/leaks.ts`).
 4. Copies all of `src/`, and every other file the generator added or
-   changed, into the results. It never edits them. Links are recorded,
-   never copied. This happens even when generation failed, so a partial
-   output can be diagnosed. Then the run ends, unscored:
-   - as `invalid` if an isolation check failed
-   - as `incomplete` if generation failed (a crash, timeout, budget stop or
-     error result)
+   changed, into the results. It never edits them.
+   - A separate helper (`evals/runner/src/copy.ts`), confined like the
+     build, makes the copy: it can read only the workspace, the Node
+     install and the OS runtime, and write only the output folder. It
+     opens each file without following links and checks the type of what
+     it opened. Links and anything it refuses are recorded in the
+     manifest, never copied or followed. It also takes the snapshot the
+     added and changed files are found from.
+   - The checks that follow read the copy. If the copy refused anything,
+     they can't cover the whole output, so the run ends as `invalid`.
+   - From here on the runner never reads or changes the workspace with its
+     own permissions, so a process the session left running that swaps a
+     file or folder for a link mid-copy gets nothing from the host.
+   - This happens even when generation failed, so a partial output can be
+     diagnosed. Then the run ends, unscored:
+     - as `invalid` if an isolation check failed
+     - as `incomplete` if generation failed (a crash, timeout, budget stop
+       or error result)
 5. Runs `pnpm build`, confined (see "The build"). A failed build, or one
    that wrote no `dist/index.html`, is a brief-completion failure: it's
    recorded, never fixed, and the run ends there.
+   - Any `dist/` the session left is deleted first, confined the same way.
+     The session's sandbox lets a process replace the workspace folder
+     itself with a link to a host folder, and a delete with the runner's
+     own permissions would follow it.
 6. Serves the build with the runner's own server
    (`evals/runner/src/serve.ts`), never the workspace's `vite preview`:
-   - `dist/` is copied into a runner-owned folder by a separate helper,
-     confined like the build: it can read only `dist/`, the Node install
-     and the OS runtime, and write only that folder. It opens each file
-     without following links and checks the type of what it opened. Links
-     and anything it refuses are recorded in the manifest and
-     `preview.log`, never followed. The runner never reads the workspace
-     with its own permissions, so a build process that swaps a file for a
-     link mid-copy gets nothing from the host.
+   - `dist/` is copied into a runner-owned folder by the confined helper
+     from step 4: it can read only `dist/`, the Node install and the OS
+     runtime, and write only that folder. Links and anything it refuses
+     are recorded in the manifest and `preview.log`, never followed. A
+     build process that swaps a file for a link mid-copy gets nothing from
+     the host.
    - The server reads only that copy.
    - The mock API is the runner's own, from `evals/fixtures/src`. The
      generator could have edited its workspace's Vite config and its copy
@@ -414,6 +429,10 @@ Each run:
      made inert. `token-lint.json` lists them under `ignoredDirectives`.
 10. Deletes the temp folder and writes `manifest.json`. This happens even
     when a step fails or the run is stopped.
+    - The session can't write the folder that holds the temp folder, only
+      folders inside it. A link swapped in for one of those is removed,
+      not followed, even mid-delete: on Node 24, `rmSync` walks the tree
+      by file descriptor, not by path.
 
 Statuses (the CLI exits non-zero for all but `complete`):
 - `complete`: every applicable step ran. The build or tests may still have
@@ -539,6 +558,40 @@ prompt on stdin. The CLI is `claude` on PATH, or `CLAUDE_CODE_BIN`.
     the run before the probe.
 - **Environment:** built from scratch. PATH holds only node, pnpm and
   system folders, so no inherited variable carries the repo path.
+- **Stopped when it ends:** when the CLI exits, after the probe or the
+  session, the time limit stops applying and everything the session
+  started is stopped, with a deadline of its own
+  (`evals/adapters/claude-code/leftovers.ts`):
+  - The CLI's process group is killed at once. The CLI has just been
+    reaped, and macOS hands out process IDs in order, so the group's
+    number still names its group.
+  - Claude Code runs each Bash command in a process group (and session) of
+    its own, so a background process outlives the CLI. Nothing a process
+    says about itself, such as its HOME, proves it's the session's, so
+    ownership comes from the process tree, checked while the session runs.
+  - `CLAUDE_CODE_SHELL` points at a zsh wrapper in the session's private
+    state. It runs the real zsh as its child, and checks in before and
+    after: it sends its PID and the PID of a waiter it started, through a
+    pipe the runner opened before the session, and waits. The runner checks
+    in the process table that the shell descends from the CLI and that the
+    waiter is its child. Then it records every process in the shell's
+    process group as a witness, by PID and start time, and kills the waiter
+    to let the shell go on. The runner never writes to a path the session
+    could replace.
+  - The session's processes are the witnesses still alive (same PID, same
+    start time), every member of their process groups (a group's number
+    can't be handed out again while it has a member), and any child of
+    one of them. The adapter kills them with their groups, each round only
+    what that round's process table showed, and looks again until none is
+    left.
+  - A shell's group with no witness left alive can't be shown to be the
+    same group any more, so its members aren't killed. Neither are
+    candidates: processes whose environment sets the session's HOME
+    (`ps -E`, which shows no environment for Apple's own binaries) or that
+    work in the workspace or that HOME (lsof). Either is left running and
+    fails the check below. It could be the session's, or a diagnostic
+    someone started.
+  - Output isn't waited for past a few seconds after that.
 - **Auth:** the owner's subscription token from `claude setup-token`.
   - The runner reads `CLAUDE_CODE_OAUTH_TOKEN` from the shell that starts
     it and passes it only to the session.
@@ -578,6 +631,7 @@ the run `invalid`.
   - The workspace is outside the repo and the results.
   - Its path, the prompt, and every workspace file except the condition's
     guidance carry no leak words, owner copy or repo path.
+  - The copy of the generator's output refused nothing.
   - No file the generator wrote carries the canary's token.
 - **Init event,** for the probe and the session:
   - the exact model and the fixed tool list
@@ -597,6 +651,10 @@ the run `invalid`.
   - Every path a tool call read or wrote is inside the workspace. Refused
     attempts are listed, not failed.
   - The canary's token and forbidden paths appear in no tool result.
+- **Leftover processes,** for the probe and the session: nothing it
+  started is still running once it ends, and no process with its HOME or
+  in its folders is left that can't be shown to be its own. What was
+  stopped is listed.
 
 When Claude Code updates, the probe fails closed on anything new, such as a
 plugin, a skill or a system prompt line. Review it before adding it to an

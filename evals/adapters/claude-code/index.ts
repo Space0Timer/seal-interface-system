@@ -13,9 +13,13 @@
 // records the system prompt and first message the session sends, so they
 // can be checked for the repo path and for words about the eval.
 //
+// When either session's CLI exits, whatever the session left running is
+// stopped (see leftovers.ts), so nothing keeps changing the workspace once
+// generation has returned. Anything still running fails the isolation check.
+//
 // The claude-code-stub variant then runs the generation itself against the
-// stub too (it writes the conformance app), proving the whole pipeline with
-// the real CLI for free.
+// stub too (it writes the conformance app and leaves a process running),
+// proving the whole pipeline with the real CLI for free.
 import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -25,6 +29,7 @@ import { leakIn } from '../../starter/src/leaks.ts';
 import { onPath, toolchain } from '../../starter/src/toolchain.ts';
 import type { Adapter, GenerateOptions, GenerateResult, IsolationCheck, ReadProbe } from '../types.ts';
 import { buildInvocation, coverFor, redacted, sessionPaths, TOOLS, type Invocation, type InvocationInput } from './invocation.ts';
+import { stopLeftovers, watchShells, type Leftovers } from './leftovers.ts';
 import { startStubModel, type RecordedRequest, type ScriptTurn } from './stub-model.ts';
 import { checkInit, checkPaths, checkReceived, parseTranscript, sessionOutcome, type ToolResult, type Transcript } from './transcript.ts';
 
@@ -73,14 +78,24 @@ function readVersion(bin: string): string | undefined {
   }
 }
 
-interface SessionRun {
+export interface SessionRun {
   transcript: Transcript;
   exitCode: number | null;
   timedOut: boolean;
+  /** What the session left running when the CLI exited, and what else was working in its folders. */
+  leftovers: Leftovers;
 }
 
-/** Runs one session, streaming its transcript and stderr into the log folder. */
-function runSession(
+/**
+ * Runs one session, streaming its transcript and stderr into the log
+ * folder. While it runs, every shell it starts checks in, and the processes
+ * in the shell's group are recorded. When the CLI exits, the time limit stops applying and
+ * whatever the session left running is stopped, with a deadline of its
+ * own: the CLI's process group is killed, and so is every process shown to
+ * be the session's (see leftovers.ts). Output still pending a few seconds
+ * after that is cut off.
+ */
+export function runSession(
   bin: string,
   invocation: Invocation,
   workspace: string,
@@ -89,41 +104,121 @@ function runSession(
   timeoutMs: number,
   signal?: AbortSignal,
 ): Promise<SessionRun> {
+  const home = invocation.env['HOME'];
+  const shell = invocation.env['CLAUDE_CODE_SHELL'];
+  if (!home || !shell) throw new Error('the session needs a HOME and a shell of its own, which is how what it leaves running is found');
   return new Promise((resolvePromise, reject) => {
+    // Check-ins arrive only once the CLI has started a shell, by which time child is set. If one can't be handled,
+    // what that shell leaves can't be told apart, so the session is ended the usual way and the run fails with it.
+    let failure: Error | undefined;
+    const shells = watchShells(
+      shell,
+      () => child.pid,
+      (error) => {
+        failure ??= new Error(`could not check a shell in: ${error.message}`);
+        kill();
+      },
+    );
     const child = spawn(bin, invocation.args, { cwd: workspace, env: invocation.env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let exitCode: number | null = null;
+    let closed = false;
+    let leftovers: Leftovers | undefined;
+    let finished = false;
     child.stdout?.on('data', (chunk: Buffer) => {
       stdout += chunk.toString();
       writeFileSync(files.transcript, stdout);
     });
     child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
-    const kill = () => {
+    const killGroup = (signalName: NodeJS.Signals) => {
       try {
-        if (child.pid) process.kill(-child.pid, 'SIGTERM');
+        if (child.pid) process.kill(-child.pid, signalName);
       } catch {
-        child.kill('SIGTERM');
+        if (signalName === 'SIGTERM') child.kill('SIGTERM');
       }
     };
+    const kill = () => killGroup('SIGTERM');
     const timer = setTimeout(() => {
       timedOut = true;
       kill();
     }, timeoutMs);
     signal?.addEventListener('abort', kill, { once: true });
-    child.once('error', (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.once('close', (code) => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', kill);
+    const finish = () => {
+      if (finished || !leftovers) return;
+      finished = true;
+      shells.close();
       writeFileSync(files.transcript, stdout);
       writeFileSync(files.stderr, stderr);
-      resolvePromise({ transcript: parseTranscript(stdout), exitCode: code, timedOut });
+      if (failure) reject(failure);
+      else resolvePromise({ transcript: parseTranscript(stdout), exitCode, timedOut, leftovers });
+    };
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', kill);
+      shells.close();
+      reject(error);
+    });
+    child.once('exit', (code) => {
+      exitCode = code;
+      // The session is over, so it can no longer time out, and stopping it isn't interrupted.
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', kill);
+      // The CLI has just been reaped, and process IDs are handed out in order, so its group's number still names
+      // its group. What's in it is killed at once, and given a moment to go before the rest is looked for.
+      killGroup('SIGKILL');
+      const deadline = Date.now() + 30_000;
+      groupGone(child.pid, Date.now() + 2_000)
+        .then(() => stopLeftovers({ home, folders: [workspace, home], shells }, { deadline }))
+        .then(
+          (result) => {
+            leftovers = result;
+            if (closed) return finish();
+            setTimeout(() => {
+              child.stdout?.destroy();
+              child.stderr?.destroy();
+              finish();
+            }, 5_000).unref();
+          },
+          (error: unknown) => {
+            shells.close();
+            reject(failure ?? new Error(`could not stop what the session left running: ${error instanceof Error ? error.message : String(error)}`));
+          },
+        );
+    });
+    child.once('close', () => {
+      closed = true;
+      finish();
     });
     child.stdin?.end(prompt);
   });
+}
+
+/** Resolves once no process is left in the group, or at the deadline. */
+async function groupGone(group: number | undefined, deadline: number): Promise<void> {
+  while (group && Date.now() < deadline) {
+    try {
+      process.kill(-group, 0);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+/** Nothing the session started is still running, and nothing that may be its own is left unexplained. */
+export function checkStopped(id: string, { stopped, remaining, unverified }: Leftovers): IsolationCheck {
+  const problems = [
+    ...(remaining.length ? [`still running after the session ended: ${remaining.join('; ')}`] : []),
+    ...(unverified.length ? [`with the session's HOME or in its folders, but not shown to be the session's, so left running: ${unverified.join('; ')}`] : []),
+  ];
+  if (problems.length) return { id, ok: false, detail: problems.join('. ') };
+  return {
+    id,
+    ok: true,
+    detail: stopped.length ? `stopped what the session left running: ${stopped.join('; ')}` : 'the session left nothing running',
+  };
 }
 
 /** What a session sent in its first request: the system prompt and every message, as text. */
@@ -368,7 +463,13 @@ export function judgeProbe(transcript: Transcript, steps: ProbeStep[]): Isolatio
   });
 }
 
-/** The stub generation: writes the conformance app and builds it, like a generator would. */
+/**
+ * A background process the stub generation leaves running, as a generator
+ * could leave a dev server. The session must stop it when it ends.
+ */
+export const STUB_LEFTOVER = "node -e 'setInterval(() => {}, 1000)'";
+
+/** The stub generation: writes the conformance app, builds it and leaves a process running, like a generator could. */
 function stubGenerationScript(workspace: string, skill?: GenerateOptions['skill']): ScriptTurn[] {
   const app = join(REPO, 'evals', 'tests', 'conformance-app');
   const tokens = skill && existsSync(join(workspace, skill.dir, 'tokens.resolver.json')) ? "import './src/design-tokens.css';\n" : '';
@@ -377,6 +478,7 @@ function stubGenerationScript(workspace: string, skill?: GenerateOptions['skill'
     { tool: 'Write', input: { file_path: join(workspace, 'index.html'), content: readFileSync(join(app, 'index.html'), 'utf8') } },
     { tool: 'Write', input: { file_path: join(workspace, 'main.ts'), content: tokens + readFileSync(join(app, 'main.ts'), 'utf8') } },
     { tool: 'Bash', input: { command: 'pnpm build', description: 'Build the app' } },
+    { tool: 'Bash', input: { command: `${STUB_LEFTOVER} > /dev/null 2>&1 &`, description: 'Start a background process' } },
     { text: 'The screen is built.' },
   ];
 }
@@ -481,6 +583,7 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
         ...checkInit(probeRun.transcript.init, expectedInit(model)).map((c) => ({ ...c, id: c.id.replace('claude-code.', 'claude-code.probe-') })),
         ...judgeProbe(probeRun.transcript, probe),
         ...checkFirstRequest(first, prompt, opts.forbiddenPaths),
+        checkStopped('claude-code.probe-stopped', probeRun.leftovers),
       );
       if (opts.skill) {
         const skillBody = readFileSync(join(workspace, opts.skill.dir, 'SKILL.md'), 'utf8').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
@@ -517,6 +620,7 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
         ...checkInit(transcript.init, expectedInit(model)),
         checkPaths(transcript, workspace, sessionPaths(sessionState).home),
         ...checkReceived(transcript, opts.canary.token, opts.forbiddenPaths),
+        checkStopped('claude-code.session-stopped', run.leftovers),
       );
       const outcome = sessionOutcome(transcript, run.exitCode, run.timedOut);
       const result = transcript.result;
