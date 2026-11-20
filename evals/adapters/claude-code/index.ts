@@ -108,8 +108,17 @@ export function runSession(
   const shell = invocation.env['CLAUDE_CODE_SHELL'];
   if (!home || !shell) throw new Error('the session needs a HOME and a shell of its own, which is how what it leaves running is found');
   return new Promise((resolvePromise, reject) => {
-    // Check-ins arrive only once the CLI has started a shell, by which time child is set.
-    const shells = watchShells(shell, () => child.pid);
+    // Check-ins arrive only once the CLI has started a shell, by which time child is set. If one can't be handled,
+    // what that shell leaves can't be told apart, so the session is ended the usual way and the run fails with it.
+    let failure: Error | undefined;
+    const shells = watchShells(
+      shell,
+      () => child.pid,
+      (error) => {
+        failure ??= new Error(`could not check a shell in: ${error.message}`);
+        kill();
+      },
+    );
     const child = spawn(bin, invocation.args, { cwd: workspace, env: invocation.env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     let stdout = '';
     let stderr = '';
@@ -142,7 +151,8 @@ export function runSession(
       shells.close();
       writeFileSync(files.transcript, stdout);
       writeFileSync(files.stderr, stderr);
-      resolvePromise({ transcript: parseTranscript(stdout), exitCode, timedOut, leftovers });
+      if (failure) reject(failure);
+      else resolvePromise({ transcript: parseTranscript(stdout), exitCode, timedOut, leftovers });
     };
     child.once('error', (error) => {
       clearTimeout(timer);
@@ -173,7 +183,7 @@ export function runSession(
           },
           (error: unknown) => {
             shells.close();
-            reject(new Error(`could not stop what the session left running: ${error instanceof Error ? error.message : String(error)}`));
+            reject(failure ?? new Error(`could not stop what the session left running: ${error instanceof Error ? error.message : String(error)}`));
           },
         );
     });

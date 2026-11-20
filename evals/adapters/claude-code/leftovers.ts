@@ -107,9 +107,11 @@ export interface Shells {
  * and listens for check-ins. They're only taken from a shell the process
  * table shows descends from the CLI, whose PID cli returns once it has
  * started, so a check-in someone else wrote records nothing and lets
- * nothing go on.
+ * nothing go on. If a check-in can't be handled, for example because ps
+ * failed, fail is called once and later check-ins are ignored: what that
+ * shell leaves could no longer be told apart.
  */
-export function watchShells(shell: string, cli: () => number | undefined): Shells {
+export function watchShells(shell: string, cli: () => number | undefined, fail: (error: Error) => void): Shells {
   const dir = dirname(shell);
   mkdirSync(dirname(dir), { recursive: true });
   mkdirSync(dir);
@@ -124,26 +126,36 @@ export function watchShells(shell: string, cli: () => number | undefined): Shell
   const witnesses: Witnesses = new Map();
   const groups = new Set<number>();
   let pending = '';
+  let failed = false;
+  const checkIn = (line: string) => {
+    const match = /^(\d+) (\d+)$/.exec(line);
+    const cliPid = cli();
+    if (!match || !cliPid) return;
+    const table = processTable();
+    const shellProc = table.get(Number(match[1]));
+    const waiter = table.get(Number(match[2]));
+    let current = shellProc?.pid ?? 0;
+    for (let depth = 0; depth < 10 && current > 1 && current !== cliPid; depth++) current = table.get(current)?.ppid ?? 0;
+    if (!shellProc || !waiter || current !== cliPid || waiter.ppid !== shellProc.pid) return;
+    groups.add(shellProc.pgid);
+    for (const p of table.values()) if (p.pgid === shellProc.pgid) witnesses.set(p.pid, p.start);
+    try {
+      process.kill(waiter.pid, 'SIGTERM');
+    } catch {
+      // It's gone already, and the shell has gone on.
+    }
+  };
   pipe.on('data', (chunk: Buffer) => {
     pending += chunk.toString();
     const lines = pending.split('\n');
     pending = lines.pop() ?? '';
     for (const line of lines) {
-      const match = /^(\d+) (\d+)$/.exec(line);
-      const cliPid = cli();
-      if (!match || !cliPid) continue;
-      const table = processTable();
-      const shellProc = table.get(Number(match[1]));
-      const waiter = table.get(Number(match[2]));
-      let current = shellProc?.pid ?? 0;
-      for (let depth = 0; depth < 10 && current > 1 && current !== cliPid; depth++) current = table.get(current)?.ppid ?? 0;
-      if (!shellProc || !waiter || current !== cliPid || waiter.ppid !== shellProc.pid) continue;
-      groups.add(shellProc.pgid);
-      for (const p of table.values()) if (p.pgid === shellProc.pgid) witnesses.set(p.pid, p.start);
+      if (failed) return;
       try {
-        process.kill(waiter.pid, 'SIGTERM');
-      } catch {
-        // It's gone already, and the shell has gone on.
+        checkIn(line);
+      } catch (error) {
+        failed = true;
+        fail(error instanceof Error ? error : new Error(String(error)));
       }
     }
   });

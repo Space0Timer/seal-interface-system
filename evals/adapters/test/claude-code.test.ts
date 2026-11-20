@@ -459,9 +459,58 @@ test('the shell wrapper is set up only in a folder of its own, never through one
     mkdirSync(join(dir, 'host'));
     mkdirSync(join(dir, 'state'));
     symlinkSync(join(dir, 'host'), join(dir, 'state', 'shell'));
-    assert.throws(() => watchShells(join(dir, 'state', 'shell', 'zsh'), () => undefined), /EEXIST/);
+    assert.throws(() => watchShells(join(dir, 'state', 'shell', 'zsh'), () => undefined, () => undefined), /EEXIST/);
     assert.deepEqual(readdirSync(join(dir, 'host')), [], 'nothing is written through the link');
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a shell that can\'t be checked in ends the session the usual way: the CLI is stopped and the session fails', { skip: process.platform === 'darwin' ? false : 'checks shells in with macOS ps' }, async () => {
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'session-'));
+  mkdirSync(join(dir, 'home'));
+  mkdirSync(join(dir, 'bin'));
+  // A ps that fails, as one that timed out would.
+  writeFileSync(join(dir, 'bin', 'ps'), '#!/bin/sh\necho "ps: failed" >&2\nexit 1\n', { mode: 0o755 });
+  writeFileSync(join(dir, 'start.cjs'), `const [pidFile, command, ...args] = process.argv.slice(2);
+const c = require('node:child_process').spawn(command, args, { detached: true, stdio: 'ignore' });
+require('node:fs').writeFileSync(pidFile, String(c.pid));`);
+  const pid = (file: string) => Number(readFileSync(join(dir, file), 'utf8').trim());
+  const alive = (p: number) => {
+    try {
+      process.kill(p, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // A stand-in for the CLI that starts a shell the way Claude Code does, then would go on for a while.
+  const script = ['echo $$ > cli.pid', `node start.cjs shell.pid "$CLAUDE_CODE_SHELL" -c true`, 'sleep 30'].join('\n');
+  const path = process.env['PATH'];
+  process.env['PATH'] = `${join(dir, 'bin')}:${path}`;
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      runSession(
+        '/bin/sh',
+        { args: ['-c', script], env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: join(dir, 'home'), CLAUDE_CODE_SHELL: join(dir, 'state', 'shell', 'zsh') }, settings: {} },
+        dir,
+        '',
+        { transcript: join(dir, 'transcript.jsonl'), stderr: join(dir, 'stderr.log') },
+        60_000,
+      ),
+      /could not check a shell in: Command failed: ps/,
+    );
+    assert.ok(Date.now() - started < 10_000, `failed after ${Date.now() - started} ms`);
+    assert.equal(alive(pid('cli.pid')), false, 'the CLI was stopped');
+  } finally {
+    process.env['PATH'] = path;
+    try {
+      // The shell itself, in a process group of its own, still waiting to check in.
+      process.kill(-pid('shell.pid'), 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
     rmSync(dir, { recursive: true, force: true });
   }
 });
