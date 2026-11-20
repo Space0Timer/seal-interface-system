@@ -17,6 +17,8 @@ export function onPath(name: string): string | undefined {
 }
 
 export interface Toolchain {
+  /** The Node install this process runs on. Real path. */
+  nodeRoot: string;
   /** PATH entries for node and pnpm. */
   binDirs: string[];
   /** Folders a sandbox must keep readable: the Node and pnpm installs and corepack's cache. Real paths. */
@@ -33,6 +35,7 @@ export function toolchain(): Toolchain {
   const corepackHome = process.env['COREPACK_HOME'] ?? join(homedir(), '.cache', 'node', 'corepack');
   const corepack = existsSync(corepackHome) ? realpathSync(corepackHome) : undefined;
   return {
+    nodeRoot,
     binDirs: [...new Set([dirname(process.execPath), ...(pnpmBin ? [dirname(pnpmBin)] : [])])],
     roots: [...new Set([nodeRoot, ...(pnpmRoot ? [pnpmRoot] : []), ...(corepack ? [corepack] : [])])],
     env: corepack ? { COREPACK_HOME: corepack, COREPACK_ENABLE_NETWORK: '0', COREPACK_ENABLE_DOWNLOAD_PROMPT: '0' } : {},

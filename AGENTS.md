@@ -371,9 +371,15 @@ Each run:
    recorded, never fixed, and the run ends there.
 6. Serves the build with the runner's own server
    (`evals/runner/src/serve.ts`), never the workspace's `vite preview`:
-   - It copies `dist/`, regular files only, into a runner-owned folder
-     and serves the copy. Links are recorded in the manifest and
-     `preview.log`, never followed.
+   - `dist/` is copied into a runner-owned folder by a separate helper,
+     confined like the build: it can read only `dist/`, the Node install
+     and the OS runtime, and write only that folder. It opens each file
+     without following links and checks the type of what it opened. Links
+     and anything it refuses are recorded in the manifest and
+     `preview.log`, never followed. The runner never reads the workspace
+     with its own permissions, so a build process that swaps a file for a
+     link mid-copy gets nothing from the host.
+   - The server reads only that copy.
    - The mock API is the runner's own, from `evals/fixtures/src`. The
      generator could have edited its workspace's Vite config and its copy
      of the mock API, so every condition is judged against the same API
@@ -417,6 +423,8 @@ generation sandbox. `evals/runner/src/confine.ts` confines it:
     out of reach.
   - writes only to the workspace and its build state
   - no network beyond localhost, no other process's details, no keychain
+- When `pnpm build` exits, anything it left running in its process group
+  is killed, and its output isn't waited for past a few seconds.
 - Elsewhere only the environment is confined, so a live adapter refuses
   to run there.
 - The manifest records the environment, everything readable and the

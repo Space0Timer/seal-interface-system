@@ -22,7 +22,7 @@ import type { Preview } from '../../starter/src/preview.ts';
 import { toolchain } from '../../starter/src/toolchain.ts';
 import { checkOutside, checkPrompt, checkWorkspacePath, scanWorkspace } from './checks.ts';
 import { conditionNamed } from './conditions.ts';
-import { confine, sandboxAvailable, type ConfinementRecord } from './confine.ts';
+import { confine, confineCopy, sandboxAvailable, type ConfinementRecord } from './confine.ts';
 import { copyFiles, diff, hashEntry, hashTree, sha256, snapshot, walk } from './files.ts';
 import { PROMPT_FILE, renderPrompt } from './prompt.ts';
 import { summarizeReport, type TestSummary } from './report.ts';
@@ -95,8 +95,15 @@ export interface Manifest {
   output: { dir: string; copied: string[]; added: string[]; changed: string[]; deleted: string[]; links: Array<{ path: string; target: string }> } | null;
   /** Brief completion: a failed build, or one that wrote no dist/index.html, is recorded, never fixed. */
   build: { ok: boolean; exitCode: number | null; log: string; error?: string } | null;
-  /** The runner's own server for the build: a copy of dist/ (links left out) and the canonical mock API. */
-  preview: { url: string; log: string; files: number; links: Array<{ path: string; target: string }> } | null;
+  /** The runner's own server for the build: a confined copy of dist/ (links left out) and the canonical mock API. */
+  preview: {
+    url: string;
+    log: string;
+    copiedIn: ConfinementRecord['sandbox'];
+    files: number;
+    links: Array<{ path: string; target: string }>;
+    refused: Array<{ path: string; reason: string }>;
+  } | null;
   tests: (TestSummary & { report: string; log: string; touchTargets: string[] }) | null;
   screenshots: { expected: string[]; saved: string[]; missing: Array<{ file: string; reason: string }>; report: string } | null;
   tokenLint: { status: 'not-applicable' | 'not-built-yet' };
@@ -132,8 +139,13 @@ function repoRoots(): string[] {
   return [...new Set(roots)];
 }
 
-/** Runs a command to completion, capturing its output in a log file. Aborts with the run. */
-function runLogged(
+/**
+ * Runs a command to completion, capturing its output in a log file. Aborts
+ * with the run. When the command exits, whatever it left running in its
+ * process group is killed, so nothing from a build keeps changing the
+ * workspace; output still pending after a few seconds is cut off.
+ */
+export function runLogged(
   command: string,
   args: string[],
   { cwd, env, logFile, signal }: { cwd: string; env?: NodeJS.ProcessEnv; logFile: string; signal?: AbortSignal | undefined },
@@ -141,22 +153,37 @@ function runLogged(
   return new Promise((resolvePromise, reject) => {
     const child = spawn(command, args, { cwd, env: env ?? process.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     let output = '';
+    let exitCode: number | null = null;
+    let finished = false;
     child.stdout?.on('data', (chunk: Buffer) => (output += chunk.toString()));
     child.stderr?.on('data', (chunk: Buffer) => (output += chunk.toString()));
-    const kill = () => {
+    const killGroup = (signalName: NodeJS.Signals) => {
       try {
-        if (child.pid) process.kill(-child.pid, 'SIGTERM');
+        if (child.pid) process.kill(-child.pid, signalName);
       } catch {
-        child.kill('SIGTERM');
+        if (signalName === 'SIGTERM') child.kill('SIGTERM');
       }
+    };
+    const kill = () => killGroup('SIGTERM');
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      signal?.removeEventListener('abort', kill);
+      writeFileSync(logFile, output);
+      resolvePromise(exitCode);
     };
     signal?.addEventListener('abort', kill, { once: true });
     child.once('error', reject);
-    child.once('close', (code) => {
-      signal?.removeEventListener('abort', kill);
-      writeFileSync(logFile, output);
-      resolvePromise(code);
+    child.once('exit', (code) => {
+      exitCode = code;
+      killGroup('SIGKILL');
+      setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish();
+      }, 5_000).unref();
     });
+    child.once('close', finish);
   });
 }
 
@@ -340,15 +367,17 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     const [buildCommand, buildArgs] = confinement.wrap('pnpm', ['build']);
     const buildCode = await step('build', () => runLogged(buildCommand, buildArgs, { cwd: workspace, env: confinement.env, logFile: buildLog, signal }));
     manifest.build = { ok: buildCode === 0, exitCode: buildCode, log: 'build.log' };
+    // The build's output leaves the workspace only through the confined copy, never with the runner's own permissions.
     const servedDir = join(scratch, 'serve');
-    const built = manifest.build.ok ? copyBuild(join(workspace, 'dist'), servedDir) : undefined;
-    if (built && 'missing' in built) manifest.build = { ...manifest.build, ok: false, error: built.missing };
+    const copier = confineCopy({ from: join(workspace, 'dist'), to: servedDir, nodeRoot: toolchain().nodeRoot, forbidden: forbiddenPaths });
+    const built = manifest.build.ok ? await step('copy-build', () => copyBuild(join(workspace, 'dist'), servedDir, copier)) : undefined;
+    if (built?.missing) manifest.build = { ...manifest.build, ok: false, error: built.missing };
 
-    if (built && !('missing' in built)) {
+    if (built && !built.missing) {
       // 5. Serve the build: the runner's own server and mock API, never the workspace's.
       const preview = await step('serve', () => serveBuild(servedDir, built));
       server = preview;
-      manifest.preview = { url: preview.url, log: 'preview.log', files: built.copied.length, links: built.links };
+      manifest.preview = { url: preview.url, log: 'preview.log', copiedIn: copier.sandbox, files: built.copied.length, links: built.links, refused: built.refused };
       const serverAlive = (when: string) => {
         if (preview.gone()) throw new Error(`the build's server stopped ${when}:\n${preview.output()}`);
       };

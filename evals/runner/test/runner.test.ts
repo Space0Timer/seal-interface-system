@@ -17,7 +17,7 @@ import { leakIn } from '../../starter/src/leaks.ts';
 import { REPO } from '../../starter/src/materialize.ts';
 import { sandboxAvailable } from '../src/confine.ts';
 import { renderPrompt } from '../src/prompt.ts';
-import { runEval, type Manifest } from '../src/run.ts';
+import { runEval, runLogged, type Manifest } from '../src/run.ts';
 
 const temps: string[] = [];
 const resultsRoot = () => {
@@ -62,6 +62,28 @@ test('inputs are checked before anything is created', async () => {
   assert.deepEqual(readdirSync(root), []);
 });
 
+test('a command that exits is followed by whatever it left running: killed, not waited for', async () => {
+  const dir = resultsRoot();
+  const started = Date.now();
+  // The background sleep keeps the output pipe open, as a build's leftover process could.
+  const code = await runLogged('/bin/sh', ['-c', 'sleep 60 & echo $!'], { cwd: dir, logFile: join(dir, 'out.log') });
+  assert.equal(code, 0);
+  assert.ok(Date.now() - started < 4_000, `resolved after ${Date.now() - started} ms`);
+  const pid = Number(readFileSync(join(dir, 'out.log'), 'utf8').trim());
+  assert.ok(pid > 0);
+  // Killed at once; give the system a moment to reap it.
+  const alive = () => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for (let i = 0; i < 20 && alive(); i++) await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(alive(), false, 'the background process is gone');
+});
+
 test('a full fake run: isolated, built, tested in every project, screenshotted, recorded, cleaned up', async () => {
   const root = resultsRoot();
   const m = await runEval({ brief: 'asset-library', condition: 'plain', adapter: fakeAdapter(), resultsRoot: root, log: quiet });
@@ -81,6 +103,8 @@ test('a full fake run: isolated, built, tested in every project, screenshotted, 
 
   assert.equal(m.build?.ok, true);
   assert.equal(m.confinement?.sandbox, sandboxAvailable() ? 'sandbox-exec' : 'none');
+  assert.equal(m.preview?.copiedIn, sandboxAvailable() ? 'sandbox-exec' : 'none', 'dist/ left the workspace only through the confined copy');
+  assert.deepEqual([m.preview?.links, m.preview?.refused], [[], []]);
   assert.match(m.preview?.url ?? '', /^http:\/\/(localhost|127\.0\.0\.1):\d+$/);
   assert.equal(m.tests?.ran, true);
   assert.deepEqual(m.tests?.failures, []);

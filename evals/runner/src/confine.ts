@@ -14,9 +14,14 @@
 // (in the home folder, on a mounted volume, in a shared folder) nor copy
 // them into the build log the run keeps.
 //
+// The build's output is copied out of the workspace by a helper confined
+// the same way, which can read only dist/, the Node install and the OS
+// runtime, and write only the folder the runner serves (see serve.ts). So a
+// build process left running can't swap a host file into what's served.
+//
 // Elsewhere only the environment is confined, so live runs refuse to start
-// there (see runEval). The build's output is served by the runner itself
-// (see serve.ts), so no other generated code runs outside the browser.
+// there (see runEval). The runner serves the copy itself, so no other
+// generated code runs outside the browser.
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { confinedPath, type Toolchain } from '../../starter/src/toolchain.ts';
@@ -47,11 +52,25 @@ export interface ConfinementRecord {
   profile?: string | undefined;
 }
 
-export interface Confinement {
+/** How to launch a confined process: its whole environment, and the command line that runs `command args` confined. */
+export interface Launch {
   env: Record<string, string>;
-  /** The command line that runs `command args` confined. */
   wrap(command: string, args: string[]): [string, string[]];
+}
+
+export interface Confinement extends Launch {
   record: ConfinementRecord;
+}
+
+/** What a sandbox may touch, besides the OS runtime it always reads. Real paths. */
+export interface SandboxPolicy {
+  /** Readable installs, such as Node's. */
+  tools: string[];
+  /** Readable data, readable even inside a forbidden path. */
+  data: string[];
+  write: string[];
+  /** Never readable, even inside a tool. */
+  forbidden: string[];
 }
 
 export function sandboxAvailable(platform: NodeJS.Platform = process.platform): boolean {
@@ -78,32 +97,43 @@ export function confinedEnv({ stateDir, toolchain }: ConfineInput): Record<strin
   };
 }
 
+const buildPolicy = ({ workspace, stateDir, toolchain, forbidden }: ConfineInput): SandboxPolicy => ({
+  tools: toolchain.roots,
+  data: [workspace, stateDir],
+  write: [workspace, stateDir],
+  forbidden,
+});
+
+/** Every folder a sandbox with this policy may read. */
+export function readableUnder({ tools, data }: SandboxPolicy): string[] {
+  return [...new Set([...SYSTEM_READ, ...tools, ...data])];
+}
+
 /** Every folder the build may read. */
-export function readable({ workspace, stateDir, toolchain }: ConfineInput): string[] {
-  return [...new Set([...SYSTEM_READ, ...toolchain.roots, workspace, stateDir])];
+export function readable(input: ConfineInput): string[] {
+  return readableUnder(buildPolicy(input));
 }
 
 const q = (path: string) => JSON.stringify(path);
 const subpaths = (paths: string[]) => paths.map((p) => `(subpath ${q(p)})`).join(' ');
 
-export function seatbeltProfile(input: ConfineInput): string {
-  const own = [input.workspace, input.stateDir];
-  const forbidden = [...new Set(input.forbidden)];
+export function sandboxProfile(policy: SandboxPolicy): string {
+  const forbidden = [...new Set(policy.forbidden)];
   return [
     '(version 1)',
     '(allow default)',
     '; The last matching rule wins.',
-    '; Reads: nothing, except the OS runtime, the toolchain, the workspace and its own state.',
+    '; Reads: nothing, except the OS runtime, the tools and the data.',
     '(deny file-read*)',
     '; Metadata stays readable, since Node resolves real paths through the parent folders.',
     '(allow file-read-metadata)',
-    `(allow file-read* ${SYSTEM_READ_LITERAL.map((p) => `(literal ${q(p)})`).join(' ')} ${subpaths(readable(input))})`,
+    `(allow file-read* ${SYSTEM_READ_LITERAL.map((p) => `(literal ${q(p)})`).join(' ')} ${subpaths(readableUnder(policy))})`,
     ...(forbidden.length
-      ? ['; Never the repo checkouts, the results or ~/.claude, even inside an allowed folder.', `(deny file-read* ${subpaths(forbidden)})`, `(allow file-read* ${subpaths(own)})`]
+      ? ['; Never the repo checkouts, the results or ~/.claude, even inside an allowed folder.', `(deny file-read* ${subpaths(forbidden)})`, `(allow file-read* ${subpaths(policy.data)})`]
       : []),
-    '; Writes: only the workspace, its own state and the standard devices.',
+    '; Writes: only the writable folders and the standard devices.',
     '(deny file-write*)',
-    `(allow file-write* ${subpaths(own)} (regex #"^/dev/(null|zero|tty[^/]*|fd/[0-9]+|dtracehelper|stdout|stderr)$"))`,
+    `(allow file-write* ${subpaths(policy.write)} (regex #"^/dev/(null|zero|tty[^/]*|fd/[0-9]+|dtracehelper|stdout|stderr)$"))`,
     '; Network: localhost only. Name lookups go through mDNSResponder; every other Unix socket is closed.',
     '(deny network-outbound (remote unix-socket))',
     '(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))',
@@ -114,6 +144,10 @@ export function seatbeltProfile(input: ConfineInput): string {
     '(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd.xpc") (global-name "com.apple.security.agent"))',
     '',
   ].join('\n');
+}
+
+export function seatbeltProfile(input: ConfineInput): string {
+  return sandboxProfile(buildPolicy(input));
 }
 
 /** Sets up the private state and returns how to run a command confined. */
@@ -129,4 +163,25 @@ export function confine(input: ConfineInput, { sandbox = sandboxAvailable() }: {
     wrap: (command, args) => [SANDBOX_EXEC, ['-p', profile, command, ...args]],
     record: { sandbox: 'sandbox-exec', ...record, profile },
   };
+}
+
+export interface CopyInput {
+  /** The build output. Real path. */
+  from: string;
+  /** The folder the runner serves, which only the copy may write. Real path. */
+  to: string;
+  nodeRoot: string;
+  forbidden: string[];
+}
+
+/**
+ * How to run the copy of the build output: Node with no inherited
+ * environment, reading only the build output, the Node install and the OS
+ * runtime, and writing only the served folder.
+ */
+export function confineCopy(input: CopyInput, { sandbox = sandboxAvailable() }: { sandbox?: boolean } = {}): Launch & { sandbox: ConfinementRecord['sandbox'] } {
+  const env = { LANG: 'en_US.UTF-8' };
+  if (!sandbox) return { env, wrap: (command, args) => [command, args], sandbox: 'none' };
+  const profile = sandboxProfile({ tools: [input.nodeRoot], data: [input.from, input.to], write: [input.to], forbidden: input.forbidden });
+  return { env, wrap: (command, args) => [SANDBOX_EXEC, ['-p', profile, command, ...args]], sandbox: 'sandbox-exec' };
 }
