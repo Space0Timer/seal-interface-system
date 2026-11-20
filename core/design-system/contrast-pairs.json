@@ -25,7 +25,14 @@
           "color.surface.subtle"
         ],
         [
+          "color.surface.sidebar"
+        ],
+        [
           "color.surface.canvas",
+          "color.interaction.hover"
+        ],
+        [
+          "color.surface.sidebar",
           "color.interaction.hover"
         ],
         [
@@ -107,6 +114,9 @@
           "color.surface.canvas"
         ],
         [
+          "color.surface.sidebar"
+        ],
+        [
           "color.surface.raised"
         ],
         [
@@ -118,6 +128,7 @@
   ],
   "exempt": {
     "color.text.disabled": "Disabled controls are exempt from WCAG contrast minimums.",
-    "color.border.divider": "Dividers are optional and not needed to identify a control."
+    "color.border.divider": "Dividers are optional and not needed to identify a control.",
+    "color.surface.scrim": "A translucent layer behind a dialog, not a background for text or controls."
   }
 }
