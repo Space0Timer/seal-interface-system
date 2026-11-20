@@ -563,22 +563,26 @@ prompt on stdin. The CLI is `claude` on PATH, or `CLAUDE_CODE_BIN`.
   started is stopped, with a deadline of its own
   (`evals/adapters/claude-code/leftovers.ts`):
   - The CLI's process group is killed.
-  - Claude Code runs each Bash command in a process group of its own, so
-    a background process outlives the CLI. The adapter also kills every
-    process shown to be the session's, with its process group, and looks
-    again until none is left. A process is the session's if its
-    environment, not its arguments, sets the session's HOME, or if its
-    parent or process group is the session's. A process group never spans
-    sessions, and the CLI starts in a session of its own.
-  - `ps -E` shows no environment for Apple's own binaries, such as `sh`
-    and `sleep`, so one of those is the session's only through its parent
-    or group. A process working in the workspace or that HOME that can't
-    be shown to be the session's, such as a shell someone opened there,
-    is left running and fails the check below. lsof shows the working
-    folders.
-  - A process that drops that HOME, leaves the session's groups and leaves
-    those folders isn't found. The runner's confined copy and delete don't
-    rely on this.
+  - Claude Code runs each Bash command in a process group (and session) of
+    its own, so a background process outlives the CLI. Nothing a process
+    says about itself, such as its HOME, proves it's the session's, so
+    ownership comes from the process tree, checked while the session runs.
+    `CLAUDE_CODE_SHELL` points at a zsh wrapper in the session's private
+    state. Each shell registers its PID and waits. The runner checks in
+    the process table that it descends from the CLI, records its process
+    group, and only then lets it run.
+  - The session's processes are the CLI's group, the recorded groups, and
+    any child of one of the session's processes. A process group never
+    spans sessions, so nothing started elsewhere can join one. The adapter
+    kills them with their groups, and looks again until none is left.
+  - A recorded group counts only if its first process is still the shell
+    that registered, or if one of its members has the session's HOME
+    (`ps -E`, which shows no environment for Apple's own binaries) or
+    works in the workspace or that HOME (lsof). So a group number reused
+    by now isn't mistaken for it.
+  - A process with the session's HOME, or working in those folders, that
+    isn't shown to be the session's is left running and fails the check
+    below. It could be the session's, or a diagnostic someone started.
   - Output isn't waited for past a few seconds after that.
 - **Auth:** the owner's subscription token from `claude setup-token`.
   - The runner reads `CLAUDE_CODE_OAUTH_TOKEN` from the shell that starts
@@ -640,8 +644,9 @@ the run `invalid`.
     attempts are listed, not failed.
   - The canary's token and forbidden paths appear in no tool result.
 - **Leftover processes,** for the probe and the session: nothing it
-  started is still running once it ends, and nothing that can't be shown
-  to be its own is working in its folders. What was stopped is listed.
+  started is still running once it ends, and no process with its HOME or
+  in its folders is left that can't be shown to be its own. What was
+  stopped is listed.
 
 When Claude Code updates, the probe fails closed on anything new, such as a
 plugin, a skill or a system prompt line. Review it before adding it to an

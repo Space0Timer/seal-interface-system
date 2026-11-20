@@ -29,7 +29,7 @@ import { leakIn } from '../../starter/src/leaks.ts';
 import { onPath, toolchain } from '../../starter/src/toolchain.ts';
 import type { Adapter, GenerateOptions, GenerateResult, IsolationCheck, ReadProbe } from '../types.ts';
 import { buildInvocation, coverFor, redacted, sessionPaths, TOOLS, type Invocation, type InvocationInput } from './invocation.ts';
-import { stopLeftovers, type Leftovers } from './leftovers.ts';
+import { stopLeftovers, watchShells, type Leftovers } from './leftovers.ts';
 import { startStubModel, type RecordedRequest, type ScriptTurn } from './stub-model.ts';
 import { checkInit, checkPaths, checkReceived, parseTranscript, sessionOutcome, type ToolResult, type Transcript } from './transcript.ts';
 
@@ -88,11 +88,12 @@ export interface SessionRun {
 
 /**
  * Runs one session, streaming its transcript and stderr into the log
- * folder. When the CLI exits, the time limit stops applying and whatever
- * the session left running is stopped, with a deadline of its own: the
- * CLI's process group is killed, and so is every process shown to be the
- * session's (see leftovers.ts). Output still pending a few seconds after
- * that is cut off.
+ * folder. While it runs, every shell it starts is checked and its process
+ * group recorded. When the CLI exits, the time limit stops applying and
+ * whatever the session left running is stopped, with a deadline of its
+ * own: the CLI's process group is killed, and so is every process shown to
+ * be the session's (see leftovers.ts). Output still pending a few seconds
+ * after that is cut off.
  */
 export function runSession(
   bin: string,
@@ -104,9 +105,11 @@ export function runSession(
   signal?: AbortSignal,
 ): Promise<SessionRun> {
   const home = invocation.env['HOME'];
-  if (!home) throw new Error('the session needs a HOME of its own, which is how what it leaves running is found');
-  const folders = [workspace, home];
+  const shell = invocation.env['CLAUDE_CODE_SHELL'];
+  if (!home || !shell) throw new Error('the session needs a HOME and a shell of its own, which is how what it leaves running is found');
   return new Promise((resolvePromise, reject) => {
+    // Registrations arrive only once the CLI has started a shell, by which time child is set.
+    const shells = watchShells(shell, () => child.pid);
     const child = spawn(bin, invocation.args, { cwd: workspace, env: invocation.env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     let stdout = '';
     let stderr = '';
@@ -136,6 +139,7 @@ export function runSession(
     const finish = () => {
       if (finished || !leftovers) return;
       finished = true;
+      shells.close();
       writeFileSync(files.transcript, stdout);
       writeFileSync(files.stderr, stderr);
       resolvePromise({ transcript: parseTranscript(stdout), exitCode, timedOut, leftovers });
@@ -143,6 +147,7 @@ export function runSession(
     child.once('error', (error) => {
       clearTimeout(timer);
       signal?.removeEventListener('abort', kill);
+      shells.close();
       reject(error);
     });
     child.once('exit', (code) => {
@@ -151,8 +156,8 @@ export function runSession(
       clearTimeout(timer);
       signal?.removeEventListener('abort', kill);
       killGroup('SIGKILL');
-      // The CLI started in a session of its own, so its process group is the session's.
-      stopLeftovers(home, folders, { groups: child.pid ? [child.pid] : [], deadline: Date.now() + 30_000 }).then(
+      const session = { home, folders: [workspace, home], cliGroup: child.pid ?? -1, shells: shells.groups };
+      stopLeftovers(session, { deadline: Date.now() + 30_000 }).then(
         (result) => {
           leftovers = result;
           if (closed) return finish();
@@ -163,6 +168,7 @@ export function runSession(
           }, 5_000).unref();
         },
         (error: unknown) => {
+          shells.close();
           reject(new Error(`could not stop what the session left running: ${error instanceof Error ? error.message : String(error)}`));
         },
       );
@@ -175,11 +181,11 @@ export function runSession(
   });
 }
 
-/** Nothing the session started is still running, and nothing else is working in its folders. */
+/** Nothing the session started is still running, and nothing that may be its own is left unexplained. */
 export function checkStopped(id: string, { stopped, remaining, unverified }: Leftovers): IsolationCheck {
   const problems = [
     ...(remaining.length ? [`still running after the session ended: ${remaining.join('; ')}`] : []),
-    ...(unverified.length ? [`working in the workspace or the session's home, but not shown to be the session's, so left running: ${unverified.join('; ')}`] : []),
+    ...(unverified.length ? [`with the session's HOME or in its folders, but not shown to be the session's, so left running: ${unverified.join('; ')}`] : []),
   ];
   if (problems.length) return { id, ok: false, detail: problems.join('. ') };
   return {

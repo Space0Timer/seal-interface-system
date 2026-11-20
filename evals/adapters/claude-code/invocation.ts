@@ -27,6 +27,10 @@
 //   no skill the model can use.
 // - The environment is built from scratch: no inherited variable can carry
 //   the repo path into the session.
+// - Bash commands start through a zsh wrapper in the private state
+//   (CLAUDE_CODE_SHELL), which registers each shell with the runner before
+//   it runs, so the runner can tell which processes are the session's (see
+//   leftovers.ts).
 //
 // Some of these switches (CLAUDE_CODE_TMPDIR, CLAUDE_CODE_DISABLE_BUNDLED_SKILLS,
 // the built-in plugin names) aren't in the public docs. The probe session in
@@ -87,7 +91,7 @@ export interface Invocation {
 
 export function sessionPaths(stateDir: string) {
   const home = join(stateDir, 'home');
-  return { home, config: join(home, '.claude'), tmp: join(stateDir, 'tmp'), agentTmp: join(stateDir, 'agent-tmp') };
+  return { home, config: join(home, '.claude'), tmp: join(stateDir, 'tmp'), agentTmp: join(stateDir, 'agent-tmp'), shell: join(stateDir, 'shell', 'zsh') };
 }
 
 const inside = (path: string, dir: string) => path === dir || path.startsWith(`${dir}/`);
@@ -159,7 +163,7 @@ export function buildSettings(input: InvocationInput): Record<string, unknown> {
 }
 
 export function buildEnv(input: InvocationInput): Record<string, string> {
-  const { home, config, tmp, agentTmp } = sessionPaths(input.stateDir);
+  const { home, config, tmp, agentTmp, shell } = sessionPaths(input.stateDir);
   const path = [...new Set([...input.binDirs, '/usr/bin', '/bin', '/usr/sbin', '/sbin'])].join(':');
   const auth: Record<string, string> =
     'oauthToken' in input.auth
@@ -178,6 +182,8 @@ export function buildEnv(input: InvocationInput): Record<string, string> {
     ...auth,
     // Claude Code's own scratch files go to the private state, not the shared temp folder.
     CLAUDE_CODE_TMPDIR: agentTmp,
+    // Bash commands start through the wrapper that registers them (see leftovers.ts).
+    CLAUDE_CODE_SHELL: shell,
     CLAUDE_CODE_DISABLE_BUNDLED_SKILLS: '1',
     CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1',
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',

@@ -100,6 +100,7 @@ test('the session environment is built from scratch: fresh home, no repo path, n
   const { env } = buildInvocation(input);
   assert.equal(env['HOME'], `${input.stateDir}/home`);
   assert.equal(env['CLAUDE_CONFIG_DIR'], `${input.stateDir}/home/.claude`);
+  assert.equal(env['CLAUDE_CODE_SHELL'], `${input.stateDir}/shell/zsh`, 'shells start through the wrapper that registers them');
   assert.equal(env['CLAUDE_CODE_OAUTH_TOKEN'], 'secret-token');
   assert.equal(env['ANTHROPIC_API_KEY'], undefined, 'an API key would override the subscription token');
   assert.equal(env['ANTHROPIC_BASE_URL'], undefined);
@@ -363,6 +364,7 @@ test('the stub model replays its script for the session and records what it was 
 test('when the CLI exits, what is shown to be the session\'s is stopped, and only that', { skip: process.platform === 'darwin' ? false : 'reads other processes with macOS ps and lsof' }, async () => {
   const dir = mkdtempSync(join(realpathSync(tmpdir()), 'session-'));
   const home = join(dir, 'home');
+  const shell = join(dir, 'state', 'shell', 'zsh');
   mkdirSync(home);
   const alive = (pid: number) => {
     try {
@@ -372,27 +374,32 @@ test('when the CLI exits, what is shown to be the session\'s is stopped, and onl
       return false;
     }
   };
-  // Starts a command in a new process group, as Claude Code runs each Bash command. With hold, it holds the CLI's
-  // output open.
-  const detached = ([command, ...args]: string[], pidFile: string, hold = false) =>
-    `node -e 'const c = require("node:child_process").spawn(${JSON.stringify(command)}, ${JSON.stringify(args)}, { detached: true, stdio: ["ignore", "${hold ? 'inherit' : 'ignore'}", "ignore"] }); console.error(c.pid); c.unref()' 2> ${pidFile}`;
-  // A process that starts an Apple binary in its own group, whose environment ps doesn't show, and keeps running.
-  const parent = `const c = require("node:child_process").spawn("sleep", ["61"], { stdio: "ignore" }); require("node:fs").writeFileSync(${JSON.stringify(join(dir, 'child.pid'))}, String(c.pid)); setInterval(() => {}, 1000)`;
-  const other = `HOME=${home}-other`;
+  // start.cjs starts a command in a session (and process group) of its own, as Claude Code starts each shell, and
+  // writes its PID. With "wait" it stays until the command exits, as the CLI does for a shell; with "hold" it leaves
+  // the command holding the CLI's output open.
+  writeFileSync(join(dir, 'start.cjs'), `const [pidFile, how, command, ...args] = process.argv.slice(2);
+const c = require('node:child_process').spawn(command, args, { detached: true, stdio: ['ignore', how === 'hold' ? 'inherit' : 'ignore', 'ignore'] });
+require('node:fs').writeFileSync(pidFile, String(c.pid));
+if (how !== 'wait') c.unref();`);
+  // leave.cjs starts an Apple binary, whose environment ps doesn't show, in its own process group, and keeps running.
+  writeFileSync(join(dir, 'leave.cjs'), `const c = require('node:child_process').spawn('sleep', ['61'], { stdio: 'ignore' });
+require('node:fs').writeFileSync('child.pid', String(c.pid));
+require('node:fs').writeFileSync('parent.pid', String(process.pid));
+setInterval(() => {}, 1000);`);
   // A stand-in for the CLI, which leaves processes running and exits:
   // - in-group: in the CLI's own process group
-  // - parent and child: in a group of their own, outside the session's folders. The parent has the session's HOME;
-  //   the child is an Apple binary.
-  // - outside: another HOME that only starts like the session's, outside the session's folders, holding the output
-  //   open. Not the session's, and not in its folders: left alone, and the output it holds is cut off.
-  // - inspecting: another HOME, but working in the workspace, like a shell someone opened there. It can't be shown
-  //   to be the session's, so it's reported and left running.
+  // - parent and child: left by a command run through the shell, in the shell's process group
+  // - diagnostic: started on its own, not through the shell, with the session's HOME, in the workspace. It isn't
+  //   shown to be the session's, though its PID is registered as if it were a shell: it's reported and left running.
+  // - outside: another HOME, outside the session's folders, holding the output open. Not the session's: left alone,
+  //   and the output it holds is cut off.
   const script = [
     'sleep 60 & echo $! > in-group.pid',
-    `${other} ${detached(['sleep', '62'], 'inspecting.pid')}`,
-    `cd / && ${detached([process.execPath, '-e', parent], `${dir}/parent.pid`)}`,
-    `${other} ${detached(['sleep', '63'], `${dir}/outside.pid`, true)}`,
-    `until [ -s ${dir}/child.pid ]; do sleep 0.1; done`,
+    `node start.cjs shell.pid wait "$CLAUDE_CODE_SHELL" -c 'node leave.cjs > /dev/null 2>&1 &'`,
+    'until [ -s child.pid ]; do sleep 0.1; done',
+    `node start.cjs diagnostic.pid - node -e 'setInterval(() => {}, 1000)'`,
+    `cat diagnostic.pid >> ${join(dir, 'state', 'shell', 'register')} && echo >> ${join(dir, 'state', 'shell', 'register')}`,
+    `cd / && HOME=${home}-other node ${join(dir, 'start.cjs')} ${join(dir, 'outside.pid')} hold sleep 63`,
   ].join('\n');
   const pid = (file: string) => Number(readFileSync(join(dir, file), 'utf8').trim());
   try {
@@ -400,7 +407,7 @@ test('when the CLI exits, what is shown to be the session\'s is stopped, and onl
     // A time limit the CLI itself stays well within, though the cleanup after it doesn't.
     const run = await runSession(
       '/bin/sh',
-      { args: ['-c', script], env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home }, settings: {} },
+      { args: ['-c', script], env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, CLAUDE_CODE_SHELL: shell }, settings: {} },
       dir,
       '',
       { transcript: join(dir, 'transcript.jsonl'), stderr: join(dir, 'stderr.log') },
@@ -411,17 +418,17 @@ test('when the CLI exits, what is shown to be the session\'s is stopped, and onl
     assert.equal(run.timedOut, false, 'the time limit stops applying when the CLI exits');
     assert.deepEqual(run.leftovers.remaining, []);
     for (const p of [pid('parent.pid'), pid('child.pid')]) assert.ok(run.leftovers.stopped.some((s) => s.startsWith(`${p} `)), `${p} in ${run.leftovers.stopped.join('; ')}`);
-    assert.deepEqual(run.leftovers.unverified, [`${pid('inspecting.pid')} sleep 62`]);
+    assert.deepEqual(run.leftovers.unverified, [`${pid('diagnostic.pid')} node -e setInterval(() => {}, 1000)`]);
     const gone = ['in-group.pid', 'parent.pid', 'child.pid'].map(pid);
     for (let i = 0; i < 20 && gone.some(alive); i++) await new Promise((resolve) => setTimeout(resolve, 100));
     assert.deepEqual(gone.filter(alive), [], 'nothing shown to be the session\'s is still running');
-    assert.equal(alive(pid('inspecting.pid')), true, 'a process that is not shown to be the session\'s is left running');
+    assert.equal(alive(pid('diagnostic.pid')), true, 'a process with the session\'s HOME, started elsewhere, is left running');
     assert.equal(alive(pid('outside.pid')), true, 'a process that is not the session\'s is left alone');
     const check = checkStopped('claude-code.session-stopped', run.leftovers);
-    assert.equal(check.ok, false, 'a process working in the workspace that may be the session\'s fails the check');
-    assert.match(check.detail, /not shown to be the session's, so left running: \d+ sleep 62/);
+    assert.equal(check.ok, false, 'a process that may be the session\'s, left running, fails the check');
+    assert.match(check.detail, /not shown to be the session's, so left running: \d+ node -e setInterval/);
   } finally {
-    for (const file of ['inspecting.pid', 'outside.pid']) {
+    for (const file of ['diagnostic.pid', 'outside.pid']) {
       try {
         process.kill(pid(file), 'SIGKILL');
       } catch {
