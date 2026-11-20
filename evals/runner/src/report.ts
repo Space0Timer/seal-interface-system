@@ -88,3 +88,14 @@ export function summarizeReport(path: string): TestSummary {
     failures: outcomes.filter((o) => o.status === 'unexpected'),
   };
 }
+
+export function requireReport(summary: TestSummary, stage: string, exitCode: number | null, projects: string[]): void {
+  if (!summary.ran) throw new Error(`${stage} did not write a Playwright report`);
+  if (summary.globalErrors.length) throw new Error(`${stage} could not run: ${summary.globalErrors.join('\n')}`);
+  if (projects.some((project) => !summary.outcomes.some((outcome) => outcome.project === project))) {
+    throw new Error(`${stage} report is missing project results`);
+  }
+  if (exitCode === null || (exitCode !== 0 && summary.failed === 0)) {
+    throw new Error(`${stage} exited without a reported assertion failure (exit ${exitCode})`);
+  }
+}

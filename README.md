@@ -33,8 +33,9 @@ Early and personal. What exists today:
   own Claude setup, and proves it on every run. A fake adapter runs the
   whole pipeline inside `pnpm check`.
 
-Not built yet: the eval rubric and the held-out workspace-members brief.
-[`AGENTS.md`](AGENTS.md) has the full plan.
+The [asset-library rubric](evals/rubric/asset-library.md) defines the
+reviewer's evidence and scoring. The held-out workspace-members brief is
+planned in [`AGENTS.md`](AGENTS.md).
 
 The React components and reference screens are kept in a separate private
 repo.

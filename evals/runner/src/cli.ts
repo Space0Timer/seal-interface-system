@@ -13,7 +13,8 @@ import { parseArgs } from 'node:util';
 import { claudeCodeAdapter } from '../../adapters/claude-code/index.ts';
 import { fakeAdapter } from '../../adapters/fake/index.ts';
 import type { Adapter } from '../../adapters/types.ts';
-import { runEval } from './run.ts';
+import { exportReview } from './review.ts';
+import { RESULTS, runEval } from './run.ts';
 
 const ADAPTERS: Record<string, () => Adapter> = {
   fake: () => fakeAdapter(),
@@ -35,8 +36,19 @@ const { values, positionals } = parseArgs({
     'timeout-minutes': { type: 'string' },
     project: { type: 'string', multiple: true },
     'results-dir': { type: 'string' },
+    out: { type: 'string' },
   },
 });
+
+if (positionals[0] === 'export-review') {
+  if (!values.out || positionals.length < 2) {
+    console.error('usage: cli.ts export-review --out <new-dir> [--results-dir <dir>] <run-id> ...');
+    process.exit(2);
+  }
+  const { packet, mapping } = exportReview(values['results-dir'] ?? RESULTS, values.out, positionals.slice(1));
+  console.log(`Reviewer packet: ${packet}\nPrivate alias mapping: ${mapping}`);
+  process.exit(0);
+}
 
 if (positionals[0] !== 'run' || !values.condition || !values.adapter) {
   console.error(usage);

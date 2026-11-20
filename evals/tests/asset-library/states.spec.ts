@@ -1,10 +1,12 @@
-import { expect, test } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { NO_RESULTS_QUERY } from '../../fixtures/src/data.ts';
+import { test } from '../browser.ts';
 import {
   checkAllAssetsReachable,
   checkBulkDelete,
   checkLargeLibrary,
   checkSearchFinds,
+  checkWholeLibrarySearch,
   DEFAULT_NAMES,
   libraryItem,
   openLibrary,
@@ -43,8 +45,12 @@ test('empty: no items, and uploading a file adds it', async ({ page }) => {
   await expect(libraryItem(page, upload?.filename ?? '')).toBeVisible();
 });
 
-test('search: finds matching assets beyond the first page, and only those', async ({ page }) => {
+test('search: finds exactly the matching invoices', async ({ page }) => {
   await checkSearchFinds(page);
+});
+
+test('search: finds a filename not fetched before the search in the large library', async ({ page }) => {
+  await checkWholeLibrarySearch(page);
 });
 
 test('no results: a search with no matches shows no items, and clearing it restores them', async ({ page }) => {

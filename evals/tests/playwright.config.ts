@@ -15,7 +15,10 @@ export default defineConfig({
   expect: { timeout: 10_000 },
   forbidOnly: !!process.env['CI'],
   reporter: [['list']],
-  use: { baseURL: external ?? `http://localhost:${port}` },
+  use: {
+    baseURL: external ?? `http://localhost:${port}`,
+    ...(process.env['EVAL_MOCK_ADMIN_TOKEN'] ? { serviceWorkers: 'block' } : {}),
+  },
   ...(external
     ? {}
     : {

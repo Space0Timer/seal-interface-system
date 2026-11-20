@@ -12,12 +12,14 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { Adapter, GenerateResult, IsolationCheck } from '../../adapters/types.ts';
 import { materialize, REPO } from '../../starter/src/materialize.ts';
-import { startPreview, type Preview } from '../../starter/src/preview.ts';
+import { BuildOutputError, buildSandbox, collectBundle } from './build.ts';
 import { checkOutside, checkPrompt, checkWorkspacePath, scanWorkspace } from './checks.ts';
 import { conditionNamed } from './conditions.ts';
 import { copyFiles, diff, hashEntry, hashTree, sha256, snapshot, walk } from './files.ts';
+import { startEvalPreview } from './preview.ts';
 import { PROMPT_FILE, renderPrompt } from './prompt.ts';
-import { summarizeReport, type TestSummary } from './report.ts';
+import { requireReport, summarizeReport, type TestSummary } from './report.ts';
+import { lintTokens, type TokenLint } from './token-lint.ts';
 
 export const RESULTS = join(REPO, 'evals', 'results');
 const TESTS = join(REPO, 'evals', 'tests');
@@ -66,10 +68,13 @@ export interface Manifest {
   adapter: string;
   model: string | null;
   effort: string | null;
+  projects: string[];
+  limits: { timeoutMs: number; maxBudgetUsd: number | null };
   startedAt: string;
   finishedAt?: string;
   versions: { node: string; pnpm: string; playwright: string | null; agent: string | null };
   hashes: { skill: string | null; starter: string | null; brief: string; prompt: string };
+  skillRevision: string | null;
   prompt: string;
   /** The temp workspace, deleted after the run. Recorded so its removal can be checked. */
   workspace: string | null;
@@ -78,11 +83,11 @@ export interface Manifest {
   generation: Omit<GenerateResult, 'isolation' | 'settings'> | null;
   output: { dir: string; copied: string[]; added: string[]; changed: string[]; deleted: string[]; links: Array<{ path: string; target: string }> } | null;
   /** Brief completion: a failed build is recorded, never fixed. */
-  build: { ok: boolean; exitCode: number | null; log: string } | null;
-  preview: { url: string; log: string } | null;
+  build: { ok: boolean; exitCode: number; log: string; outputError?: string } | null;
+  preview: { url: string } | null;
   tests: (TestSummary & { report: string; log: string; touchTargets: string[] }) | null;
   screenshots: { expected: string[]; saved: string[]; missing: Array<{ file: string; reason: string }>; report: string } | null;
-  tokenLint: { status: 'not-applicable' | 'not-built-yet' };
+  tokenLint: TokenLint;
   files: Array<{ path: string; bytes: number; sha256: string }>;
 }
 
@@ -146,7 +151,8 @@ function runLogged(
 export async function runEval(options: RunOptions): Promise<Manifest> {
   const { brief, adapter, model, effort, maxBudgetUsd, signal } = options;
   const log = options.log ?? ((line: string) => console.log(line));
-  const projects = options.projects ?? ALL_PROJECTS;
+  const projects = [...new Set(options.projects ?? ALL_PROJECTS)];
+  const timeoutMs = options.timeoutMs ?? 90 * 60_000;
 
   // Check every input before creating anything.
   const condition = conditionNamed(options.condition);
@@ -154,12 +160,17 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
   if (!states) throw new Error(`no screenshot states for brief "${brief}"`);
   const unknownProjects = projects.filter((p) => !ALL_PROJECTS.includes(p));
   if (unknownProjects.length) throw new Error(`unknown projects: ${unknownProjects.join(', ')}`);
+  if (!projects.length) throw new Error('select at least one project');
   if (effort && !EFFORTS.includes(effort)) throw new Error(`effort must be one of ${EFFORTS.join(', ')}`);
   if (adapter.live && !model) throw new Error(`the ${adapter.name} adapter calls a model: pass an exact model ID`);
   if (adapter.live && !(maxBudgetUsd && maxBudgetUsd > 0)) throw new Error(`the ${adapter.name} adapter calls a model: pass a spending cap`);
   const briefPath = join(REPO, 'evals', 'briefs', `${brief}.md`);
   if (!existsSync(briefPath)) throw new Error(`no brief named "${brief}"`);
   const prompt = renderPrompt(brief);
+  const skillHash = condition.skill ? hashTree(join(REPO, condition.skill.from)) : null;
+  if (condition.skill?.pin && skillHash !== condition.skill.pin.hash) {
+    throw new Error(`the ${condition.skill.name} skill differs from its pinned revision ${condition.skill.pin.revision}`);
+  }
   adapter.check?.();
 
   const resultsRoot = resolve(options.resultsRoot ?? RESULTS);
@@ -167,7 +178,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
   const runId = randomBytes(6).toString('hex');
   const out = join(resultsRoot, runId);
   mkdirSync(out);
-  // The run-ID → condition mapping lives apart from the run folders, so they can be handed out blinded.
+  // Private operator mapping. Reviewer packets use a separate whitelist export.
   appendFileSync(
     join(resultsRoot, 'mapping.jsonl'),
     `${JSON.stringify({ runId, brief, condition: condition.name, adapter: adapter.name, model: model ?? null, effort: effort ?? null, startedAt: new Date().toISOString() })}\n`,
@@ -182,14 +193,17 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     adapter: adapter.name,
     model: model ?? null,
     effort: effort ?? null,
+    projects,
+    limits: { timeoutMs, maxBudgetUsd: maxBudgetUsd ?? null },
     startedAt: new Date().toISOString(),
     versions: { node: process.version, pnpm: tool('pnpm', ['--version']), playwright: playwrightVersion(), agent: adapter.version() ?? null },
     hashes: {
-      skill: condition.skill ? hashTree(join(REPO, condition.skill.from)) : null,
+      skill: skillHash,
       starter: null,
       brief: hashEntry(briefPath),
       prompt: sha256(readFileSync(PROMPT_FILE)),
     },
+    skillRevision: condition.skill?.pin?.revision ?? null,
     prompt,
     workspace: null,
     timings: {},
@@ -200,7 +214,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     preview: null,
     tests: null,
     screenshots: null,
-    tokenLint: { status: condition.tokenLint ? 'not-built-yet' : 'not-applicable' },
+    tokenLint: { status: condition.tokenLint ? 'not-run' : 'not-applicable' },
     files: [],
   };
 
@@ -219,7 +233,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
   const scratch = mkdtempSync(join(realpathSync(tmpdir()), 'work-'));
   const workspace = join(scratch, 'app');
   manifest.workspace = workspace;
-  let server: Preview | undefined;
+  let server: Awaited<ReturnType<typeof startEvalPreview>> | undefined;
 
   try {
     const forbiddenPaths = [...repoRoots(), realpathSync(resultsRoot), join(homedir(), '.claude')];
@@ -228,6 +242,12 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     await step('materialize', () =>
       materialize({ out: workspace, brief, guidance: condition.skill && skillDir ? { from: condition.skill.from, to: skillDir } : undefined }),
     );
+    const sandbox = buildSandbox(workspace, join(scratch, 'build-state'));
+    const sandboxLog = join(out, 'build-sandbox.log');
+    const probe = await step('build-sandbox', () => runLogged(sandbox.command, sandbox.probe, {
+      cwd: workspace, env: sandbox.env, logFile: sandboxLog, signal,
+    }));
+    if (probe !== 0) throw new Error(`could not start the build sandbox: ${readFileSync(sandboxLog, 'utf8').trim()}`);
     manifest.hashes.starter = hashTree(workspace, { skipAnywhere: ['node_modules'], skipPaths: skillDir ? [skillDir] : [] });
     const canary = { file: join(scratch, 'shared', 'notes.txt'), token: `note-${randomBytes(16).toString('hex')}` };
     mkdirSync(dirname(canary.file));
@@ -241,6 +261,12 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
       checkPrompt(prompt, forbiddenPaths),
       scanWorkspace(workspace, { guidanceDir: skillDir, forbiddenPaths }),
     ];
+    if (!checks.every((check) => check.ok)) {
+      manifest.isolation = { ok: false, checks };
+      manifest.status = 'invalid';
+      manifest.error = `isolation failed: ${checks.filter((c) => !c.ok).map((c) => c.id).join(', ')}`;
+      return manifest;
+    }
     const before = snapshot(workspace, SNAPSHOT_SKIP);
 
     // 2. Generate.
@@ -256,7 +282,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
         forbiddenPaths,
         skill: condition.skill && skillDir ? { name: condition.skill.name, dir: skillDir } : undefined,
         maxBudgetUsd,
-        timeoutMs: options.timeoutMs ?? 90 * 60_000,
+        timeoutMs,
         signal,
       }),
     );
@@ -285,50 +311,66 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
       manifest.error = `isolation failed: ${checks.filter((c) => !c.ok).map((c) => c.id).join(', ')}`;
       return manifest;
     }
+    if (!generation.ok) throw new Error(generation.error ?? 'the generation session did not complete');
 
     // 4. Build. A failure is a brief-completion failure, recorded and never fixed.
     const buildLog = join(out, 'build.log');
-    const buildCode = await step('build', () => runLogged('pnpm', ['build'], { cwd: workspace, logFile: buildLog, signal }));
+    rmSync(join(workspace, 'dist'), { recursive: true, force: true });
+    const buildCode = await step('build', () => runLogged(sandbox.command, sandbox.args, {
+      cwd: workspace, env: sandbox.env, logFile: buildLog, signal,
+    }));
+    if (buildCode === null) throw new Error('the isolated build process was interrupted');
     manifest.build = { ok: buildCode === 0, exitCode: buildCode, log: 'build.log' };
 
     if (manifest.build.ok) {
-      // 5. Serve the build with this workspace's own preview server.
-      const preview = await step('serve', () => startPreview(workspace));
+      // 5. Serve only the static build, with a runner-owned fixture server.
+      let bundle: Map<string, Buffer>;
+      try {
+        bundle = await step('collect-build', () => collectBundle(workspace, sandbox));
+      } catch (error) {
+        if (!(error instanceof BuildOutputError)) throw error;
+        manifest.build.ok = false;
+        manifest.build.outputError = error.message;
+        manifest.status = 'complete';
+        return manifest;
+      }
+      const preview = await step('serve', () => startEvalPreview(bundle));
       server = preview;
-      manifest.preview = { url: preview.url, log: 'preview.log' };
-      const serverAlive = (when: string) => {
-        if (preview.gone()) throw new Error(`the workspace's vite preview exited ${when}:\n${preview.output()}`);
+      manifest.preview = { url: preview.url };
+      const browserEnv = {
+        ...process.env,
+        EVAL_BASE_URL: preview.url,
+        EVAL_MOCK_ADMIN_TOKEN: preview.admin,
       };
 
       // 6. The shared behavior tests.
       const testsDir = join(out, 'tests');
       mkdirSync(testsDir);
       const projectArgs = projects.flatMap((p) => ['--project', p]);
-      await step('tests', () =>
+      const testsCode = await step('tests', () =>
         runLogged('pnpm', ['exec', 'playwright', 'test', ...projectArgs, '--reporter=list,json', '--output', join(testsDir, 'artifacts')], {
           cwd: TESTS,
-          env: { ...process.env, EVAL_BASE_URL: preview.url, PLAYWRIGHT_JSON_OUTPUT_FILE: join(testsDir, 'report.json') },
+          env: { ...browserEnv, PLAYWRIGHT_JSON_OUTPUT_FILE: join(testsDir, 'report.json') },
           logFile: join(testsDir, 'output.log'),
           signal,
         }),
       );
-      serverAlive('during the tests');
       const touchTargets = existsSync(join(testsDir, 'artifacts'))
         ? walk(join(testsDir, 'artifacts'))
             .filter((rel) => rel.endsWith('/touch-targets.json'))
             .map((rel) => `tests/artifacts/${rel}`)
         : [];
       manifest.tests = { ...summarizeReport(join(testsDir, 'report.json')), report: 'tests/report.json', log: 'tests/output.log', touchTargets };
+      requireReport(manifest.tests, 'behavior tests', testsCode, projects);
 
       // 7. Screenshots of every state, in every project.
       const shotsDir = join(out, 'screenshots');
       mkdirSync(shotsDir);
-      await step('screenshots', () =>
+      const screenshotsCode = await step('screenshots', () =>
         runLogged('pnpm', ['exec', 'playwright', 'test', ...projectArgs, '--reporter=list,json', '--output', join(scratch, 'screenshot-artifacts')], {
           cwd: RUNNER,
           env: {
-            ...process.env,
-            EVAL_BASE_URL: preview.url,
+            ...browserEnv,
             EVAL_BRIEF: brief,
             EVAL_SCREENSHOT_DIR: shotsDir,
             PLAYWRIGHT_JSON_OUTPUT_FILE: join(shotsDir, 'report.json'),
@@ -337,10 +379,11 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
           signal,
         }),
       );
-      serverAlive('during the screenshots');
       const expected = projects.flatMap((p) => states.map((s) => `screenshots/${p}/${s}.png`));
       const saved = expected.filter((rel) => existsSync(join(out, rel)));
-      const failures = summarizeReport(join(shotsDir, 'report.json')).failures;
+      const screenshotReport = summarizeReport(join(shotsDir, 'report.json'));
+      requireReport(screenshotReport, 'screenshots', screenshotsCode, projects);
+      const { failures } = screenshotReport;
       const missing = expected
         .filter((rel) => !saved.includes(rel))
         .map((file) => {
@@ -349,10 +392,12 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
           return { file, reason: failure?.error ?? 'not saved' };
         });
       manifest.screenshots = { expected, saved, missing, report: 'screenshots/report.json' };
-      writeFileSync(join(out, 'preview.log'), preview.output());
     }
 
-    // 8. Token lint applies only to conditions with the token contract. Not built yet.
+    // 8. Token lint only applies where the token contract is part of the guidance.
+    if (manifest.build.ok && condition.tokenLint && skillDir) {
+      manifest.tokenLint = await step('token-lint', () => lintTokens(outputDir, copied.copied, out, scratch, skillDir));
+    }
     manifest.status = 'complete';
     return manifest;
   } catch (error) {

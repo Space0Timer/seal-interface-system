@@ -1,6 +1,7 @@
 import { writeFileSync } from 'node:fs';
-import { expect, test } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { OVERSIZED_FILENAME, TRANSIENT_FAILURE_FILENAME } from '../../fixtures/src/data.ts';
+import { test } from '../browser.ts';
 import {
   checkBothFailuresRecover,
   checkOversizedRecovery,

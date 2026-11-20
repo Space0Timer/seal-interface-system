@@ -190,8 +190,10 @@ test('probe: a forbidden read that returns the canary, or a shell that cannot ru
   assert.ok(passing.every((c) => c.ok), JSON.stringify(passing.filter((c) => !c.ok)));
   const leaked = judgeProbe(results({ ...good, 0: [CANARY, false] }), targets, versions);
   assert.deepEqual(leaked.filter((c) => !c.ok).map((c) => c.id), ['claude-code.probe-read-canary']);
-  const network = judgeProbe(results({ ...good, 8: ['200', false] }), targets, versions);
-  assert.deepEqual(network.filter((c) => !c.ok).map((c) => c.id), ['claude-code.probe-network']);
+  for (const status of ['200', '403', '503']) {
+    const network = judgeProbe(results({ ...good, 8: [status, false] }), targets, versions);
+    assert.deepEqual(network.filter((c) => !c.ok).map((c) => c.id), ['claude-code.probe-network']);
+  }
   const noShell = judgeProbe(results({ ...good, 9: ['command not found: pnpm', true] }), targets, versions);
   assert.deepEqual(noShell.filter((c) => !c.ok).map((c) => c.id), ['claude-code.probe-shell-works']);
 });

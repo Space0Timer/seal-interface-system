@@ -85,9 +85,10 @@ evals/runner/          the agent-independent runner, its
                        generator prompt)
 evals/adapters/        types.ts (the runner–adapter contract),
                        fake/ and claude-code/
+evals/guidance/        pinned third-party skill and its license
 evals/results/         one folder per run and mapping.jsonl
                        (gitignored)
-evals/rubric/          the shared rubric                         (not yet)
+evals/rubric/          shared reviewer criteria and scoring rules
 .claude/agents/        Claude-only adapters, e.g. reviewer.md,  (not yet)
                        which points to evals/rubric/ and holds
                        no criteria of its own
@@ -337,12 +338,18 @@ node evals/runner/src/cli.ts run --brief asset-library --condition plain \
   [--project <name> ...]
 ```
 
-Conditions are `plain` (no guidance) and `my-skill`. The my-skill hook
-copies `core/design-system` to where the adapter's agent finds project
-skills: `.claude/skills/design-system` for Claude Code. frontend-design
-isn't wired up yet. A live adapter needs `--model` (an exact model ID) and
+Conditions are `plain`, `frontend-design`, and `my-skill`. The runner
+copies only the assigned guidance into the adapter's project skill
+directory. Claude Code discovers it under `.claude/skills/`.
+The vendored frontend-design skill and license come from
+[Anthropic's pinned plugin revision](https://github.com/anthropics/claude-plugins-official/tree/44490cccaf6d9f82fdeec9416fbf7c9bd72575dc/plugins/frontend-design/skills/frontend-design).
+The runner verifies the skill's file hash before each run. A live adapter
+needs `--model` (an exact model ID) and
 `--max-budget-usd`. `--effort` pins the reasoning effort; without it the
 agent's default for the model applies. The manifest records both.
+
+The build isolation backend currently uses macOS `sandbox-exec`. The
+runner stops if the backend is unavailable or its toolchain probe fails.
 
 Each run:
 1. Checks every input. Then it assembles a workspace with `materialize.ts`
@@ -358,10 +365,14 @@ Each run:
 3. Copies all of `src/`, and every other file the generator added or
    changed, into the results. It never edits them. Links are recorded,
    never copied.
-4. Runs `pnpm build`. A failed build is a brief-completion failure: it's
-   recorded, never fixed, and the run ends there.
-5. Serves the build with the workspace's own `vite preview`. This uses
-   `evals/starter/src/preview.ts`, shared with the proof.
+4. Runs `pnpm build` with a fresh environment. The OS sandbox allows
+   workspace and private build-state writes, reads from the workspace and
+   the toolchain, and denies network access. A product build failure is
+   recorded for brief completion.
+5. Collects the static `dist/` output inside that sandbox. The runner
+   serves a snapshot of those files and its canonical mock API on one
+   loopback origin. The browser loads resources from that origin. The
+   Node-side test code authenticates reset and log requests.
 6. Runs the shared behavior tests in all four projects. It saves a JSON
    report and the touch-target evidence.
 7. Takes full-page screenshots of the six states in all four projects
@@ -370,7 +381,9 @@ Each run:
    - A PNG is saved only once its state is confirmed by the mock API's log
      and by what renders.
    - A state that can't be reached is recorded with the reason.
-8. Token lint: my-skill only. It isn't built yet, and the manifest says so.
+8. Runs the repo's CSS token and product-code lint rules for my-skill.
+   Findings describe authored code. The rubric also checks how the
+   rendered app uses semantic roles.
 9. Writes `manifest.json`, then deletes the temp folder. This happens even
    when a step fails or the run is stopped.
 
@@ -378,39 +391,53 @@ Statuses:
 - `complete`: every applicable step ran. The build or tests may still have
   failed.
 - `invalid`: an isolation check failed. Nothing was built or scored.
-- `error`: the runner itself failed.
+- `error`: the runner itself failed, including when a Playwright command
+  produces no report or has a global execution error.
 
 ### Results
 
 ```
 evals/results/            gitignored
-  mapping.jsonl           run ID → brief, condition, adapter, model. Kept
-                          apart from the run folders so they can be blinded,
-                          and never copied into a workspace.
+  mapping.jsonl           private run ID → brief, condition, adapter, model
+  review-<id>.json        private sample alias → run ID for an exported packet
   <run-id>/               12 random hex characters
     manifest.json
     prompt.md             the exact prompt sent
     generation/           the adapter's logs (Claude Code: invocation,
                           transcript, probe and its recorded requests)
     output/               the generator's files, byte for byte
-    build.log, preview.log
+    build-sandbox.log, build.log
+    token-lint.json       where the token contract applies and lint ran
     tests/                report.json, output.log, and artifacts/ with
                           touch-targets.json for each mobile project
     screenshots/          <project>/<state>.png and report.json
 ```
 
 `manifest.json` holds:
-- the run ID, brief, condition, adapter and model
+- the run ID, brief, condition, adapter, model, limits, and browser projects
 - Node, pnpm, Playwright and agent versions
 - hashes:
-  - skill: a sha256 over `core/design-system`'s sorted files, or null for
-    plain
+  - skill: a SHA-256 over the assigned skill's sorted files, plus the
+    pinned upstream revision when applicable
   - the starter, the brief and the prompt
 - step timings
 - the isolation report
 - generation outcome, usage and cost
 - summaries of the output, build, tests and screenshots
 - every file, with its size and sha256
+
+### Blinded review
+
+```
+node evals/runner/src/cli.ts export-review --out <new-dir> <run-id> ...
+```
+
+Export checks that the runs share the brief, starter, prompt, model
+settings, limits, versions, and browser projects. It randomizes sample
+order and includes the brief, rubric, principles, ban list, screenshots,
+test outcomes, and touch measurements. Give reviewers only the exported
+directory. Keep the alias key and raw results private until every sample's
+visual and behavioral judgments are locked.
 
 ### Claude Code isolation
 
@@ -458,7 +485,9 @@ settings and workspace against a local stub model, at no cost.
   - list the repo, the owner's home and the shared temp folder
   - write outside the workspace
   - reach the network
-- Then it runs node and pnpm and reads a workspace file.
+- Then it runs node and pnpm, reads a workspace file, and invokes the
+  assigned skill when present. The probe verifies that the stub receives
+  the skill body.
 - Every forbidden attempt must fail and every ordinary step must work, or
   the run stops before any model is called.
 
@@ -492,8 +521,9 @@ When Claude Code updates, the probe fails closed on anything new, such as a
 plugin, a skill or a system prompt line. Review it before adding it to an
 allowlist.
 
-`pnpm check` runs the fake adapter end to end. With `CLAUDE_CODE_BIN` set,
-it also runs `claude-code-stub` end to end.
+`pnpm check` runs the fake adapter end to end on macOS. With
+`CLAUDE_CODE_BIN` set, it also runs all three conditions through the real
+CLI against the local stub and verifies the blinded export.
 
 ### Scoring
 
@@ -703,16 +733,15 @@ comparison.
   app inside a fresh workspace.
 - The runner and the Claude Code adapter, with the isolation probe. The
   fake adapter runs the whole pipeline inside `pnpm check`.
+- Owner-approved asset-library rubric, pinned frontend-design skill,
+  isolated build and trusted preview, blinded export, and token lint.
 - The React package and the playground moved to a private repo
   (2026-11-19), before any component or screen was written.
 
 Next:
 1. The first real plain run on asset-library, after the owner approves
    the command, model and cost.
-2. Build these, following the eval protocol:
-   - `evals/rubric/`, for the owner to approve
-   - `.claude/agents/reviewer.md`, pointing to the rubric
-   - anonymized review sets, and token lint for my-skill
+2. Add `.claude/agents/reviewer.md` pointing to the approved rubric.
 3. The held-out workspace-members brief, with its fixtures and behavior
    tests. It stays out of the skill.
 4. Don't install the skill machine-wide yet. The private repo links
