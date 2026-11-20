@@ -574,7 +574,9 @@ CLI against the local stub and verifies the blinded export.
   available. They measure each control's clickable target, not its icon.
 - **Where the tests live:** `evals/tests/`. Set `EVAL_BASE_URL` to a
   condition's app, served with the mock API plugin. Without it, the tests
-  run against the **conformance app**.
+  run against the **conformance app**, on a port the OS picks for that run.
+  Playwright always starts its own server there and never reuses one, so
+  concurrent checks in other worktrees can't stand in for it or stop it.
 - **The conformance app** is unstyled and written only from the brief's
   contract. It proves the tests can be passed from the brief alone. It is
   never given to generators and is not a design reference.
