@@ -1,0 +1,14 @@
+{
+  "name": "@ds/eval-runner",
+  "private": true,
+  "type": "module",
+  "description": "Runs one eval condition end to end: workspace, generation through an adapter, build, shared tests, screenshots and a manifest.",
+  "scripts": {
+    "run": "node src/cli.ts run",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p ."
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.1"
+  }
+}

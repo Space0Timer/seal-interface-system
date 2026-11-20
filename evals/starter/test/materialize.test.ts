@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { after, test } from 'node:test';
 import { REPLACEMENT_FILE, UPLOAD_BATCH } from '../../fixtures/src/data.ts';
+import { EVAL_WORDS, OWNER_COPY } from '../src/leaks.ts';
 import { materialize, REPO, TEMPLATE, TEMPLATE_FILES } from '../src/materialize.ts';
 
 // Every temp folder this file creates is removed when the run ends.
@@ -35,16 +36,6 @@ const TOP_LEVEL = [
   'vite.config.ts',
 ];
 
-// The owner's reference copy lives only in the skill (principles P9).
-const OWNER_COPY = [
-  'No assets yet',
-  'Upload files to add them to your library',
-  'Try a different search',
-  'Upload failed because the connection was interrupted',
-  'Choose another file',
-  'This file exceeds the 100 MB size limit',
-];
-
 function textFiles(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
     const path = join(dir, entry.name);
@@ -65,10 +56,6 @@ test('a plain workspace has the template, tools, brief and upload files, and not
   assert.deepEqual(readdirSync(join(ws, 'tools', 'mock-api')).sort(), ['data.ts', 'mock-api.ts', 'thumbnails.ts', 'vite-plugin.ts']);
   assert.ok(!existsSync(join(ws, 'src', 'design-tokens.css')));
 });
-
-// Words that would tell a generator about the experiment around it.
-const EVAL_WORDS =
-  /\bevals?\b|\bconditions?\b|\brubric|\bgenerators?\b|\bowner\b|SKILL\.md|principles\.md|ban-list|conformance|reviewer|design system|generated workspaces?|@ds\/|keep comments neutral|\bharness\b/i;
 
 test('nothing in a plain workspace carries the owner\'s design guidance, copy, or the eval around it', () => {
   const ws = materialize({ out: fresh(), install: false });

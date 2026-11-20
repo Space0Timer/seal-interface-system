@@ -1,0 +1,10 @@
+{
+  "name": "@ds/eval-adapters",
+  "private": true,
+  "type": "module",
+  "description": "Agent adapters for the eval runner: skill placement, session launch and isolation checks, one agent each.",
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p ."
+  }
+}

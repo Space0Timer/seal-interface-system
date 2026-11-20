@@ -7,3 +7,4 @@ playwright-report/
 .vite/
 .DS_Store
 .claude/worktrees/
+evals/results/
