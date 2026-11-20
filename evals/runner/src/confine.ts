@@ -1,32 +1,39 @@
-// Confines the generated app's own code after generation: its build, and its
-// preview server, which loads its Vite config and its copy of the mock API.
-// Both run code the generator could have written, outside the generation
-// sandbox, so they get the same treatment:
+// Confines the generated app's build. `pnpm build` runs code the generator
+// could have written (the build script, the Vite config and its plugins)
+// outside the generation sandbox, so it gets:
 // - An environment built from an explicit allowlist, with a fresh home and
 //   temp folder. Nothing the runner holds, such as CLAUDE_CODE_OAUTH_TOKEN
 //   on a live run, is inherited.
-// - On macOS, an OS sandbox (sandbox-exec) that can't read the owner's home,
-//   the system temp folders, the repo checkouts or the results, except the
-//   workspace, its own state and the node and pnpm installs; can write only
-//   to the workspace and its own state; has no network beyond localhost; and
-//   can't inspect other processes or ask the keychain for anything.
-// So generated code can neither reach the host's files and credentials nor
-// copy them into the build and preview logs the run keeps.
+// - On macOS, an OS sandbox (sandbox-exec) that reads nothing by default.
+//   It may read only the OS runtime, the node and pnpm installs, the
+//   workspace and its own state, and never the repo checkouts or the
+//   results. It can write only to the workspace and its own state, has no
+//   network beyond localhost, and can't inspect other processes or ask the
+//   keychain for anything.
+// So generated code can neither reach the host's files and credentials
+// (in the home folder, on a mounted volume, in a shared folder) nor copy
+// them into the build log the run keeps.
 //
 // Elsewhere only the environment is confined, so live runs refuse to start
-// there (see runEval).
+// there (see runEval). The build's output is served by the runner itself
+// (see serve.ts), so no other generated code runs outside the browser.
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { confinedPath, type Toolchain } from '../../starter/src/toolchain.ts';
 
 export const SANDBOX_EXEC = '/usr/bin/sandbox-exec';
 
+/** The OS runtime a build reads: system binaries, libraries and frameworks, /etc, time zones and devices. */
+export const SYSTEM_READ = ['/usr/bin', '/usr/sbin', '/usr/lib', '/usr/libexec', '/usr/share', '/bin', '/sbin', '/System', '/private/etc', '/private/var/db/timezone', '/dev'];
+/** The root and the top-level links into /private, which path lookups pass through. */
+const SYSTEM_READ_LITERAL = ['/', '/etc', '/var', '/tmp'];
+
 export interface ConfineInput {
   workspace: string;
   /** A private folder outside the workspace for the fresh home and temp folder. */
   stateDir: string;
-  /** Folders the confined process must never read. Real paths. */
-  hidden: string[];
+  /** Paths never readable, even inside an allowed folder: the repo checkouts, the results, ~/.claude. Real paths. */
+  forbidden: string[];
   toolchain: Toolchain;
 }
 
@@ -34,7 +41,9 @@ export interface ConfinementRecord {
   sandbox: 'sandbox-exec' | 'none';
   /** The whole environment. It holds only paths and switches, never a secret. */
   env: Record<string, string>;
-  hidden: string[];
+  /** Everything the build may read. */
+  readable: string[];
+  forbidden: string[];
   profile?: string | undefined;
 }
 
@@ -69,24 +78,33 @@ export function confinedEnv({ stateDir, toolchain }: ConfineInput): Record<strin
   };
 }
 
+/** Every folder the build may read. */
+export function readable({ workspace, stateDir, toolchain }: ConfineInput): string[] {
+  return [...new Set([...SYSTEM_READ, ...toolchain.roots, workspace, stateDir])];
+}
+
 const q = (path: string) => JSON.stringify(path);
 const subpaths = (paths: string[]) => paths.map((p) => `(subpath ${q(p)})`).join(' ');
 
-export function seatbeltProfile({ workspace, stateDir, hidden, toolchain }: ConfineInput): string {
-  const own = [workspace, stateDir];
+export function seatbeltProfile(input: ConfineInput): string {
+  const own = [input.workspace, input.stateDir];
+  const forbidden = [...new Set(input.forbidden)];
   return [
     '(version 1)',
     '(allow default)',
-    '; Reads: nothing under the hidden folders except the workspace, its own state and the toolchain.',
-    `(deny file-read* ${subpaths([...new Set(hidden)])})`,
+    '; The last matching rule wins.',
+    '; Reads: nothing, except the OS runtime, the toolchain, the workspace and its own state.',
+    '(deny file-read*)',
     '; Metadata stays readable, since Node resolves real paths through the parent folders.',
     '(allow file-read-metadata)',
-    `(allow file-read* ${subpaths([...own, ...toolchain.roots])})`,
+    `(allow file-read* ${SYSTEM_READ_LITERAL.map((p) => `(literal ${q(p)})`).join(' ')} ${subpaths(readable(input))})`,
+    ...(forbidden.length
+      ? ['; Never the repo checkouts, the results or ~/.claude, even inside an allowed folder.', `(deny file-read* ${subpaths(forbidden)})`, `(allow file-read* ${subpaths(own)})`]
+      : []),
     '; Writes: only the workspace, its own state and the standard devices.',
     '(deny file-write*)',
     `(allow file-write* ${subpaths(own)} (regex #"^/dev/(null|zero|tty[^/]*|fd/[0-9]+|dtracehelper|stdout|stderr)$"))`,
     '; Network: localhost only. Name lookups go through mDNSResponder; every other Unix socket is closed.',
-    '; The last matching rule wins, so the localhost allow comes last.',
     '(deny network-outbound (remote unix-socket))',
     '(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))',
     '(deny network-outbound (remote ip "*:*"))',
@@ -103,14 +121,12 @@ export function confine(input: ConfineInput, { sandbox = sandboxAvailable() }: {
   const { home, tmp } = statePaths(input.stateDir);
   for (const dir of [home, tmp]) mkdirSync(dir, { recursive: true });
   const env = confinedEnv(input);
-  const hidden = [...new Set(input.hidden)];
-  if (!sandbox) {
-    return { env, wrap: (command, args) => [command, args], record: { sandbox: 'none', env, hidden } };
-  }
-  const profile = seatbeltProfile({ ...input, hidden });
+  const record = { env, readable: readable(input), forbidden: [...new Set(input.forbidden)] };
+  if (!sandbox) return { env, wrap: (command, args) => [command, args], record: { sandbox: 'none', ...record } };
+  const profile = seatbeltProfile(input);
   return {
     env,
     wrap: (command, args) => [SANDBOX_EXEC, ['-p', profile, command, ...args]],
-    record: { sandbox: 'sandbox-exec', env, hidden, profile },
+    record: { sandbox: 'sandbox-exec', ...record, profile },
   };
 }

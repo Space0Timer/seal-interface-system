@@ -7,9 +7,10 @@
 //   broken-build   writes a type error into src/, so `pnpm build` fails
 //   leaky          reads the canary, so the isolation checks fail
 //   timeout        writes the app, then reports that the session timed out
-//   snoop          writes a Vite config that, whenever the build or the
-//                  preview server loads it, tries to read the canary and a
-//                  repo file and prints its environment and home folder
+//   snoop          writes a Vite config that, whenever it's loaded, tries to
+//                  read the canary and a repo file and prints its environment
+//                  and home folder; and breaks its copy of the mock API, so
+//                  every request to it fails
 import { copyFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -47,6 +48,21 @@ export default defineConfig({
 `;
 }
 
+/** The snoop variant's copy of the mock API: it fails every request. */
+const BROKEN_MOCK_API = `import type { IncomingMessage, ServerResponse } from 'node:http';
+
+export type Handler = (req: IncomingMessage, res: ServerResponse, next?: () => void) => void;
+
+export function createMockApi(): Handler {
+  return (req, res, next) => {
+    const url = req.url ?? '/';
+    if (!url.startsWith('/api/') && !url.startsWith('/__mock/')) return next?.();
+    res.writeHead(503, { 'Content-Type': 'text/plain' });
+    res.end('unavailable');
+  };
+}
+`;
+
 export function fakeAdapter(variant: FakeVariant = 'conformance'): Adapter {
   return {
     name: variant === 'conformance' ? 'fake' : `fake-${variant}`,
@@ -69,7 +85,8 @@ export function fakeAdapter(variant: FakeVariant = 'conformance'): Adapter {
       if (variant === 'leaky') sawCanary = readFileSync(options.canary.file, 'utf8').includes(options.canary.token);
       if (variant === 'snoop') {
         writeFileSync(join(workspace, 'vite.config.ts'), snoopConfig(options.canary.file, join(REPO, 'package.json')));
-        written.push('vite.config.ts');
+        writeFileSync(join(workspace, 'tools', 'mock-api', 'mock-api.ts'), BROKEN_MOCK_API);
+        written.push('vite.config.ts', 'tools/mock-api/mock-api.ts');
       }
 
       const log = { adapter: 'fake', variant, prompt, written };

@@ -366,12 +366,21 @@ Each run:
    - as `invalid` if an isolation check failed
    - as `error` if generation failed (a crash, timeout, budget stop or
      error result)
-5. Runs `pnpm build`, confined (see "Build and preview"). A failed build is
-   a brief-completion failure: it's recorded, never fixed, and the run
-   ends there.
-6. Serves the build with the workspace's own `vite preview`, confined the
-   same way. This uses `evals/starter/src/preview.ts`, shared with the
-   proof.
+5. Runs `pnpm build`, confined (see "The build"). A failed build, or one
+   that wrote no `dist/index.html`, is a brief-completion failure: it's
+   recorded, never fixed, and the run ends there.
+6. Serves the build with the runner's own server
+   (`evals/runner/src/serve.ts`), never the workspace's `vite preview`:
+   - It copies `dist/`, regular files only, into a runner-owned folder
+     and serves the copy. Links are recorded in the manifest and
+     `preview.log`, never followed.
+   - The mock API is the runner's own, from `evals/fixtures/src`. The
+     generator could have edited its workspace's Vite config and its copy
+     of the mock API, so every condition is judged against the same API
+     this way.
+   - Paths without an extension that match no file get `index.html`, as
+     Vite's preview does for a single-page app.
+   - No generated code runs outside the browser after the build.
 7. Runs the shared behavior tests in all four projects. It saves a JSON
    report and the touch-target evidence.
 8. Takes full-page screenshots of the six states in all four projects
@@ -392,23 +401,26 @@ Statuses (the CLI exits non-zero for all but `complete`):
 - `error`: generation failed, or the runner itself did. Nothing was built
   or scored.
 
-**Build and preview.** Both run code the generator could have written
-(the build script, the Vite config, the workspace's copy of the mock API)
-outside the generation sandbox. `evals/runner/src/confine.ts` confines
-them:
+**The build.** `pnpm build` runs code the generator could have written
+(the build script, the Vite config and its plugins) outside the
+generation sandbox. `evals/runner/src/confine.ts` confines it:
 - The environment is an explicit allowlist: PATH with only node, pnpm and
   system folders, a fresh HOME and TMPDIR in `work-*/build/`, LANG and
   corepack's settings. Nothing else is inherited, so
-  `CLAUDE_CODE_OAUTH_TOKEN` never reaches generated code or its logs.
-- On macOS they run in `sandbox-exec`:
-  - no reads of the owner's home, the temp folders, the repo checkouts or
-    the results, except the workspace, its build state and the node and
-    pnpm installs
+  `CLAUDE_CODE_OAUTH_TOKEN` never reaches generated code or its log.
+- On macOS it runs in `sandbox-exec`:
+  - Reads are denied by default. It may read only the OS runtime (system
+    binaries, libraries and frameworks, `/etc`, time zones, devices), the
+    node and pnpm installs, the workspace and its build state. The repo
+    checkouts, the results and `~/.claude` stay unreadable even inside
+    those. So the home folder, mounted volumes and shared folders are
+    out of reach.
   - writes only to the workspace and its build state
   - no network beyond localhost, no other process's details, no keychain
 - Elsewhere only the environment is confined, so a live adapter refuses
   to run there.
-- The manifest records the environment and the sandbox profile.
+- The manifest records the environment, everything readable and the
+  sandbox profile.
 
 ### Results
 
@@ -439,7 +451,7 @@ evals/results/            gitignored
 - step timings
 - the isolation report
 - generation outcome, usage and cost
-- how the build and preview were confined
+- how the build was confined, and which links in `dist/` weren't served
 - summaries of the output, build, tests and screenshots
 - every file, with its size and sha256
 
@@ -496,9 +508,12 @@ before every real session, a **probe** session runs with the same command,
 settings and workspace against a local stub model, at no cost.
 - The stub makes the probe try to:
   - read the canary
-  - read a file in, glob and list every forbidden path: each repo
-    checkout, the results and `~/.claude` (never a dotfile, where
-    credentials live)
+  - glob and list every forbidden path: each repo checkout, the results
+    and `~/.claude`. These return names, never contents.
+  - read only files the runner names as harmless: a marker with a random
+    token in the results, and each checkout's own `package.json`. No
+    other file in a forbidden path is ever read, so a failed check can't
+    have put a secret in the logs.
   - list the owner's home and the shared temp folder
   - write outside the workspace
   - reach the network through the sandbox's proxy, and directly

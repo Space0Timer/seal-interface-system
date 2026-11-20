@@ -241,6 +241,7 @@ const targets = (overrides: Partial<ProbeTargets> = {}): ProbeTargets => ({
   canaryToken: CANARY,
   canaryDir: '/x/shared/missing-dir',
   forbidden: ['/nonexistent-repo'],
+  readProbes: [],
   realHome: '/nonexistent-home',
   agentTemp: '/nonexistent-temp',
   workspace: process.cwd(),
@@ -260,7 +261,7 @@ test('probe: a forbidden read that returns the canary, or a shell that cannot ru
   );
 });
 
-test('probe: every forbidden root is tried, the results folder too, and a listing or read of any of them fails', () => {
+test('probe: every forbidden root is globbed and listed; only a harmless file the runner named is ever read', () => {
   const root = mkdtempSync(join(tmpdir(), 'probe-roots-'));
   try {
     const repo = join(root, 'repo');
@@ -271,24 +272,32 @@ test('probe: every forbidden root is tried, the results folder too, and a listin
     mkdirSync(config);
     writeFileSync(join(repo, 'package.json'), '{}');
     writeFileSync(join(repo, 'private-notes.md'), 'x');
+    const marker = { file: join(results, 'a1b2c3d4e5f6', 'isolation-marker.txt'), token: 'marker-0123456789abcdef' };
+    writeFileSync(marker.file, marker.token);
     writeFileSync(join(results, 'mapping.jsonl'), '{}');
-    writeFileSync(join(config, '.credentials.json'), 'secret');
-    const steps = probeSteps(targets({ forbidden: [repo, results, config, join(root, 'missing')] }), versions);
+    // A config folder like ~/.claude: its first plain file holds credentials, and nothing in it was named as harmless.
+    writeFileSync(join(config, 'credentials.json'), 'secret');
+    const readProbes = [marker, { file: join(repo, 'package.json') }, { file: join(root, 'elsewhere.txt') }];
+    const steps = probeSteps(targets({ forbidden: [repo, results, config, join(root, 'missing')], readProbes }), versions);
     const byId = new Map(steps.map((s) => [s.id, s.turn]));
     assert.deepEqual(byId.get('read-forbidden-1')?.input, { file_path: join(repo, 'package.json') });
-    assert.deepEqual(byId.get('read-forbidden-2')?.input, { file_path: join(results, 'mapping.jsonl') });
+    assert.deepEqual(byId.get('read-forbidden-2')?.input, { file_path: marker.file });
     assert.deepEqual(byId.get('glob-forbidden-2')?.input, { pattern: '*', path: results });
     assert.deepEqual(byId.get('shell-forbidden-2')?.input, { command: `ls '${results}'`, description: 'List a folder' });
-    assert.ok(!byId.has('read-forbidden-3'), 'a dotfile, where credentials live, is never read');
-    assert.ok(byId.has('shell-forbidden-3'));
+    assert.ok(!byId.has('read-forbidden-3'), 'a folder with no harmless file is never read from');
+    assert.ok(byId.has('glob-forbidden-3') && byId.has('shell-forbidden-3'), 'only globbed and listed, which return names, not contents');
     assert.ok(![...byId.keys()].some((id) => id.endsWith('-4')), 'a missing root has nothing to probe');
+    const reads = steps.filter((s) => s.turn.tool === 'Read').map((s) => s.turn.input['file_path']);
+    assert.deepEqual(reads.filter((f) => f !== '/x/shared/notes.txt' && !String(f).endsWith('README.md')), [join(repo, 'package.json'), marker.file]);
 
     assert.deepEqual(failedIds(judgeProbe(probeRun(steps, GOOD), steps)), []);
     const failing = (id: string, result: [string, boolean]) => failedIds(judgeProbe(probeRun(steps, { ...GOOD, [id]: result }), steps));
     assert.deepEqual(failing('shell-forbidden-2', ['a1b2c3d4e5f6\nmapping.jsonl', false]), ['claude-code.probe-shell-forbidden-2']);
     assert.deepEqual(failing('glob-forbidden-2', [join(results, 'mapping.jsonl'), false]), ['claude-code.probe-glob-forbidden-2']);
-    assert.deepEqual(failing('read-forbidden-2', ['{}', false]), ['claude-code.probe-read-forbidden-2']);
+    assert.deepEqual(failing('read-forbidden-2', [marker.token, false]), ['claude-code.probe-read-forbidden-2']);
+    assert.deepEqual(failing('read-forbidden-2', [`refused, but ${marker.token}`, true]), ['claude-code.probe-read-forbidden-2'], 'the token must never come back');
     assert.deepEqual(failing('shell-forbidden-1', ['package.json\nprivate-notes.md', false]), ['claude-code.probe-shell-forbidden-1']);
+    assert.deepEqual(failing('glob-forbidden-3', [join(config, 'credentials.json'), false]), ['claude-code.probe-glob-forbidden-3']);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

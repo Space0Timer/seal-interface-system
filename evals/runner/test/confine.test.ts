@@ -1,6 +1,6 @@
-// The confinement of the generated app's build and preview server: an
-// allowlisted environment everywhere, and on macOS a sandbox that keeps it
-// from the host's files, the network beyond localhost and other processes.
+// The confinement of the generated app's build: an allowlisted environment
+// everywhere, and on macOS a sandbox that reads nothing it wasn't given and
+// keeps it from the network beyond localhost and from other processes.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -9,18 +9,24 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { toolchain } from '../../starter/src/toolchain.ts';
-import { confine, confinedEnv, sandboxAvailable, seatbeltProfile, type ConfineInput } from '../src/confine.ts';
+import { confine, confinedEnv, readable, sandboxAvailable, seatbeltProfile, SYSTEM_READ, type ConfineInput } from '../src/confine.ts';
 
 const root = mkdtempSync(join(realpathSync(tmpdir()), 'confine-'));
 after(() => rmSync(root, { recursive: true, force: true }));
 const workspace = join(root, 'app');
-const hiddenDir = join(root, 'shared');
-mkdirSync(workspace);
-mkdirSync(hiddenDir);
+// A folder nobody named, like a mounted volume or a shared folder: unreadable by default.
+const unnamedDir = join(root, 'shared');
+// A toolchain folder with a forbidden folder inside it.
+const tools = join(root, 'tools');
+const forbiddenDir = join(tools, 'checkout');
+for (const dir of [workspace, unnamedDir, forbiddenDir]) mkdirSync(dir, { recursive: true });
 writeFileSync(join(workspace, 'index.html'), 'the app');
-writeFileSync(join(hiddenDir, 'notes.txt'), 'a host file');
+writeFileSync(join(unnamedDir, 'notes.txt'), 'a host file');
+writeFileSync(join(tools, 'tool.txt'), 'a tool');
+writeFileSync(join(forbiddenDir, 'package.json'), '{}');
 const realHome = realpathSync(homedir());
-const input: ConfineInput = { workspace, stateDir: join(root, 'build'), hidden: [realHome, root, root], toolchain: toolchain() };
+const base = toolchain();
+const input: ConfineInput = { workspace, stateDir: join(root, 'build'), forbidden: [forbiddenDir, forbiddenDir], toolchain: { ...base, roots: [...base.roots, tools] } };
 
 test('the environment is an allowlist: a fresh home and temp folder, the toolchain, nothing inherited', () => {
   const saved = process.env['CLAUDE_CODE_OAUTH_TOKEN'];
@@ -39,15 +45,19 @@ test('the environment is an allowlist: a fresh home and temp folder, the toolcha
   }
 });
 
-test('the profile hides every hidden folder once and opens only the workspace, its state and the toolchain', () => {
+test('the profile reads nothing by default, then only the runtime, the toolchain, the workspace and its state, never a forbidden path', () => {
   const profile = seatbeltProfile(input);
-  const line = (start: string) => profile.split('\n').find((l) => l.startsWith(start)) ?? '';
-  const denied = line('(deny file-read*');
-  for (const dir of [realHome, root]) assert.ok(denied.includes(`(subpath ${JSON.stringify(dir)})`), dir);
-  assert.equal(denied.split(JSON.stringify(root)).length, 2, 'each hidden folder once');
-  const readable = line('(allow file-read*');
-  for (const dir of [workspace, input.stateDir, ...input.toolchain.roots]) assert.ok(readable.includes(JSON.stringify(dir)), dir);
-  const writable = line('(allow file-write*');
+  const lines = profile.split('\n');
+  const index = (start: string) => lines.findIndex((l) => l.startsWith(start));
+  assert.ok(lines.includes('(deny file-read*)'), 'reads are denied by default');
+  const allowed = lines[index('(allow file-read* (literal')] ?? '';
+  for (const dir of [...SYSTEM_READ, workspace, input.stateDir, ...input.toolchain.roots]) assert.ok(allowed.includes(`(subpath ${JSON.stringify(dir)})`), dir);
+  assert.ok(!allowed.includes(`(subpath ${JSON.stringify(realHome)})`) && !allowed.includes(`(subpath ${JSON.stringify(root)})`), 'no home or temp folder as a whole');
+  assert.deepEqual(readable(input), [...new Set(readable(input))]);
+  const forbidden = index(`(deny file-read* (subpath ${JSON.stringify(forbiddenDir)}))`);
+  assert.ok(forbidden > index('(allow file-read* (literal'), 'the forbidden deny comes after the allows, so it wins');
+  assert.equal(lines[forbidden + 1], `(allow file-read* (subpath ${JSON.stringify(workspace)}) (subpath ${JSON.stringify(input.stateDir)}))`);
+  const writable = lines[index('(allow file-write*')] ?? '';
   assert.ok(writable.includes(JSON.stringify(workspace)) && writable.includes(JSON.stringify(input.stateDir)));
   assert.ok(!input.toolchain.roots.some((dir) => writable.includes(JSON.stringify(dir))), 'the toolchain is read-only');
 });
@@ -64,9 +74,13 @@ const probe = `
 const fs = require('node:fs'), net = require('node:net'), http = require('node:http'), os = require('node:os');
 const out = {};
 const attempt = (what, fn) => { try { out[what] = fn(); } catch (error) { out[what] = error.code; } };
-attempt('readHidden', () => fs.readFileSync(${JSON.stringify(join(hiddenDir, 'notes.txt'))}, 'utf8'));
-attempt('listHidden', () => fs.readdirSync(${JSON.stringify(hiddenDir)}).join(','));
+attempt('readUnnamed', () => fs.readFileSync(${JSON.stringify(join(unnamedDir, 'notes.txt'))}, 'utf8'));
+attempt('listUnnamed', () => fs.readdirSync(${JSON.stringify(unnamedDir)}).join(','));
+attempt('listShared', () => fs.readdirSync('/Users/Shared').length);
 attempt('listHome', () => fs.readdirSync(${JSON.stringify(realHome)}).length);
+attempt('readTool', () => fs.readFileSync(${JSON.stringify(join(tools, 'tool.txt'))}, 'utf8'));
+attempt('readForbidden', () => fs.readFileSync(${JSON.stringify(join(forbiddenDir, 'package.json'))}, 'utf8'));
+attempt('readHosts', () => typeof fs.readFileSync('/etc/hosts', 'utf8'));
 attempt('readWorkspace', () => fs.readFileSync('index.html', 'utf8'));
 attempt('writeOutside', () => (fs.writeFileSync(${JSON.stringify(join(root, 'outside.txt'))}, 'x'), 'written'));
 attempt('writeWorkspace', () => (fs.writeFileSync('built.txt', 'x'), 'written'));
@@ -98,7 +112,7 @@ Promise.all([remote, socket, local]).then(([remote, socket, local]) => {
 });
 `;
 
-test('sandboxed: no host files, no writes outside, no network beyond localhost, no other process', { skip: sandboxAvailable() ? false : 'needs macOS sandbox-exec' }, async () => {
+test('sandboxed: nothing unnamed or forbidden is readable, no writes outside, no network beyond localhost, no other process', { skip: sandboxAvailable() ? false : 'needs macOS sandbox-exec' }, async () => {
   // A Unix socket like an SSH agent's, listening outside the sandbox. Connecting needs no accept, so a blocked test process can host it.
   const agent = createServer();
   await new Promise<void>((resolve) => agent.listen(join(workspace, 'agent.sock'), resolve));
@@ -115,9 +129,13 @@ test('sandboxed: no host files, no writes outside, no network beyond localhost, 
   assert.deepEqual(
     { ...seen, home: undefined },
     {
-      readHidden: 'EPERM',
-      listHidden: 'EPERM',
+      readUnnamed: 'EPERM',
+      listUnnamed: 'EPERM',
+      listShared: 'EPERM',
       listHome: 'EPERM',
+      readTool: 'a tool',
+      readForbidden: 'EPERM',
+      readHosts: 'string',
       readWorkspace: 'the app',
       writeOutside: 'EPERM',
       writeWorkspace: 'written',

@@ -26,6 +26,15 @@ export interface GenerateOptions {
   canary: Canary;
   /** Absolute paths the session must never see or mention: this repo, the results. */
   forbiddenPaths: string[];
+  /**
+   * Files inside the forbidden paths that are harmless to read, so an
+   * adapter can try reading them to prove it can't: runner-made markers,
+   * each with a token that must never come back, and files known to hold
+   * nothing sensitive, such as the repo's own package.json. An adapter must
+   * never try to read any other file in a forbidden path, since a failed
+   * check would already have its contents in the logs.
+   */
+  readProbes: ReadProbe[];
   /** The condition's skill, if any: its name and folder relative to the workspace. */
   skill?: { name: string; dir: string } | undefined;
   /** Spending cap for live adapters, in US dollars. */
@@ -33,6 +42,12 @@ export interface GenerateOptions {
   timeoutMs: number;
   /** Aborted when the run is stopped. The adapter must end its session. */
   signal?: AbortSignal | undefined;
+}
+
+export interface ReadProbe {
+  file: string;
+  /** For a marker: its unique text. */
+  token?: string | undefined;
 }
 
 /** One isolation check. A run is invalid if any check fails. */

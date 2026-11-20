@@ -6,8 +6,9 @@
 //
 // The run stops before the adapter is called if the workspace or prompt
 // fails an isolation check, and before the build if generation failed or
-// the session wasn't isolated. The build and the preview server run the
-// generated code confined (see confine.ts).
+// the session wasn't isolated. The build runs the generated code confined
+// (see confine.ts). The build output is then served by the runner itself,
+// with its own mock API (see serve.ts).
 //
 // Agent-independent: everything agent-specific is in the adapter.
 import { execFileSync, spawn } from 'node:child_process';
@@ -17,7 +18,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { Adapter, GenerateResult, IsolationCheck } from '../../adapters/types.ts';
 import { materialize, REPO } from '../../starter/src/materialize.ts';
-import { startPreview, type Preview } from '../../starter/src/preview.ts';
+import type { Preview } from '../../starter/src/preview.ts';
 import { toolchain } from '../../starter/src/toolchain.ts';
 import { checkOutside, checkPrompt, checkWorkspacePath, scanWorkspace } from './checks.ts';
 import { conditionNamed } from './conditions.ts';
@@ -25,6 +26,7 @@ import { confine, sandboxAvailable, type ConfinementRecord } from './confine.ts'
 import { copyFiles, diff, hashEntry, hashTree, sha256, snapshot, walk } from './files.ts';
 import { PROMPT_FILE, renderPrompt } from './prompt.ts';
 import { summarizeReport, type TestSummary } from './report.ts';
+import { copyBuild, serveBuild } from './serve.ts';
 
 export const RESULTS = join(REPO, 'evals', 'results');
 const TESTS = join(REPO, 'evals', 'tests');
@@ -88,12 +90,13 @@ export interface Manifest {
   timings: Record<string, Step>;
   isolation: { ok: boolean; checks: IsolationCheck[]; settings?: Record<string, unknown> | undefined };
   generation: Omit<GenerateResult, 'isolation' | 'settings'> | null;
-  /** How the build and the preview server were confined. */
+  /** How the build was confined. */
   confinement: ConfinementRecord | null;
   output: { dir: string; copied: string[]; added: string[]; changed: string[]; deleted: string[]; links: Array<{ path: string; target: string }> } | null;
-  /** Brief completion: a failed build is recorded, never fixed. */
-  build: { ok: boolean; exitCode: number | null; log: string } | null;
-  preview: { url: string; log: string } | null;
+  /** Brief completion: a failed build, or one that wrote no dist/index.html, is recorded, never fixed. */
+  build: { ok: boolean; exitCode: number | null; log: string; error?: string } | null;
+  /** The runner's own server for the build: a copy of dist/ (links left out) and the canonical mock API. */
+  preview: { url: string; log: string; files: number; links: Array<{ path: string; target: string }> } | null;
   tests: (TestSummary & { report: string; log: string; touchTargets: string[] }) | null;
   screenshots: { expected: string[]; saved: string[]; missing: Array<{ file: string; reason: string }>; report: string } | null;
   tokenLint: { status: 'not-applicable' | 'not-built-yet' };
@@ -245,6 +248,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
   const workspace = join(scratch, 'app');
   manifest.workspace = workspace;
   let server: Preview | undefined;
+  let removeMarker = () => {};
 
   try {
     const forbiddenPaths = [...repoRoots(), realpathSync(resultsRoot), join(homedir(), '.claude')];
@@ -259,6 +263,12 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     writeFileSync(canary.file, `${canary.token}\n`);
     const stateDir = join(scratch, 'state');
     mkdirSync(stateDir);
+    // Files the adapter may try reading to prove the forbidden paths are unreadable: a marker in the results, and
+    // each checkout's package.json, which is published with the repo. Never anything else in a forbidden path.
+    const marker = { file: join(out, 'isolation-marker.txt'), token: `marker-${randomBytes(16).toString('hex')}` };
+    writeFileSync(marker.file, `${marker.token}\n`);
+    removeMarker = () => rmSync(marker.file, { force: true });
+    const readProbes = [marker, ...repoRoots().map((root) => ({ file: join(root, 'package.json') })).filter((p) => existsSync(p.file))];
 
     const checks: IsolationCheck[] = [
       checkOutside(workspace, forbiddenPaths),
@@ -281,12 +291,14 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
         stateDir,
         canary,
         forbiddenPaths,
+        readProbes,
         skill: condition.skill && skillDir ? { name: condition.skill.name, dir: skillDir } : undefined,
         maxBudgetUsd,
         timeoutMs: options.timeoutMs ?? 90 * 60_000,
         signal,
       }),
     );
+    removeMarker();
     const { isolation: adapterChecks, settings, ...generation } = generated;
     manifest.generation = generation;
 
@@ -298,12 +310,16 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     const copied = await step('copy-output', () => copyFiles(workspace, outputDir, toCopy));
     manifest.output = { dir: 'output', ...copied, ...changes };
 
-    // The canary's token must not have travelled into the workspace either.
-    const carried = toCopy.filter((rel) => lstatSync(join(workspace, rel)).isFile() && readFileSync(join(workspace, rel)).includes(canary.token));
+    // Neither the canary's token nor the marker's may have travelled into the workspace either.
+    const carried = toCopy.filter((rel) => {
+      if (!lstatSync(join(workspace, rel)).isFile()) return false;
+      const text = readFileSync(join(workspace, rel));
+      return text.includes(canary.token) || text.includes(marker.token);
+    });
     checks.push({
       id: 'runner.canary-absent',
       ok: carried.length === 0,
-      detail: carried.length ? `the canary's token is in ${carried.join(', ')}` : 'the canary token is in no file the generator wrote',
+      detail: carried.length ? `the canary's or the marker's token is in ${carried.join(', ')}` : 'the canary and marker tokens are in no file the generator wrote',
     });
     checks.push(...adapterChecks);
     if (!checks.every((c) => c.ok)) return invalid(checks, settings);
@@ -315,13 +331,8 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
       return manifest;
     }
 
-    // The generated code runs only confined from here on: no inherited credentials, no host files, no network.
-    const confinement = confine({
-      workspace,
-      stateDir: join(scratch, 'build'),
-      hidden: [realpathSync(homedir()), realpathSync(tmpdir()), ...(existsSync('/tmp') ? [realpathSync('/tmp')] : []), ...forbiddenPaths],
-      toolchain: toolchain(),
-    });
+    // The generated build runs only confined: no inherited credentials, no reads beyond what it needs, no network.
+    const confinement = confine({ workspace, stateDir: join(scratch, 'build'), forbidden: forbiddenPaths, toolchain: toolchain() });
     manifest.confinement = confinement.record;
 
     // 4. Build. A failure is a brief-completion failure, recorded and never fixed.
@@ -329,14 +340,17 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     const [buildCommand, buildArgs] = confinement.wrap('pnpm', ['build']);
     const buildCode = await step('build', () => runLogged(buildCommand, buildArgs, { cwd: workspace, env: confinement.env, logFile: buildLog, signal }));
     manifest.build = { ok: buildCode === 0, exitCode: buildCode, log: 'build.log' };
+    const servedDir = join(scratch, 'serve');
+    const built = manifest.build.ok ? copyBuild(join(workspace, 'dist'), servedDir) : undefined;
+    if (built && 'missing' in built) manifest.build = { ...manifest.build, ok: false, error: built.missing };
 
-    if (manifest.build.ok) {
-      // 5. Serve the build with this workspace's own preview server.
-      const preview = await step('serve', () => startPreview(workspace, { launch: confinement }));
+    if (built && !('missing' in built)) {
+      // 5. Serve the build: the runner's own server and mock API, never the workspace's.
+      const preview = await step('serve', () => serveBuild(servedDir, built));
       server = preview;
-      manifest.preview = { url: preview.url, log: 'preview.log' };
+      manifest.preview = { url: preview.url, log: 'preview.log', files: built.copied.length, links: built.links };
       const serverAlive = (when: string) => {
-        if (preview.gone()) throw new Error(`the workspace's vite preview exited ${when}:\n${preview.output()}`);
+        if (preview.gone()) throw new Error(`the build's server stopped ${when}:\n${preview.output()}`);
       };
 
       // 6. The shared behavior tests.
@@ -400,6 +414,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     return manifest;
   } finally {
     server?.stop();
+    removeMarker();
     rmSync(scratch, { recursive: true, force: true });
     // 9. The manifest, with every output file.
     manifest.finishedAt = new Date().toISOString();

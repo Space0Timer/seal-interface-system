@@ -160,29 +160,31 @@ test('a failed generation ends the run with the adapter\'s error: partial output
   assert.ok(!existsSync(m.workspace!));
 });
 
-test('the build and the preview server run confined: no inherited credential, home folder or host file', async () => {
+test('the build runs confined, and the build is scored against the runner\'s own mock API, not the workspace\'s', async () => {
   const root = resultsRoot();
   const token = `test-token-${randomBytes(8).toString('hex')}`;
   const m = await withEnv('CLAUDE_CODE_OAUTH_TOKEN', token, () =>
     runEval({ brief: 'asset-library', condition: 'plain', adapter: fakeAdapter('snoop'), projects: ['desktop-light'], resultsRoot: root, log: quiet }),
   );
   assert.equal(m.status, 'complete', m.error ?? 'no error');
+  // The workspace's copy of the mock API fails every request, so passing tests mean the runner's own served them.
   assert.deepEqual(m.tests?.failures, []);
-  const sandboxed = sandboxAvailable();
-  const buildHome = join(dirname(m.workspace!), 'build', 'home');
-  for (const log of ['build.log', 'preview.log']) {
-    const text = readFileSync(join(root, m.runId, log), 'utf8');
-    assert.match(text, /snoop token: unset/, log);
-    assert.ok(!text.includes(token), `${log} never sees the token`);
-    const env = /snoop env: (.*)/.exec(text)?.[1]?.split(',') ?? [];
-    assert.ok(env.includes('HOME') && !env.some((name) => name.startsWith('CLAUDE')), `${log}: ${env.join(', ')}`);
-    assert.ok(text.includes(`snoop home: ${buildHome}`), `${log} runs with a fresh home`);
-    if (sandboxed) {
-      assert.match(text, /snoop canary: EPERM/, log);
-      assert.match(text, /snoop repo: EPERM/, log);
-    }
+  assert.ok((m.tests?.passed ?? 0) > 0);
+  assert.equal(m.confinement?.sandbox, sandboxAvailable() ? 'sandbox-exec' : 'none');
+  const build = readFileSync(join(root, m.runId, 'build.log'), 'utf8');
+  assert.match(build, /snoop token: unset/);
+  assert.ok(!build.includes(token), 'the build never sees the token');
+  const env = /snoop env: (.*)/.exec(build)?.[1]?.split(',') ?? [];
+  assert.ok(env.includes('HOME') && !env.some((name) => name.startsWith('CLAUDE')), env.join(', '));
+  assert.ok(build.includes(`snoop home: ${join(dirname(m.workspace!), 'build', 'home')}`), 'the build runs with a fresh home');
+  if (sandboxAvailable()) {
+    assert.match(build, /snoop canary: EPERM/);
+    assert.match(build, /snoop repo: EPERM/);
   }
+  // Serving runs no generated code: the Vite config is never loaded again.
+  assert.ok(!readFileSync(join(root, m.runId, 'preview.log'), 'utf8').includes('snoop'));
   assert.ok(!readFileSync(join(root, m.runId, 'manifest.json'), 'utf8').includes(token));
+  assert.ok(!existsSync(join(root, m.runId, 'isolation-marker.txt')), 'the marker is gone once generation ends');
 });
 
 test('the my-skill hook: the skill lands where the adapter says, with its hash; the starter is unchanged', async () => {

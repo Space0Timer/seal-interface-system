@@ -2,7 +2,8 @@
 //
 // Before the real session, a probe session runs with the same command,
 // settings and workspace, but against a local stub model, so it costs
-// nothing. The stub makes the session try to read the canary, every
+// nothing. The stub makes the session try to read the canary and the
+// runner's harmless files in the forbidden paths, glob and list every
 // forbidden path (each repo checkout, the results, ~/.claude) and the
 // owner's home, write outside the workspace and reach the network, and then
 // do the ordinary things a generator needs (read a workspace file, run node
@@ -22,7 +23,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { leakIn } from '../../starter/src/leaks.ts';
 import { onPath, toolchain } from '../../starter/src/toolchain.ts';
-import type { Adapter, GenerateOptions, GenerateResult, IsolationCheck } from '../types.ts';
+import type { Adapter, GenerateOptions, GenerateResult, IsolationCheck, ReadProbe } from '../types.ts';
 import { buildInvocation, coverFor, redacted, sessionPaths, TOOLS, type Invocation, type InvocationInput } from './invocation.ts';
 import { startStubModel, type RecordedRequest, type ScriptTurn } from './stub-model.ts';
 import { checkInit, checkPaths, checkReceived, parseTranscript, sessionOutcome, type ToolResult, type Transcript } from './transcript.ts';
@@ -193,6 +194,8 @@ export interface ProbeTargets {
   canaryDir: string;
   /** Every path the session must never reach: each repo checkout, the results, ~/.claude. */
   forbidden: string[];
+  /** The only files in them the probe may try to read (see GenerateOptions.readProbes). */
+  readProbes: ReadProbe[];
   realHome: string;
   /** Claude Code's shared temp folder, which holds other sessions' files. */
   agentTemp: string;
@@ -251,15 +254,6 @@ export function judgeNetwork(result: ToolResult | undefined, target: string): { 
   return { verdict: 'inconclusive', detail: 'it failed without a denial, which proves nothing' };
 }
 
-/** A file to try reading in a forbidden folder: its package.json, else its first plain file. Never a dotfile, where credentials live. */
-function probeFile(dir: string): string | undefined {
-  if (existsSync(join(dir, 'package.json'))) return 'package.json';
-  return readdirSync(dir, { withFileTypes: true })
-    .filter((e) => e.isFile() && !e.name.startsWith('.'))
-    .map((e) => e.name)
-    .sort()[0];
-}
-
 /** The probe: forbidden attempts first, then ordinary work. */
 export function probeSteps(t: ProbeTargets, versions: { node: string; pnpm: string }): ProbeStep[] {
   const q = (p: string) => `'${p.replaceAll("'", "'\\''")}'`;
@@ -289,18 +283,23 @@ export function probeSteps(t: ProbeTargets, versions: { node: string; pnpm: stri
       return { ok: verdict === 'blocked', detail: `${what}: ${verdict === 'blocked' ? detail : `${verdict}, ${detail}`}` };
     };
 
-  // Numbered by position in the forbidden list, so a missing folder never renumbers the others.
+  // Numbered by position in the forbidden list, so a missing folder never renumbers the others. Only a harmless
+  // file the runner named is ever read; a folder without one is only globbed and listed, which return names, never
+  // contents, so a failed check can't put a secret in the logs.
   const forbidden = t.forbidden.flatMap((dir, i): ProbeStep[] => {
     if (!existsSync(dir)) return [];
     const n = i + 1;
-    const file = probeFile(dir);
+    const probe = t.readProbes.find((p) => p.file.startsWith(`${dir}/`) && existsSync(p.file));
     return [
-      ...(file
+      ...(probe
         ? [
             {
               id: `read-forbidden-${n}`,
-              turn: { tool: 'Read', input: { file_path: join(dir, file) } },
-              judge: (r: ToolResult | undefined) => ({ ok: !!r?.isError, detail: `Read of ${join(dir, file)} was refused` }),
+              turn: { tool: 'Read', input: { file_path: probe.file } },
+              judge: (r: ToolResult | undefined) => ({
+                ok: !!r?.isError && !(probe.token && r.text.includes(probe.token)),
+                detail: `Read of ${probe.file} was refused`,
+              }),
             },
           ]
         : []),
@@ -455,7 +454,7 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
 
       // 1. The probe, against the stub model.
       const probe = probeSteps(
-        { canaryFile: opts.canary.file, canaryToken: opts.canary.token, canaryDir, forbidden: opts.forbiddenPaths, realHome, agentTemp, workspace },
+        { canaryFile: opts.canary.file, canaryToken: opts.canary.token, canaryDir, forbidden: opts.forbiddenPaths, readProbes: opts.readProbes, realHome, agentTemp, workspace },
         versions,
       );
       prepare(probeState);
