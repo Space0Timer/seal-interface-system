@@ -39,18 +39,28 @@ export interface Preview {
   stop(): void;
 }
 
+/** How to launch the server: its environment, and optionally a wrapper such as an OS sandbox. */
+export interface Launch {
+  env: NodeJS.ProcessEnv;
+  wrap?(command: string, args: string[]): [string, string[]];
+}
+
 // eslint-disable-next-line no-control-regex
 const ANSI = /\u001b\[[0-9;]*m/g;
 
 /**
  * Starts `vite preview` in a built workspace and resolves once this process
  * has announced its URL and answers on it. Rejects (and stops the server)
- * if the process exits first or doesn't serve in time.
+ * if the process exits first or doesn't serve in time. Without `launch`, the
+ * server inherits this process's environment.
  */
-export async function startPreview(workspace: string, { timeoutMs = 30_000 } = {}): Promise<Preview> {
+export async function startPreview(workspace: string, { timeoutMs = 30_000, launch }: { timeoutMs?: number; launch?: Launch } = {}): Promise<Preview> {
   const port = await freePort();
-  const child = spawn('pnpm', ['exec', 'vite', 'preview', '--port', String(port), '--strictPort'], {
+  const viteArgs = ['exec', 'vite', 'preview', '--port', String(port), '--strictPort'];
+  const [command, args] = launch?.wrap?.('pnpm', viteArgs) ?? ['pnpm', viteArgs];
+  const child = spawn(command, args, {
     cwd: workspace,
+    env: launch?.env ?? process.env,
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
   });

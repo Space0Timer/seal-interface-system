@@ -351,34 +351,64 @@ Each run:
    - `work-*/shared/notes.txt`: a canary with a random token, just
      outside the workspace
    - `work-*/state/`: the adapter's private state
-2. Calls the adapter with `evals/runner/prompt.md`:
+   - `work-*/build/`: the build's fresh home and temp folder
+2. Runs the runner's isolation checks on the workspace and the prompt. If
+   one fails, the run ends as `invalid` before the adapter is called, so
+   nothing reaches the agent and nothing is spent.
+3. Calls the adapter with `evals/runner/prompt.md`:
    - It's one neutral text for every condition. Only the brief's filename
      is filled in.
    - A test scans it with the starter's leak list (`evals/starter/src/leaks.ts`).
-3. Copies all of `src/`, and every other file the generator added or
+4. Copies all of `src/`, and every other file the generator added or
    changed, into the results. It never edits them. Links are recorded,
-   never copied.
-4. Runs `pnpm build`. A failed build is a brief-completion failure: it's
-   recorded, never fixed, and the run ends there.
-5. Serves the build with the workspace's own `vite preview`. This uses
-   `evals/starter/src/preview.ts`, shared with the proof.
-6. Runs the shared behavior tests in all four projects. It saves a JSON
+   never copied. This happens even when generation failed, so a partial
+   output can be diagnosed. Then the run ends, unscored:
+   - as `invalid` if an isolation check failed
+   - as `error` if generation failed (a crash, timeout, budget stop or
+     error result)
+5. Runs `pnpm build`, confined (see "Build and preview"). A failed build is
+   a brief-completion failure: it's recorded, never fixed, and the run
+   ends there.
+6. Serves the build with the workspace's own `vite preview`, confined the
+   same way. This uses `evals/starter/src/preview.ts`, shared with the
+   proof.
+7. Runs the shared behavior tests in all four projects. It saves a JSON
    report and the touch-target evidence.
-7. Takes full-page screenshots of the six states in all four projects
+8. Takes full-page screenshots of the six states in all four projects
    (`evals/runner/screenshots/`), with the clock fixed to the fixtures'
    NOW.
    - A PNG is saved only once its state is confirmed by the mock API's log
      and by what renders.
    - A state that can't be reached is recorded with the reason.
-8. Token lint: my-skill only. It isn't built yet, and the manifest says so.
-9. Writes `manifest.json`, then deletes the temp folder. This happens even
-   when a step fails or the run is stopped.
+9. Token lint: my-skill only. It isn't built yet, and the manifest says so.
+10. Writes `manifest.json`, then deletes the temp folder. This happens even
+    when a step fails or the run is stopped.
 
-Statuses:
+Statuses (the CLI exits non-zero for all but `complete`):
 - `complete`: every applicable step ran. The build or tests may still have
   failed.
-- `invalid`: an isolation check failed. Nothing was built or scored.
-- `error`: the runner itself failed.
+- `invalid`: an isolation check failed, before or after generation.
+  Nothing was built or scored.
+- `error`: generation failed, or the runner itself did. Nothing was built
+  or scored.
+
+**Build and preview.** Both run code the generator could have written
+(the build script, the Vite config, the workspace's copy of the mock API)
+outside the generation sandbox. `evals/runner/src/confine.ts` confines
+them:
+- The environment is an explicit allowlist: PATH with only node, pnpm and
+  system folders, a fresh HOME and TMPDIR in `work-*/build/`, LANG and
+  corepack's settings. Nothing else is inherited, so
+  `CLAUDE_CODE_OAUTH_TOKEN` never reaches generated code or its logs.
+- On macOS they run in `sandbox-exec`:
+  - no reads of the owner's home, the temp folders, the repo checkouts or
+    the results, except the workspace, its build state and the node and
+    pnpm installs
+  - writes only to the workspace and its build state
+  - no network beyond localhost, no other process's details, no keychain
+- Elsewhere only the environment is confined, so a live adapter refuses
+  to run there.
+- The manifest records the environment and the sandbox profile.
 
 ### Results
 
@@ -409,6 +439,7 @@ evals/results/            gitignored
 - step timings
 - the isolation report
 - generation outcome, usage and cost
+- how the build and preview were confined
 - summaries of the output, build, tests and screenshots
 - every file, with its size and sha256
 
@@ -441,6 +472,16 @@ prompt on stdin. The CLI is `claude` on PATH, or `CLAUDE_CODE_BIN`.
     temp folder (`/tmp/claude-<uid>`, which holds other sessions' files).
   - It can't write outside the workspace, and has no network except local
     ports.
+  - Every forbidden path (each repo checkout, the results, `~/.claude`)
+    is denied to Bash and the file tools wherever it is, including outside
+    the home and temp folders. Claude Code shows the model its sandbox
+    settings, so a forbidden path is never denied by name. It's covered by
+    the hidden folder that holds it, else by its highest ancestor that
+    holds nothing the session needs (for a checkout in
+    `/private/tmp/review/repo`, that's `/private/tmp/review`, since the
+    session's shell writes into `/tmp/claude-<uid>`). A path that can only
+    be hidden by its own name, such as a checkout directly in `/tmp`, stops
+    the run before the probe.
 - **Environment:** built from scratch. PATH holds only node, pnpm and
   system folders, so no inherited variable carries the repo path.
 - **Auth:** the owner's subscription token from `claude setup-token`.
@@ -454,17 +495,26 @@ Some of these switches aren't in the public docs: `CLAUDE_CODE_TMPDIR`,
 before every real session, a **probe** session runs with the same command,
 settings and workspace against a local stub model, at no cost.
 - The stub makes the probe try to:
-  - read the canary and a repo file
-  - list the repo, the owner's home and the shared temp folder
+  - read the canary
+  - read a file in, glob and list every forbidden path: each repo
+    checkout, the results and `~/.claude` (never a dotfile, where
+    credentials live)
+  - list the owner's home and the shared temp folder
   - write outside the workspace
-  - reach the network
+  - reach the network through the sandbox's proxy, and directly
 - Then it runs node and pnpm and reads a workspace file.
 - Every forbidden attempt must fail and every ordinary step must work, or
   the run stops before any model is called.
+- A network attempt passes only on proof of a denial: the sandbox's own
+  violation report naming the target, or the OS refusing the connection
+  with EPERM. Any HTTP status (even 404 or 500) means the network
+  answered. Any other failure, such as a missing curl, a DNS error or a
+  timeout, proves nothing and fails the check too.
 
 **Isolation checks.** All are recorded in the manifest. Any failure makes
 the run `invalid`.
-- **Runner, for every adapter:**
+- **Runner, for every adapter.** The first two run before the adapter is
+  called:
   - The workspace is outside the repo and the results.
   - Its path, the prompt, and every workspace file except the condition's
     guidance carry no leak words, owner copy or repo path.

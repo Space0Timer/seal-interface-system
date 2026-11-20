@@ -4,6 +4,11 @@
 // everything in evals/results/<run-id>/. The temp workspace is deleted
 // afterwards, also when a step fails.
 //
+// The run stops before the adapter is called if the workspace or prompt
+// fails an isolation check, and before the build if generation failed or
+// the session wasn't isolated. The build and the preview server run the
+// generated code confined (see confine.ts).
+//
 // Agent-independent: everything agent-specific is in the adapter.
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -13,8 +18,10 @@ import { dirname, join, resolve } from 'node:path';
 import type { Adapter, GenerateResult, IsolationCheck } from '../../adapters/types.ts';
 import { materialize, REPO } from '../../starter/src/materialize.ts';
 import { startPreview, type Preview } from '../../starter/src/preview.ts';
+import { toolchain } from '../../starter/src/toolchain.ts';
 import { checkOutside, checkPrompt, checkWorkspacePath, scanWorkspace } from './checks.ts';
 import { conditionNamed } from './conditions.ts';
+import { confine, sandboxAvailable, type ConfinementRecord } from './confine.ts';
 import { copyFiles, diff, hashEntry, hashTree, sha256, snapshot, walk } from './files.ts';
 import { PROMPT_FILE, renderPrompt } from './prompt.ts';
 import { summarizeReport, type TestSummary } from './report.ts';
@@ -50,6 +57,11 @@ export interface RunOptions {
   signal?: AbortSignal | undefined;
 }
 
+/**
+ * complete: every step ran (a failed build or failing tests are results, not errors).
+ * invalid: an isolation check failed, so the output says nothing about the condition.
+ * error: the run couldn't finish, for example because generation failed.
+ */
 export type RunStatus = 'complete' | 'invalid' | 'error';
 
 export interface Step {
@@ -76,6 +88,8 @@ export interface Manifest {
   timings: Record<string, Step>;
   isolation: { ok: boolean; checks: IsolationCheck[]; settings?: Record<string, unknown> | undefined };
   generation: Omit<GenerateResult, 'isolation' | 'settings'> | null;
+  /** How the build and the preview server were confined. */
+  confinement: ConfinementRecord | null;
   output: { dir: string; copied: string[]; added: string[]; changed: string[]; deleted: string[]; links: Array<{ path: string; target: string }> } | null;
   /** Brief completion: a failed build is recorded, never fixed. */
   build: { ok: boolean; exitCode: number | null; log: string } | null;
@@ -157,6 +171,9 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
   if (effort && !EFFORTS.includes(effort)) throw new Error(`effort must be one of ${EFFORTS.join(', ')}`);
   if (adapter.live && !model) throw new Error(`the ${adapter.name} adapter calls a model: pass an exact model ID`);
   if (adapter.live && !(maxBudgetUsd && maxBudgetUsd > 0)) throw new Error(`the ${adapter.name} adapter calls a model: pass a spending cap`);
+  if (adapter.live && !sandboxAvailable()) {
+    throw new Error(`the ${adapter.name} adapter's output can only be built and served inside sandbox-exec, which needs macOS`);
+  }
   const briefPath = join(REPO, 'evals', 'briefs', `${brief}.md`);
   if (!existsSync(briefPath)) throw new Error(`no brief named "${brief}"`);
   const prompt = renderPrompt(brief);
@@ -195,6 +212,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     timings: {},
     isolation: { ok: false, checks: [] },
     generation: null,
+    confinement: null,
     output: null,
     build: null,
     preview: null,
@@ -215,7 +233,14 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     }
   };
 
-  // The temp folder: the workspace, a canary just outside it, and the adapter's private state.
+  const invalid = (checks: IsolationCheck[], settings?: Record<string, unknown>) => {
+    manifest.isolation = { ok: false, checks, settings };
+    manifest.status = 'invalid';
+    manifest.error = `isolation failed: ${checks.filter((c) => !c.ok).map((c) => c.id).join(', ')}`;
+    return manifest;
+  };
+
+  // The temp folder: the workspace, a canary just outside it, the adapter's private state and the build's.
   const scratch = mkdtempSync(join(realpathSync(tmpdir()), 'work-'));
   const workspace = join(scratch, 'app');
   manifest.workspace = workspace;
@@ -241,6 +266,8 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
       checkPrompt(prompt, forbiddenPaths),
       scanWorkspace(workspace, { guidanceDir: skillDir, forbiddenPaths }),
     ];
+    // Nothing reaches the adapter, and nothing is spent, unless these pass.
+    if (!checks.every((c) => c.ok)) return invalid(checks);
     const before = snapshot(workspace, SNAPSHOT_SKIP);
 
     // 2. Generate.
@@ -279,21 +306,33 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
       detail: carried.length ? `the canary's token is in ${carried.join(', ')}` : 'the canary token is in no file the generator wrote',
     });
     checks.push(...adapterChecks);
-    manifest.isolation = { ok: checks.every((c) => c.ok), checks, settings };
-    if (!manifest.isolation.ok) {
-      manifest.status = 'invalid';
-      manifest.error = `isolation failed: ${checks.filter((c) => !c.ok).map((c) => c.id).join(', ')}`;
+    if (!checks.every((c) => c.ok)) return invalid(checks, settings);
+    manifest.isolation = { ok: true, checks, settings };
+    // A session that crashed, timed out or hit its budget is not scored. Its partial output is kept above.
+    if (!generation.ok) {
+      manifest.status = 'error';
+      manifest.error = `generation failed: ${generation.error ?? `the ${adapter.name} adapter gave no reason`}`;
       return manifest;
     }
 
+    // The generated code runs only confined from here on: no inherited credentials, no host files, no network.
+    const confinement = confine({
+      workspace,
+      stateDir: join(scratch, 'build'),
+      hidden: [realpathSync(homedir()), realpathSync(tmpdir()), ...(existsSync('/tmp') ? [realpathSync('/tmp')] : []), ...forbiddenPaths],
+      toolchain: toolchain(),
+    });
+    manifest.confinement = confinement.record;
+
     // 4. Build. A failure is a brief-completion failure, recorded and never fixed.
     const buildLog = join(out, 'build.log');
-    const buildCode = await step('build', () => runLogged('pnpm', ['build'], { cwd: workspace, logFile: buildLog, signal }));
+    const [buildCommand, buildArgs] = confinement.wrap('pnpm', ['build']);
+    const buildCode = await step('build', () => runLogged(buildCommand, buildArgs, { cwd: workspace, env: confinement.env, logFile: buildLog, signal }));
     manifest.build = { ok: buildCode === 0, exitCode: buildCode, log: 'build.log' };
 
     if (manifest.build.ok) {
       // 5. Serve the build with this workspace's own preview server.
-      const preview = await step('serve', () => startPreview(workspace));
+      const preview = await step('serve', () => startPreview(workspace, { launch: confinement }));
       server = preview;
       manifest.preview = { url: preview.url, log: 'preview.log' };
       const serverAlive = (when: string) => {

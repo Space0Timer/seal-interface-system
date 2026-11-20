@@ -18,6 +18,11 @@
 //   the canary and Claude Code's shared temp folder, which holds other
 //   sessions' files), can't write outside the workspace, and has no network
 //   except binding local ports.
+// - Every forbidden path (each repo checkout, the results, ~/.claude) is
+//   denied to the file tools and to the sandbox wherever it is: a checkout
+//   outside the home folder is no less forbidden. Claude Code shows the model
+//   its sandbox settings, so the deny names a folder that covers the path
+//   without naming it (see sandboxCover).
 // - Bundled skills and built-in plugins are off, so a plain session lists
 //   no skill the model can use.
 // - The environment is built from scratch: no inherited variable can carry
@@ -48,6 +53,14 @@ export interface InvocationInput {
    * other sessions' files.
    */
   hiddenRoots: string[];
+  /**
+   * Claude Code's shared temp folder (/tmp/claude-<uid>). It's hidden from
+   * reads, but the session's shell still writes its working-directory file
+   * there, so no cover may take in the folder around it.
+   */
+  agentTemp: string;
+  /** Paths the session must never reach (each repo checkout, the results, ~/.claude), wherever they are. */
+  forbidden: string[];
   /** Folders the sandbox must still read (the Node and pnpm installs, which may live under the real home). */
   toolRoots: string[];
   /** PATH entries for node and pnpm. */
@@ -77,14 +90,53 @@ export function sessionPaths(stateDir: string) {
   return { home, config: join(home, '.claude'), tmp: join(stateDir, 'tmp'), agentTmp: join(stateDir, 'agent-tmp') };
 }
 
+const inside = (path: string, dir: string) => path === dir || path.startsWith(`${dir}/`);
+
+/**
+ * The folders to deny so every forbidden path is hidden without being
+ * named. Claude Code puts its sandbox settings, Read deny rules included, in
+ * the system prompt, so denying a repo checkout by name would tell the model
+ * where it is and what it's called. A forbidden path is covered by the
+ * hidden root that holds it, else by its highest ancestor that holds
+ * nothing the session needs: for a checkout in /private/tmp/review/repo,
+ * that's /private/tmp. Only a path with no such ancestor is denied by name,
+ * and the probe's first-request check then fails the run.
+ */
+export function sandboxCover(forbidden: string[], hiddenRoots: string[], needed: string[]): string[] {
+  const covers: string[] = [];
+  for (const path of forbidden) {
+    const covering = [...hiddenRoots, ...covers].find((root) => inside(path, root));
+    if (covering) {
+      covers.push(covering);
+      continue;
+    }
+    const parts = path.split('/').filter(Boolean);
+    const ancestors = parts.map((_, i) => `/${parts.slice(0, i + 1).join('/')}`);
+    covers.push(ancestors.find((dir) => !needed.some((n) => inside(n, dir))) ?? path);
+  }
+  return [...new Set(covers)];
+}
+
+const needed = (input: InvocationInput) => [input.workspace, input.stateDir, input.agentTemp, ...input.toolRoots];
+
+/** What this session's settings deny to hide its forbidden paths. */
+export function coverFor(input: InvocationInput): string[] {
+  return sandboxCover(input.forbidden, input.hiddenRoots, needed(input));
+}
+
 export function buildSettings(input: InvocationInput): Record<string, unknown> {
-  const { workspace, scratch, canaryDir, hiddenRoots, toolRoots } = input;
+  const { scratch, canaryDir, hiddenRoots, workspace, toolRoots } = input;
+  const cover = coverFor(input);
+  // A permission rule can't re-allow a folder inside the one it denies, as the sandbox's allowRead does. So the
+  // file tools get explicit rules only for covers that hold nothing the session needs; the hidden roots that hold
+  // the workspace or the toolchain are kept from them by blockReadsOutsideWorkingDirectories.
+  const fileToolCover = cover.filter((dir) => !needed(input).some((n) => inside(n, dir)));
   return {
     permissions: {
       defaultMode: 'dontAsk',
       allow: ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash', 'Skill'],
-      // "//" starts an absolute path in a permission rule.
-      deny: ['WebFetch', 'WebSearch', 'Agent', 'NotebookEdit', `Read(/${canaryDir}/**)`, `Edit(/${canaryDir}/**)`],
+      // "//" starts an absolute path in a permission rule. Read rules also cover Glob and Grep.
+      deny: ['WebFetch', 'WebSearch', 'Agent', 'NotebookEdit', ...[canaryDir, ...fileToolCover].flatMap((dir) => [`Read(/${dir}/**)`, `Edit(/${dir}/**)`])],
       blockReadsOutsideWorkingDirectories: true,
       blockWritesOutsideWorkingDirectories: true,
     },
@@ -94,7 +146,7 @@ export function buildSettings(input: InvocationInput): Record<string, unknown> {
       autoAllowBashIfSandboxed: true,
       allowUnsandboxedCommands: false,
       filesystem: {
-        denyRead: [...hiddenRoots, scratch],
+        denyRead: [...new Set([...hiddenRoots, ...cover, scratch])],
         allowRead: [workspace, input.stateDir, ...toolRoots],
         allowWrite: [input.stateDir],
       },

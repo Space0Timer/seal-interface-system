@@ -1,16 +1,21 @@
 // The runner, end to end, with the fake adapter (no model calls): a full
-// run, a run whose build fails, and a run whose isolation fails. With
+// run, a run whose build fails, runs whose isolation fails before and after
+// generation, a run whose generation fails, and a run whose generated code
+// tries to reach the host during the build and preview. With
 // CLAUDE_CODE_BIN set, the same pipeline also runs the real Claude Code CLI
 // against the local stub model, which costs nothing.
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { claudeCodeAdapter, findClaude } from '../../adapters/claude-code/index.ts';
 import { fakeAdapter } from '../../adapters/fake/index.ts';
+import type { Adapter } from '../../adapters/types.ts';
 import { leakIn } from '../../starter/src/leaks.ts';
 import { REPO } from '../../starter/src/materialize.ts';
+import { sandboxAvailable } from '../src/confine.ts';
 import { renderPrompt } from '../src/prompt.ts';
 import { runEval, type Manifest } from '../src/run.ts';
 
@@ -25,6 +30,17 @@ after(() => {
 });
 const quiet = () => undefined;
 const failed = (m: Manifest) => m.isolation.checks.filter((c) => !c.ok).map((c) => c.id);
+/** Runs fn with one environment variable set, then restores it. */
+async function withEnv<T>(name: string, value: string, fn: () => Promise<T>): Promise<T> {
+  const saved = process.env[name];
+  process.env[name] = value;
+  try {
+    return await fn();
+  } finally {
+    if (saved === undefined) delete process.env[name];
+    else process.env[name] = saved;
+  }
+}
 
 test('the generator prompt is neutral for every brief: no eval words, owner copy, repo path or placeholder', () => {
   for (const file of readdirSync(join(REPO, 'evals', 'briefs'))) {
@@ -64,6 +80,7 @@ test('a full fake run: isolated, built, tested in every project, screenshotted, 
   assert.ok(existsSync(join(out, 'output', 'src', 'App.tsx')), 'all of src/ is kept');
 
   assert.equal(m.build?.ok, true);
+  assert.equal(m.confinement?.sandbox, sandboxAvailable() ? 'sandbox-exec' : 'none');
   assert.match(m.preview?.url ?? '', /^http:\/\/(localhost|127\.0\.0\.1):\d+$/);
   assert.equal(m.tests?.ran, true);
   assert.deepEqual(m.tests?.failures, []);
@@ -102,6 +119,70 @@ test('a run that reads the canary is invalid and goes no further', async () => {
   assert.equal(m.build, null);
   assert.ok(existsSync(join(root, m.runId, 'manifest.json')));
   assert.ok(!existsSync(m.workspace!));
+});
+
+test('a workspace that fails an isolation check stops the run before the adapter is called', async () => {
+  const root = resultsRoot();
+  // A temp folder whose path names the eval, so the workspace path check fails.
+  const flagged = mkdtempSync(join(tmpdir(), 'eval-'));
+  temps.push(flagged);
+  const fake = fakeAdapter();
+  let calls = 0;
+  const spy: Adapter = {
+    ...fake,
+    generate: (...args) => {
+      calls += 1;
+      return fake.generate(...args);
+    },
+  };
+  const m = await withEnv('TMPDIR', flagged, () => runEval({ brief: 'asset-library', condition: 'plain', adapter: spy, resultsRoot: root, log: quiet }));
+  assert.equal(calls, 0, 'the adapter was never called');
+  assert.equal(m.status, 'invalid');
+  assert.deepEqual(failed(m), ['runner.workspace-path-neutral']);
+  assert.equal(m.generation, null);
+  assert.equal(m.output, null);
+  assert.equal(m.build, null);
+  assert.ok(existsSync(join(root, m.runId, 'manifest.json')));
+  assert.ok(!existsSync(m.workspace!));
+});
+
+test('a failed generation ends the run with the adapter\'s error: partial output kept, nothing built or scored', async () => {
+  const root = resultsRoot();
+  const m = await runEval({ brief: 'asset-library', condition: 'plain', adapter: fakeAdapter('timeout'), resultsRoot: root, log: quiet });
+  assert.equal(m.status, 'error');
+  assert.equal(m.error, 'generation failed: the session timed out');
+  assert.equal(m.isolation.ok, true);
+  assert.equal(m.generation?.ok, false);
+  assert.ok(existsSync(join(root, m.runId, 'output', 'main.ts')), 'the partial output is kept for diagnosis');
+  assert.equal(m.build, null);
+  assert.equal(m.tests, null);
+  assert.equal(m.screenshots, null);
+  assert.ok(!existsSync(m.workspace!));
+});
+
+test('the build and the preview server run confined: no inherited credential, home folder or host file', async () => {
+  const root = resultsRoot();
+  const token = `test-token-${randomBytes(8).toString('hex')}`;
+  const m = await withEnv('CLAUDE_CODE_OAUTH_TOKEN', token, () =>
+    runEval({ brief: 'asset-library', condition: 'plain', adapter: fakeAdapter('snoop'), projects: ['desktop-light'], resultsRoot: root, log: quiet }),
+  );
+  assert.equal(m.status, 'complete', m.error ?? 'no error');
+  assert.deepEqual(m.tests?.failures, []);
+  const sandboxed = sandboxAvailable();
+  const buildHome = join(dirname(m.workspace!), 'build', 'home');
+  for (const log of ['build.log', 'preview.log']) {
+    const text = readFileSync(join(root, m.runId, log), 'utf8');
+    assert.match(text, /snoop token: unset/, log);
+    assert.ok(!text.includes(token), `${log} never sees the token`);
+    const env = /snoop env: (.*)/.exec(text)?.[1]?.split(',') ?? [];
+    assert.ok(env.includes('HOME') && !env.some((name) => name.startsWith('CLAUDE')), `${log}: ${env.join(', ')}`);
+    assert.ok(text.includes(`snoop home: ${buildHome}`), `${log} runs with a fresh home`);
+    if (sandboxed) {
+      assert.match(text, /snoop canary: EPERM/, log);
+      assert.match(text, /snoop repo: EPERM/, log);
+    }
+  }
+  assert.ok(!readFileSync(join(root, m.runId, 'manifest.json'), 'utf8').includes(token));
 });
 
 test('the my-skill hook: the skill lands where the adapter says, with its hash; the starter is unchanged', async () => {
