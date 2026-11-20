@@ -63,19 +63,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const [from, to] = process.argv.slice(1);
 const out = { copied: [], links: [], refused: [] };
-const finish = (missing) => {
-  out.copied.sort();
-  out.links.sort((a, b) => (a.path < b.path ? -1 : 1));
-  out.refused.sort((a, b) => (a.path < b.path ? -1 : 1));
-  process.stdout.write(JSON.stringify(missing ? { missing, ...out } : out));
-  process.exit(0);
-};
 const reason = (error) => (error && error.code) || String(error);
-let top;
-try {
-  top = fs.lstatSync(from);
-} catch {}
-if (!top || !top.isDirectory()) finish('the build wrote no dist/ folder');
 const copyFile = (rel) => {
   let fd;
   try {
@@ -115,8 +103,21 @@ const visit = (rel, depth) => {
     else out.refused.push({ path: child, reason: 'not a regular file' });
   }
 };
-visit('', 0);
-finish(out.copied.includes('index.html') ? undefined : 'the build wrote no dist/index.html');
+const copyAll = () => {
+  let top;
+  try {
+    top = fs.lstatSync(from);
+  } catch {}
+  if (!top || !top.isDirectory()) return 'the build wrote no dist/ folder';
+  visit('', 0);
+  return out.copied.includes('index.html') ? undefined : 'the build wrote no dist/index.html';
+};
+const missing = copyAll();
+out.copied.sort();
+out.links.sort((a, b) => (a.path < b.path ? -1 : 1));
+out.refused.sort((a, b) => (a.path < b.path ? -1 : 1));
+// No process.exit: a report larger than the pipe's buffer is still being written. Node exits once it's flushed.
+process.stdout.write(JSON.stringify(missing ? { missing, ...out } : out));
 `;
 
 /** Copies dist into root, which must not exist yet, with the confined helper. */

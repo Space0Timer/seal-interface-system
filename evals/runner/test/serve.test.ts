@@ -62,6 +62,19 @@ test('a build is copied without its links, served from the copy, and backed by t
   }
 });
 
+test('a build with thousands of files is copied whole, though its report is larger than a pipe holds', () => {
+  const dist = join(root, 'large', 'dist');
+  mkdirSync(join(dist, 'assets'), { recursive: true });
+  writeFileSync(join(dist, 'index.html'), '<!doctype html>');
+  const names = Array.from({ length: 6000 }, (_, i) => `assets/chunk-${String(i).padStart(4, '0')}-a1b2c3d4.js`);
+  for (const name of names) writeFileSync(join(dist, name), '');
+  const built = copy(dist, join(root, 'served-large'));
+  assert.ok(JSON.stringify(built).length > 2 * 65_536, 'the report is well past a 64 KB pipe buffer');
+  assert.equal(built.missing, undefined);
+  assert.equal(built.copied.length, names.length + 1);
+  assert.deepEqual(readdirSync(join(root, 'served-large', 'assets')).length, names.length);
+});
+
 test('a build with no dist/index.html, or a dist/ that is a link, has nothing to serve', () => {
   const empty = join(root, 'empty', 'dist');
   mkdirSync(empty, { recursive: true });
