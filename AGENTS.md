@@ -376,6 +376,8 @@ Each run:
      it opened. Links and anything it refuses are recorded in the
      manifest, never copied or followed. It also takes the snapshot the
      added and changed files are found from.
+   - The checks that follow read the copy. If the copy refused anything,
+     they can't cover the whole output, so the run ends as `invalid`.
    - From here on the runner never reads or changes the workspace with its
      own permissions, so a process the session left running that swaps a
      file or folder for a link mid-copy gets nothing from the host.
@@ -557,17 +559,26 @@ prompt on stdin. The CLI is `claude` on PATH, or `CLAUDE_CODE_BIN`.
 - **Environment:** built from scratch. PATH holds only node, pnpm and
   system folders, so no inherited variable carries the repo path.
 - **Stopped when it ends:** when the CLI exits, after the probe or the
-  session, everything it started is stopped
+  session, the time limit stops applying and everything the session
+  started is stopped, with a deadline of its own
   (`evals/adapters/claude-code/leftovers.ts`):
   - The CLI's process group is killed.
   - Claude Code runs each Bash command in a process group of its own, so
     a background process outlives the CLI. The adapter also kills every
-    process whose environment has the session's HOME, or whose working
-    folder is in the workspace or that HOME, and looks again until none
-    is left. `ps -E` shows no environment for Apple's own binaries, such
-    as `sh` and `sleep`, but lsof shows their working folders.
-  - A process that drops that HOME and leaves those folders isn't found.
-    The runner's confined copy and delete don't rely on this.
+    process shown to be the session's, with its process group, and looks
+    again until none is left. A process is the session's if its
+    environment, not its arguments, sets the session's HOME, or if its
+    parent or process group is the session's. A process group never spans
+    sessions, and the CLI starts in a session of its own.
+  - `ps -E` shows no environment for Apple's own binaries, such as `sh`
+    and `sleep`, so one of those is the session's only through its parent
+    or group. A process working in the workspace or that HOME that can't
+    be shown to be the session's, such as a shell someone opened there,
+    is left running and fails the check below. lsof shows the working
+    folders.
+  - A process that drops that HOME, leaves the session's groups and leaves
+    those folders isn't found. The runner's confined copy and delete don't
+    rely on this.
   - Output isn't waited for past a few seconds after that.
 - **Auth:** the owner's subscription token from `claude setup-token`.
   - The runner reads `CLAUDE_CODE_OAUTH_TOKEN` from the shell that starts
@@ -608,6 +619,7 @@ the run `invalid`.
   - The workspace is outside the repo and the results.
   - Its path, the prompt, and every workspace file except the condition's
     guidance carry no leak words, owner copy or repo path.
+  - The copy of the generator's output refused nothing.
   - No file the generator wrote carries the canary's token.
 - **Init event,** for the probe and the session:
   - the exact model and the fixed tool list
@@ -628,7 +640,8 @@ the run `invalid`.
     attempts are listed, not failed.
   - The canary's token and forbidden paths appear in no tool result.
 - **Leftover processes,** for the probe and the session: nothing it
-  started is still running once it ends. What was stopped is listed.
+  started is still running once it ends, and nothing that can't be shown
+  to be its own is working in its folders. What was stopped is listed.
 
 When Claude Code updates, the probe fails closed on anything new, such as a
 plugin, a skill or a system prompt line. Review it before adding it to an

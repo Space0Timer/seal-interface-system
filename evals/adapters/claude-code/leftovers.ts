@@ -4,82 +4,154 @@
 // running after the CLI exits, still inside the session's sandbox, where it
 // can go on changing the workspace.
 //
-// A process counts as the session's if its environment sets HOME to the
-// session's own, a fresh folder that belongs to this one session, or if its
-// working folder is inside the workspace or that HOME. Every process the
-// session starts inherits the HOME. The working folder is needed too:
+// Only a process shown to be the session's is killed:
+// - Its environment, not its arguments, sets HOME to the session's own. That
+//   folder belongs to this one session, and every process the session starts
+//   inherits it.
+// - Or its parent or its process group is the session's, as the CLI's own
+//   group is. A process group never spans sessions, and the CLI starts in a
+//   session of its own, so no process started elsewhere can join one of the
+//   session's groups.
 // `ps -E` shows no environment for Apple's own binaries, such as sh and
-// sleep, and lsof shows their working folders. A process that drops that
-// HOME and leaves those folders isn't found. macOS only.
+// sleep, so one of those is the session's only through its parent or group.
+// A process working in the workspace or the session's HOME that can't be
+// shown to be the session's is reported and left running: it could be the
+// session's, or a shell someone opened there. macOS only.
 import { execFileSync, spawnSync } from 'node:child_process';
 
 export interface Leftovers {
   /** What was stopped, as `<pid> <command line>`. */
   stopped: string[];
-  /** What was still running after every attempt, in the same form. */
+  /** The session's, but still running after every attempt, in the same form. */
   remaining: string[];
+  /** Working in the workspace or the session's HOME, but not shown to be the session's, so left running. */
+  unverified: string[];
 }
 
+interface Proc {
+  pid: number;
+  ppid: number;
+  pgid: number;
+  command: string;
+}
+
+/** What has been shown to be the session's so far. Kept across rounds, since a parent killed in one round can't vouch for its child in the next. */
+interface Owned {
+  pids: Set<number>;
+  groups: Set<number>;
+}
+
+const CALL = { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 10_000 } as const;
 const inside = (path: string, dir: string) => path === dir || path.startsWith(`${dir}/`);
+const describe = (procs: Iterable<Proc>) => [...procs].map((p) => `${p.pid} ${p.command.slice(0, 200)}`);
+
+/** This user's processes, without their environments. */
+function processTable(uid: string): Map<number, Proc> {
+  const table = new Map<number, Proc>();
+  for (const line of execFileSync('ps', ['-ww', '-U', uid, '-o', 'pid=,ppid=,pgid=,command='], CALL).split('\n')) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s(.*)$/.exec(line);
+    if (match) table.set(Number(match[1]), { pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), command: match[4] ?? '' });
+  }
+  return table;
+}
 
 /**
- * This user's processes that belong to the session, by PID, with their
- * command lines. Environments are only searched, never kept: a live
- * session's environment holds its token.
+ * The processes whose environment sets HOME to home. `ps -E` prints the
+ * environment after the arguments, so only what follows a process's own
+ * command line counts. The environments are only searched, never kept: a
+ * live session's holds its token.
  */
-export function sessionProcesses(home: string, folders: string[]): Map<number, string> {
-  const uid = String(process.getuid?.() ?? '');
+function withHome(uid: string, home: string, table: Map<number, Proc>): Set<number> {
   const found = new Set<number>();
-  const marker = ` HOME=${home}`;
-  const withEnv = execFileSync('ps', ['-ww', '-E', '-U', uid, '-o', 'pid=,command='], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-  for (const line of withEnv.split('\n')) {
-    if (line.includes(`${marker} `) || line.endsWith(marker)) found.add(Number.parseInt(line, 10));
+  for (const line of execFileSync('ps', ['-ww', '-E', '-U', uid, '-o', 'pid=,command='], CALL).split('\n')) {
+    const [, pid = '', shown = ''] = /^\s*(\d+)\s(.*)$/.exec(line) ?? [];
+    const command = table.get(Number(pid))?.command;
+    if (command === undefined || !shown.startsWith(`${command} `)) continue;
+    if (`${shown.slice(command.length)} `.includes(` HOME=${home} `)) found.add(Number(pid));
   }
+  return found;
+}
+
+/** The processes working in one of the folders. lsof shows this for Apple's own binaries too. */
+function workingIn(uid: string, folders: string[]): Set<number> {
   // lsof exits non-zero when it can't read some process's details, so its output is used either way. It always
-  // lists this process, so an empty listing means lsof itself failed.
-  const cwd = spawnSync('lsof', ['-w', '-a', '-u', uid, '-d', 'cwd', '-F', 'pn'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-  if (cwd.error || !cwd.stdout.includes(`p${process.pid}\n`)) throw new Error(`lsof listed no working folders: ${cwd.error?.message ?? cwd.stderr}`);
+  // lists this process, so a listing without it means lsof itself failed.
+  const lsof = spawnSync('lsof', ['-w', '-a', '-u', uid, '-d', 'cwd', '-F', 'pn'], CALL);
+  if (lsof.error || !lsof.stdout.includes(`p${process.pid}\n`)) throw new Error(`lsof listed no working folders: ${lsof.error?.message ?? lsof.stderr}`);
+  const found = new Set<number>();
   let pid = 0;
-  for (const line of cwd.stdout.split('\n')) {
+  for (const line of lsof.stdout.split('\n')) {
     if (line.startsWith('p')) pid = Number(line.slice(1));
     else if (line.startsWith('n') && folders.some((dir) => inside(line.slice(1), dir))) found.add(pid);
   }
-  found.delete(process.pid);
-  const pids = [...found].filter((p) => p > 0);
-  if (!pids.length) return new Map();
-  // The command lines, without the environment. A process that has exited since is left out, and ps then exits non-zero.
-  const listed = spawnSync('ps', ['-ww', '-o', 'pid=,command=', '-p', pids.join(',')], { encoding: 'utf8' }).stdout ?? '';
-  const commands = new Map(
-    listed
-      .split('\n')
-      .map((line) => /^\s*(\d+)\s+(.*)$/.exec(line))
-      .filter((match) => match !== null)
-      .map(([, p = '', command = '']) => [Number(p), command.slice(0, 200)] as const),
-  );
-  return new Map(pids.map((p) => [p, commands.get(p) ?? '']));
+  return found;
+}
+
+/** The session's processes, and the others working in its folders. Adds what it finds to owned. */
+export function sessionProcesses(home: string, folders: string[], owned: Owned): { owned: Map<number, Proc>; unverified: Map<number, Proc> } {
+  const uid = String(process.getuid?.() ?? '');
+  const table = processTable(uid);
+  const self = table.get(process.pid);
+  const ours = new Map<number, Proc>();
+  const claim = (p: Proc) => {
+    // Never this process or its own group.
+    if (p.pid === process.pid || p.pgid === self?.pgid) return false;
+    ours.set(p.pid, p);
+    owned.pids.add(p.pid);
+    owned.groups.add(p.pgid);
+    return true;
+  };
+  for (const pid of withHome(uid, home, table)) {
+    const p = table.get(pid);
+    if (p) claim(p);
+  }
+  for (const p of table.values()) if (owned.pids.has(p.pid)) claim(p);
+  // Children and group members of the session's processes, until nothing new turns up.
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const p of table.values()) {
+      if (!ours.has(p.pid) && (owned.pids.has(p.ppid) || owned.groups.has(p.pgid)) && claim(p)) grew = true;
+    }
+  }
+  const unverified = new Map<number, Proc>();
+  for (const pid of workingIn(uid, folders)) {
+    const p = table.get(pid);
+    if (p && !ours.has(pid) && pid !== process.pid) unverified.set(pid, p);
+  }
+  return { owned: ours, unverified };
 }
 
 /**
- * Kills every process that belongs to the session, and looks again, since
- * one may have started another just before it was killed. Gives up after a
- * few rounds and reports what's left.
+ * Kills the session's processes and their process groups, and looks again,
+ * since one may have started another just before it was killed. Stops after
+ * a few rounds or at the deadline, and reports what's left. groups are
+ * process groups already known to be the session's, such as the CLI's own.
  */
-export async function stopLeftovers(home: string, folders: string[], rounds = 10): Promise<Leftovers> {
-  const stopped = new Map<number, string>();
-  const describe = (entries: Iterable<[number, string]>) => [...entries].map(([pid, command]) => `${pid} ${command}`);
-  for (let round = 0; round < rounds; round++) {
-    const found = sessionProcesses(home, folders);
-    if (!found.size) return { stopped: describe(stopped), remaining: [] };
-    for (const [pid, command] of found) {
+export async function stopLeftovers(
+  home: string,
+  folders: string[],
+  { groups = [], deadline = Date.now() + 30_000, rounds = 10 }: { groups?: number[]; deadline?: number; rounds?: number } = {},
+): Promise<Leftovers> {
+  const owned: Owned = { pids: new Set(), groups: new Set(groups) };
+  const stopped = new Map<number, Proc>();
+  let found = sessionProcesses(home, folders, owned);
+  for (let round = 0; found.owned.size && round < rounds && Date.now() < deadline; round++) {
+    const targets = [...found.owned.keys(), ...[...owned.groups].map((group) => -group)];
+    for (const target of targets) {
       try {
-        process.kill(pid, 'SIGKILL');
+        process.kill(target, 'SIGKILL');
       } catch {
         // Already gone.
       }
-      if (!stopped.has(pid)) stopped.set(pid, command);
     }
+    for (const [pid, p] of found.owned) if (!stopped.has(pid)) stopped.set(pid, p);
     await new Promise((resolve) => setTimeout(resolve, 100));
+    found = sessionProcesses(home, folders, owned);
   }
-  const remaining = sessionProcesses(home, folders);
-  return { stopped: describe([...stopped].filter(([pid]) => !remaining.has(pid))), remaining: describe(remaining) };
+  return {
+    stopped: describe([...stopped.values()].filter((p) => !found.owned.has(p.pid))),
+    remaining: describe(found.owned.values()),
+    unverified: describe(found.unverified.values()),
+  };
 }

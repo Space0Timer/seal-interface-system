@@ -12,6 +12,9 @@
 //                  read the canary and a repo file and prints its environment
 //                  and home folder; and breaks its copy of the mock API, so
 //                  every request to it fails
+//   unreadable     writes the app and leaves a named pipe in src/, which the
+//                  copy of the output can't read
+import { execFileSync } from 'node:child_process';
 import { copyFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,7 +23,7 @@ import type { Adapter, GenerateOptions, GenerateResult } from '../types.ts';
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const CONFORMANCE_APP = join(REPO, 'evals', 'tests', 'conformance-app');
 
-export type FakeVariant = 'conformance' | 'broken-build' | 'leaky' | 'timeout' | 'snoop' | 'unfinished';
+export type FakeVariant = 'conformance' | 'broken-build' | 'leaky' | 'timeout' | 'snoop' | 'unfinished' | 'unreadable';
 
 /** What the snoop variant's Vite config prints, one `snoop <what>: <outcome>` line each. */
 function snoopConfig(canaryFile: string, repoFile: string): string {
@@ -88,6 +91,11 @@ export function fakeAdapter(variant: FakeVariant = 'conformance'): Adapter {
         writeFileSync(join(workspace, 'vite.config.ts'), snoopConfig(options.canary.file, join(REPO, 'package.json')));
         writeFileSync(join(workspace, 'tools', 'mock-api', 'mock-api.ts'), BROKEN_MOCK_API);
         written.push('vite.config.ts', 'tools/mock-api/mock-api.ts');
+      }
+
+      if (variant === 'unreadable') {
+        execFileSync('mkfifo', [join(workspace, 'src', 'events')]);
+        written.push('src/events');
       }
 
       const log = { adapter: 'fake', variant, prompt, written };

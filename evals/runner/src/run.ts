@@ -388,6 +388,15 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     const changes = diff(before, copied.hashes);
     manifest.output = { dir: 'output', copiedIn: outputCopier.sandbox, copied: copied.copied, links: copied.links, refused: copied.refused, ...changes };
 
+    // The checks below read the copy, so they cover the generator's files only if the copy took every one it had
+    // to read. Anything it refused leaves the run unscored, with the refusals kept in the manifest.
+    checks.push({
+      id: 'runner.output-complete',
+      ok: copied.refused.length === 0,
+      detail: copied.refused.length
+        ? `the copy of the output refused ${copied.refused.map((r) => `${r.path} (${r.reason})`).join(', ')}, so the checks on it don't cover the whole output`
+        : 'the copy read every file the generator left',
+    });
     // Neither the canary's token nor the marker's may have travelled into the workspace either.
     const carried = copied.copied.filter((rel) => {
       const text = readFileSync(join(outputDir, rel));

@@ -82,16 +82,17 @@ export interface SessionRun {
   transcript: Transcript;
   exitCode: number | null;
   timedOut: boolean;
-  /** What the session left running when the CLI exited, all of it stopped unless listed as remaining. */
+  /** What the session left running when the CLI exited, and what else was working in its folders. */
   leftovers: Leftovers;
 }
 
 /**
  * Runs one session, streaming its transcript and stderr into the log
- * folder. When the CLI exits, whatever the session left running is
- * stopped: the CLI's process group is killed, and so is every process that
- * belongs to the session (see leftovers.ts). Output still pending a few
- * seconds after that is cut off.
+ * folder. When the CLI exits, the time limit stops applying and whatever
+ * the session left running is stopped, with a deadline of its own: the
+ * CLI's process group is killed, and so is every process shown to be the
+ * session's (see leftovers.ts). Output still pending a few seconds after
+ * that is cut off.
  */
 export function runSession(
   bin: string,
@@ -135,8 +136,6 @@ export function runSession(
     const finish = () => {
       if (finished || !leftovers) return;
       finished = true;
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', kill);
       writeFileSync(files.transcript, stdout);
       writeFileSync(files.stderr, stderr);
       resolvePromise({ transcript: parseTranscript(stdout), exitCode, timedOut, leftovers });
@@ -148,8 +147,12 @@ export function runSession(
     });
     child.once('exit', (code) => {
       exitCode = code;
+      // The session is over, so it can no longer time out, and stopping it isn't interrupted.
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', kill);
       killGroup('SIGKILL');
-      stopLeftovers(home, folders).then(
+      // The CLI started in a session of its own, so its process group is the session's.
+      stopLeftovers(home, folders, { groups: child.pid ? [child.pid] : [], deadline: Date.now() + 30_000 }).then(
         (result) => {
           leftovers = result;
           if (closed) return finish();
@@ -160,8 +163,6 @@ export function runSession(
           }, 5_000).unref();
         },
         (error: unknown) => {
-          clearTimeout(timer);
-          signal?.removeEventListener('abort', kill);
           reject(new Error(`could not stop what the session left running: ${error instanceof Error ? error.message : String(error)}`));
         },
       );
@@ -174,9 +175,13 @@ export function runSession(
   });
 }
 
-/** Nothing the session started is still running. */
-export function checkStopped(id: string, { stopped, remaining }: Leftovers): IsolationCheck {
-  if (remaining.length) return { id, ok: false, detail: `still running after the session ended: ${remaining.join('; ')}` };
+/** Nothing the session started is still running, and nothing else is working in its folders. */
+export function checkStopped(id: string, { stopped, remaining, unverified }: Leftovers): IsolationCheck {
+  const problems = [
+    ...(remaining.length ? [`still running after the session ended: ${remaining.join('; ')}`] : []),
+    ...(unverified.length ? [`working in the workspace or the session's home, but not shown to be the session's, so left running: ${unverified.join('; ')}`] : []),
+  ];
+  if (problems.length) return { id, ok: false, detail: problems.join('. ') };
   return {
     id,
     ok: true,

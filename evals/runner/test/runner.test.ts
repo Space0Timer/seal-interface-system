@@ -1,7 +1,8 @@
 // The runner, end to end, with the fake adapter (no model calls): a full
 // run, a run whose build fails, runs whose isolation fails before and after
-// generation, a run whose generation fails, and a run whose generated code
-// tries to reach the host during the build and preview. With
+// generation, a run whose output can't be copied whole, a run whose
+// generation fails, and a run whose generated code tries to reach the host
+// during the build and preview. With
 // CLAUDE_CODE_BIN set, the same pipeline also runs the real Claude Code CLI
 // against the local stub model, which costs nothing.
 import assert from 'node:assert/strict';
@@ -169,6 +170,18 @@ test('a session that stops early is incomplete: its output is kept, nothing is b
   assert.equal(m.tests, null);
   assert.equal(m.screenshots, null);
   assert.throws(() => exportReview(root, join(root, 'packet'), [m.runId]), /no completed evaluation evidence/);
+  assert.ok(!existsSync(m.workspace!));
+});
+
+test('an output the copy could not read whole is invalid: the refusals are kept, nothing is built or scored', async () => {
+  const root = resultsRoot();
+  const m = await runEval({ brief: 'asset-library', condition: 'plain', adapter: fakeAdapter('unreadable'), resultsRoot: root, log: quiet });
+  assert.equal(m.status, 'invalid');
+  assert.deepEqual(failed(m), ['runner.output-complete']);
+  assert.deepEqual(m.output?.refused, [{ path: 'src/events', reason: 'not a regular file' }]);
+  assert.ok(existsSync(join(root, m.runId, 'output', 'main.ts')), 'what the copy could read is kept');
+  assert.equal(m.build, null);
+  assert.equal(m.tests, null);
   assert.ok(!existsSync(m.workspace!));
 });
 

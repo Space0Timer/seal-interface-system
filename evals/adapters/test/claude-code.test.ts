@@ -8,6 +8,7 @@ import { test } from 'node:test';
 import { leakIn } from '../../starter/src/leaks.ts';
 import {
   checkFirstRequest,
+  checkStopped,
   firstRequestText,
   judgeNetwork,
   judgeProbe,
@@ -359,7 +360,7 @@ test('the stub model replays its script for the session and records what it was 
   }
 });
 
-test('when the CLI exits, nothing the session started is still running, in its process group or in one of its own', { skip: process.platform === 'darwin' ? false : 'reads other processes with macOS ps and lsof' }, async () => {
+test('when the CLI exits, what is shown to be the session\'s is stopped, and only that', { skip: process.platform === 'darwin' ? false : 'reads other processes with macOS ps and lsof' }, async () => {
   const dir = mkdtempSync(join(realpathSync(tmpdir()), 'session-'));
   const home = join(dir, 'home');
   mkdirSync(home);
@@ -371,43 +372,61 @@ test('when the CLI exits, nothing the session started is still running, in its p
       return false;
     }
   };
-  // Starts a command in a new process group, as Claude Code runs each Bash command, holding the CLI's output open.
-  const detached = ([command, ...args]: string[], pidFile: string) =>
-    `node -e 'const c = require("node:child_process").spawn(${JSON.stringify(command)}, ${JSON.stringify(args)}, { detached: true, stdio: ["ignore", "inherit", "ignore"] }); console.error(c.pid); c.unref()' 2> ${pidFile}`;
-  // A stand-in for the CLI, which leaves processes running and exits: one in its own process group, and two in
-  // groups of their own. One of those is an Apple binary, whose environment ps doesn't show, in the workspace; the
-  // other has the session's HOME, but runs elsewhere. A fourth process runs elsewhere with a HOME that only starts
-  // like the session's: it isn't the session's, so it's left running, and the output it holds is cut off.
+  // Starts a command in a new process group, as Claude Code runs each Bash command. With hold, it holds the CLI's
+  // output open.
+  const detached = ([command, ...args]: string[], pidFile: string, hold = false) =>
+    `node -e 'const c = require("node:child_process").spawn(${JSON.stringify(command)}, ${JSON.stringify(args)}, { detached: true, stdio: ["ignore", "${hold ? 'inherit' : 'ignore'}", "ignore"] }); console.error(c.pid); c.unref()' 2> ${pidFile}`;
+  // A process that starts an Apple binary in its own group, whose environment ps doesn't show, and keeps running.
+  const parent = `const c = require("node:child_process").spawn("sleep", ["61"], { stdio: "ignore" }); require("node:fs").writeFileSync(${JSON.stringify(join(dir, 'child.pid'))}, String(c.pid)); setInterval(() => {}, 1000)`;
+  const other = `HOME=${home}-other`;
+  // A stand-in for the CLI, which leaves processes running and exits:
+  // - in-group: in the CLI's own process group
+  // - parent and child: in a group of their own, outside the session's folders. The parent has the session's HOME;
+  //   the child is an Apple binary.
+  // - outside: another HOME that only starts like the session's, outside the session's folders, holding the output
+  //   open. Not the session's, and not in its folders: left alone, and the output it holds is cut off.
+  // - inspecting: another HOME, but working in the workspace, like a shell someone opened there. It can't be shown
+  //   to be the session's, so it's reported and left running.
   const script = [
     'sleep 60 & echo $! > in-group.pid',
-    detached(['sleep', '61'], 'in-workspace.pid'),
-    `cd / && ${detached([process.execPath, '-e', 'setInterval(() => {}, 1000)'], `${dir}/elsewhere.pid`)}`,
-    `HOME=${home}-other ${detached(['sleep', '62'], `${dir}/other.pid`)}`,
+    `${other} ${detached(['sleep', '62'], 'inspecting.pid')}`,
+    `cd / && ${detached([process.execPath, '-e', parent], `${dir}/parent.pid`)}`,
+    `${other} ${detached(['sleep', '63'], `${dir}/outside.pid`, true)}`,
+    `until [ -s ${dir}/child.pid ]; do sleep 0.1; done`,
   ].join('\n');
   const pid = (file: string) => Number(readFileSync(join(dir, file), 'utf8').trim());
   try {
     const started = Date.now();
+    // A time limit the CLI itself stays well within, though the cleanup after it doesn't.
     const run = await runSession(
       '/bin/sh',
       { args: ['-c', script], env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home }, settings: {} },
       dir,
       '',
       { transcript: join(dir, 'transcript.jsonl'), stderr: join(dir, 'stderr.log') },
-      60_000,
+      3_000,
     );
-    assert.ok(Date.now() - started < 8_000, `returned after ${Date.now() - started} ms`);
+    assert.ok(Date.now() - started > 5_000 && Date.now() - started < 10_000, `returned after ${Date.now() - started} ms`);
     assert.equal(run.exitCode, 0);
+    assert.equal(run.timedOut, false, 'the time limit stops applying when the CLI exits');
     assert.deepEqual(run.leftovers.remaining, []);
-    const gone = ['in-group.pid', 'in-workspace.pid', 'elsewhere.pid'].map(pid);
-    for (const p of gone.slice(1)) assert.ok(run.leftovers.stopped.some((s) => s.startsWith(`${p} `)), `${p} in ${run.leftovers.stopped.join('; ')}`);
+    for (const p of [pid('parent.pid'), pid('child.pid')]) assert.ok(run.leftovers.stopped.some((s) => s.startsWith(`${p} `)), `${p} in ${run.leftovers.stopped.join('; ')}`);
+    assert.deepEqual(run.leftovers.unverified, [`${pid('inspecting.pid')} sleep 62`]);
+    const gone = ['in-group.pid', 'parent.pid', 'child.pid'].map(pid);
     for (let i = 0; i < 20 && gone.some(alive); i++) await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.deepEqual(gone.filter(alive), [], 'nothing the session started is still running');
-    assert.equal(alive(pid('other.pid')), true, 'a process that is not the session\'s is left alone');
+    assert.deepEqual(gone.filter(alive), [], 'nothing shown to be the session\'s is still running');
+    assert.equal(alive(pid('inspecting.pid')), true, 'a process that is not shown to be the session\'s is left running');
+    assert.equal(alive(pid('outside.pid')), true, 'a process that is not the session\'s is left alone');
+    const check = checkStopped('claude-code.session-stopped', run.leftovers);
+    assert.equal(check.ok, false, 'a process working in the workspace that may be the session\'s fails the check');
+    assert.match(check.detail, /not shown to be the session's, so left running: \d+ sleep 62/);
   } finally {
-    try {
-      process.kill(pid('other.pid'), 'SIGKILL');
-    } catch {
-      // Already gone.
+    for (const file of ['inspecting.pid', 'outside.pid']) {
+      try {
+        process.kill(pid(file), 'SIGKILL');
+      } catch {
+        // Already gone.
+      }
     }
     rmSync(dir, { recursive: true, force: true });
   }
