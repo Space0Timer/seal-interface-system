@@ -52,7 +52,11 @@ export interface RunOptions {
   signal?: AbortSignal | undefined;
 }
 
-export type RunStatus = 'complete' | 'invalid' | 'error';
+/**
+ * complete: every applicable step ran. invalid: an isolation check failed.
+ * incomplete: the generation session didn't finish. error: the runner failed.
+ */
+export type RunStatus = 'complete' | 'invalid' | 'incomplete' | 'error';
 
 export interface Step {
   startedAt: string;
@@ -311,7 +315,15 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
       manifest.error = `isolation failed: ${checks.filter((c) => !c.ok).map((c) => c.id).join(', ')}`;
       return manifest;
     }
-    if (!generation.ok) throw new Error(generation.error ?? 'the generation session did not complete');
+    // A session that stopped early (budget, time limit, error result) left
+    // unfinished work. It's recorded, with its output copied above, but not
+    // built or scored. Stopping the run itself is a runner error instead.
+    if (!generation.ok) {
+      if (signal?.aborted) throw new Error('the run was aborted');
+      manifest.status = 'incomplete';
+      manifest.error = generation.error ?? 'the generation session did not finish';
+      return manifest;
+    }
 
     // 4. Build. A failure is a brief-completion failure, recorded and never fixed.
     const buildLog = join(out, 'build.log');

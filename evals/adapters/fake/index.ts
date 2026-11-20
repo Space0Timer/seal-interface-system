@@ -6,6 +6,7 @@
 // Variants exist only for the runner's own tests:
 //   broken-build   writes a type error into src/, so `pnpm build` fails
 //   leaky          reads the canary, so the isolation checks fail
+//   unfinished     writes the app, then reports that the session stopped early
 import { copyFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +15,7 @@ import type { Adapter, GenerateOptions, GenerateResult } from '../types.ts';
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const CONFORMANCE_APP = join(REPO, 'evals', 'tests', 'conformance-app');
 
-export type FakeVariant = 'conformance' | 'broken-build' | 'leaky';
+export type FakeVariant = 'conformance' | 'broken-build' | 'leaky' | 'unfinished';
 
 export function fakeAdapter(variant: FakeVariant = 'conformance'): Adapter {
   return {
@@ -40,7 +41,8 @@ export function fakeAdapter(variant: FakeVariant = 'conformance'): Adapter {
       const log = { adapter: 'fake', variant, prompt, written };
       writeFileSync(join(options.logDir, 'fake.json'), `${JSON.stringify(log, null, 2)}\n`);
       return {
-        ok: true,
+        ok: variant !== 'unfinished',
+        error: variant === 'unfinished' ? 'the session ended with error_max_budget_usd' : undefined,
         logs: ['fake.json'],
         isolation: [
           { id: 'fake.writes-inside-workspace', ok: true, detail: `wrote only ${written.join(', ')} inside the workspace` },

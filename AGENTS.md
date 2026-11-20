@@ -384,6 +384,10 @@ Each run:
 8. Runs the repo's CSS token and product-code lint rules for my-skill.
    Findings describe authored code. The rubric also checks how the
    rendered app uses semantic roles.
+   - Disable and config comments in the authored code have no effect.
+     Stylelint ignores its own; scripts are linted from copies where
+     `eslint-disable`, `oxlint-disable` and `/* eslint … */` comments are
+     made inert. `token-lint.json` lists them under `ignoredDirectives`.
 9. Writes `manifest.json`, then deletes the temp folder. This happens even
    when a step fails or the run is stopped.
 
@@ -391,8 +395,12 @@ Statuses:
 - `complete`: every applicable step ran. The build or tests may still have
   failed.
 - `invalid`: an isolation check failed. Nothing was built or scored.
+- `incomplete`: the generation session stopped early: a budget stop, the
+  time limit, or an error result. Its output is copied for inspection, but
+  nothing is built or scored, and it can't be exported for review.
 - `error`: the runner itself failed, including when a Playwright command
-  produces no report or has a global execution error.
+  produces no report or has a global execution error, or when the run is
+  stopped.
 
 ### Results
 

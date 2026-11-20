@@ -112,3 +112,32 @@ test('token lint reports authored CSS and code violations under the trusted rule
   assert.match(details, /ds\/no-inline-style/);
   assert.match(details, /ds\/no-raw-color/);
 });
+
+test('token lint ignores disable and config comments in the scripts it checks, and keeps their lines', async (t) => {
+  const root = scratch(t);
+  const output = join(root, 'output');
+  mkdirSync(join(output, 'src'), { recursive: true });
+  const file = 'src/Screen.tsx';
+  writeFileSync(
+    join(output, file),
+    [
+      '/* eslint-disable */',
+      '/* eslint ds/no-raw-color: off */',
+      '// oxlint-disable-next-line ds/no-inline-style',
+      'export const a = <h1 style={{ color: "#fff" }}>Assets</h1>;',
+      '// eslint-disable-next-line',
+      'export const b = <h2 style={{ color: "#000" }}>Uploads</h2>;',
+    ].join('\n'),
+  );
+  const result = await lintTokens(output, [file], output, root, '.claude/skills/design-system');
+  assert.equal(result.status, 'failed');
+  const report = JSON.parse(readFileSync(join(output, 'token-lint.json'), 'utf8')) as {
+    findings: Array<{ rule: string; line?: number }>;
+    ignoredDirectives: Array<{ file: string; count: number }>;
+  };
+  const found = (rule: string) => report.findings.filter((f) => f.rule === rule).map((f) => f.line).sort();
+  assert.deepEqual(found('ds/no-inline-style'), [4, 6]);
+  assert.deepEqual(found('ds/no-raw-color'), [4, 6]);
+  assert.deepEqual(report.ignoredDirectives, [{ file, count: 4 }]);
+  assert.match(readFileSync(join(output, file), 'utf8'), /eslint-disable-next-line/, 'the authored file is never changed');
+});

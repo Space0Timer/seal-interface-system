@@ -114,6 +114,21 @@ sandboxTest('a run that reads the canary is invalid and goes no further', async 
   assert.ok(!existsSync(m.workspace!));
 });
 
+sandboxTest('a session that stops early is incomplete: its output is kept, nothing is built or scored', async () => {
+  const root = resultsRoot();
+  const m = await runEval({ brief: 'asset-library', condition: 'plain', adapter: fakeAdapter('unfinished'), resultsRoot: root, log: quiet });
+  assert.equal(m.status, 'incomplete');
+  assert.match(m.error ?? '', /error_max_budget_usd/);
+  assert.equal(m.isolation.ok, true);
+  assert.equal(m.generation?.ok, false);
+  assert.ok(existsSync(join(root, m.runId, 'output', 'main.ts')), 'the unfinished output is kept for inspection');
+  assert.equal(m.build, null);
+  assert.equal(m.tests, null);
+  assert.equal(m.screenshots, null);
+  assert.throws(() => exportReview(root, join(root, 'packet'), [m.runId]), /no completed evaluation evidence/);
+  assert.ok(!existsSync(m.workspace!));
+});
+
 sandboxTest('each skill lands in the assigned project directory with its hash and the same starter', async () => {
   const root = resultsRoot();
   const plain = await runEval({ brief: 'asset-library', condition: 'plain', adapter: fakeAdapter('broken-build'), resultsRoot: root, log: quiet });
