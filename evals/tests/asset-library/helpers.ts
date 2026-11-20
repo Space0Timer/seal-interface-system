@@ -18,6 +18,7 @@ import {
 } from '../../fixtures/src/data.ts';
 import { writeUploadFiles } from '../../fixtures/src/files.ts';
 import type { LogEntry } from '../../fixtures/src/mock-api.ts';
+import { mockControlHeaders } from '../mock-admin.ts';
 
 export const uploadFiles = writeUploadFiles(join(tmpdir(), 'ds-eval-upload-files'));
 export const DEFAULT_NAMES = DEFAULT_ASSETS.map((a) => a.filename);
@@ -34,13 +35,14 @@ export interface OpenOptions {
 /** Fixes the clock, starts a fresh mock session in this browser context, and opens the app. */
 export async function openLibrary(page: Page, scenario: Scenario, options: OpenOptions = {}): Promise<void> {
   await page.clock.setFixedTime(new Date(NOW));
-  const res = await page.request.post('/__mock/reset', { data: { scenario } });
+  const res = await page.request.post('/__mock/reset', { data: { scenario }, headers: mockControlHeaders() });
   expect(res.ok(), 'mock reset failed').toBe(true);
   await page.goto(options.path ?? '/');
 }
 
 export async function mockLog(page: Page): Promise<LogEntry[]> {
-  const res = await page.request.get('/__mock/log');
+  const res = await page.request.get('/__mock/log', { headers: mockControlHeaders() });
+  expect(res.ok(), 'mock log could not be read').toBe(true);
   return ((await res.json()) as { entries: LogEntry[] }).entries;
 }
 
@@ -916,8 +918,8 @@ export async function checkLargeLibrary(page: Page, options: OpenOptions = {}): 
 }
 
 /**
- * Searching "invoice" finds both invoices, which sit beyond any small first
- * page, following result pages if needed, and no page shows anything else.
+ * Searching "invoice" finds exactly both invoices, following result pages
+ * when the initial result page holds fewer matches.
  */
 export async function checkSearchFinds(page: Page, options: OpenOptions = {}): Promise<void> {
   await openLibrary(page, 'default', options);
@@ -938,6 +940,18 @@ export async function checkSearchFinds(page: Page, options: OpenOptions = {}): P
     if (found.size === expected.length || !(await loadMore(page, DEFAULT_NAMES))) break;
   }
   expect([...found].sort(), 'matches found for "invoice"').toEqual([...expected].sort());
+}
+
+/** Exercise a match the app has not received in the startup pages. */
+export async function checkWholeLibrarySearch(page: Page, options: OpenOptions = {}): Promise<void> {
+  await openLibrary(page, 'large', options);
+  await expect.poll(async () => (await visibleItems(page, LARGE_SCAN)).length, { message: 'large library renders' }).toBeGreaterThan(0);
+  const fetched = new Set((await mockLog(page)).flatMap((entry) => entry.returnedIds ?? []));
+  const target = assetsFor('large').findLast((asset) => !fetched.has(asset.id));
+  expect(target, 'a fixture must remain unfetched at search time').toBeDefined();
+  if (!target) return;
+  await searchField(page).fill(target.filename);
+  await expect(libraryItem(page, target.filename), 'search finds an asset absent from all pages fetched before searching').toBeVisible();
 }
 
 /**

@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url';
 
 export default {
   plugins: ['./packages/lint/stylelint-token-values.js'],
-  ignoreFiles: ['**/node_modules/**', '**/dist/**', '**/storybook-static/**', '**/playwright-report/**'],
+  // evals/results/ holds generators' output, which is linted per run with
+  // the run's own rules, never by the repo's check.
+  ignoreFiles: ['**/node_modules/**', '**/dist/**', '**/storybook-static/**', '**/playwright-report/**', 'evals/results/**'],
   rules: {
     'ds/token-values': [
       true,

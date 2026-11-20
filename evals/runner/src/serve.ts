@@ -15,13 +15,14 @@
 // opens each file without following links and checks the type of what it
 // opened. Links are recorded, never copied or followed, and the server then
 // reads only the runner-owned copy.
+import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createReadStream, existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { extname, join, normalize, sep } from 'node:path';
 import { createMockApi } from '../../fixtures/src/mock-api.ts';
-import type { Preview } from '../../starter/src/preview.ts';
+import { MOCK_ADMIN_HEADER } from '../../tests/mock-admin.ts';
 import type { Launch } from './confine.ts';
 
 const TYPES: Record<string, string> = {
@@ -45,6 +46,8 @@ const TYPES: Record<string, string> = {
   '.ttf': 'font/ttf',
   '.otf': 'font/otf',
   '.wasm': 'application/wasm',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
 };
 
 export interface BuildCopy {
@@ -151,13 +154,25 @@ function fileFor(root: string, pathname: string): string | undefined {
  * port. Paths without an extension that match no file get index.html, as
  * Vite's preview does for a single-page app.
  */
-export async function serveBuild(root: string, copy: BuildCopy): Promise<Preview> {
+export async function serveBuild(root: string, copy: BuildCopy) {
   let output = [
     ...copy.links.map((l) => `not served: ${l.path} is a link to ${l.target}\n`),
     ...copy.refused.map((r) => `not served: ${r.path} (${r.reason})\n`),
   ].join('');
   const api = createMockApi();
+  const admin = randomBytes(32).toString('hex');
   const server: Server = createServer((req, res) => {
+    let pathname: string;
+    try {
+      ({ pathname } = new URL(req.url ?? '/', 'http://localhost'));
+    } catch {
+      res.writeHead(400).end();
+      return;
+    }
+    if (pathname.startsWith('/__mock/') && req.headers[MOCK_ADMIN_HEADER] !== admin) {
+      res.writeHead(403).end();
+      return;
+    }
     api(req, res, () => {
       const method = req.method ?? 'GET';
       if (method !== 'GET' && method !== 'HEAD') {
@@ -165,14 +180,18 @@ export async function serveBuild(root: string, copy: BuildCopy): Promise<Preview
         res.end('method not allowed');
         return;
       }
-      const { pathname } = new URL(req.url ?? '/', 'http://localhost');
       const file = fileFor(root, pathname) ?? (extname(pathname) ? undefined : fileFor(root, '/index.html'));
       if (!file) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('not found');
         return;
       }
-      res.writeHead(200, { 'Content-Type': TYPES[extname(file).toLowerCase()] ?? 'application/octet-stream', 'Cache-Control': 'no-cache' });
+      res.writeHead(200, {
+        'Content-Type': TYPES[extname(file).toLowerCase()] ?? 'application/octet-stream',
+        'Cache-Control': 'no-cache',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "connect-src 'self'; form-action 'self'; base-uri 'self'",
+      });
       if (method === 'HEAD') res.end();
       else createReadStream(file).pipe(res);
     });
@@ -188,6 +207,7 @@ export async function serveBuild(root: string, copy: BuildCopy): Promise<Preview
   const { port } = server.address() as AddressInfo;
   return {
     url: `http://127.0.0.1:${port}`,
+    admin,
     gone: () => closed,
     output: () => output,
     stop: () => {

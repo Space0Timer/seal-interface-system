@@ -200,6 +200,7 @@ export interface ProbeTargets {
   /** Claude Code's shared temp folder, which holds other sessions' files. */
   agentTemp: string;
   workspace: string;
+  skill?: string | undefined;
 }
 
 type ToolTurn = Extract<ScriptTurn, { tool: string }>;
@@ -340,6 +341,11 @@ export function probeSteps(t: ProbeTargets, versions: { node: string; pnpm: stri
       turn: { tool: 'Read', input: { file_path: join(t.workspace, 'README.md') } },
       judge: (r) => ({ ok: !!r && !r.isError && r.text.includes('Starter'), detail: 'Read of a workspace file worked' }),
     },
+    ...(t.skill ? [{
+      id: 'skill-call',
+      turn: { tool: 'Skill', input: { skill: t.skill } },
+      judge: (r: ToolResult | undefined) => ({ ok: !!r && !r.isError, detail: `the ${t.skill} Skill call succeeded` }),
+    }] : []),
   ];
 }
 
@@ -363,12 +369,13 @@ export function judgeProbe(transcript: Transcript, steps: ProbeStep[]): Isolatio
 }
 
 /** The stub generation: writes the conformance app and builds it, like a generator would. */
-function stubGenerationScript(workspace: string): ScriptTurn[] {
+function stubGenerationScript(workspace: string, skill?: GenerateOptions['skill']): ScriptTurn[] {
   const app = join(REPO, 'evals', 'tests', 'conformance-app');
+  const tokens = skill && existsSync(join(workspace, skill.dir, 'tokens.resolver.json')) ? "import './src/design-tokens.css';\n" : '';
   return [
     { tool: 'Read', input: { file_path: join(workspace, 'README.md') } },
     { tool: 'Write', input: { file_path: join(workspace, 'index.html'), content: readFileSync(join(app, 'index.html'), 'utf8') } },
-    { tool: 'Write', input: { file_path: join(workspace, 'main.ts'), content: readFileSync(join(app, 'main.ts'), 'utf8') } },
+    { tool: 'Write', input: { file_path: join(workspace, 'main.ts'), content: tokens + readFileSync(join(app, 'main.ts'), 'utf8') } },
     { tool: 'Bash', input: { command: 'pnpm build', description: 'Build the app' } },
     { text: 'The screen is built.' },
   ];
@@ -454,7 +461,7 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
 
       // 1. The probe, against the stub model.
       const probe = probeSteps(
-        { canaryFile: opts.canary.file, canaryToken: opts.canary.token, canaryDir, forbidden: opts.forbiddenPaths, readProbes: opts.readProbes, realHome, agentTemp, workspace },
+        { canaryFile: opts.canary.file, canaryToken: opts.canary.token, canaryDir, forbidden: opts.forbiddenPaths, readProbes: opts.readProbes, realHome, agentTemp, workspace, skill: opts.skill?.name },
         versions,
       );
       prepare(probeState);
@@ -475,6 +482,16 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
         ...judgeProbe(probeRun.transcript, probe),
         ...checkFirstRequest(first, prompt, opts.forbiddenPaths),
       );
+      if (opts.skill) {
+        const skillBody = readFileSync(join(workspace, opts.skill.dir, 'SKILL.md'), 'utf8').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
+        const encodedBody = JSON.stringify(skillBody).slice(1, -1);
+        const receivedSkill = skillBody.length > 0 && probeStub.requests.some(({ body }) => JSON.stringify(body)?.includes(encodedBody));
+        checks.push({
+          id: 'claude-code.probe-skill-content',
+          ok: receivedSkill,
+          detail: receivedSkill ? 'the Skill call sent the assigned guidance to the stub model' : 'the stub model did not receive the assigned skill body',
+        });
+      }
       const logs = ['probe-invocation.json', 'probe-transcript.jsonl', 'probe-stderr.log', 'probe-requests.json', ...(first ? ['probe-system-prompt.txt'] : [])];
       if (!checks.every((c) => c.ok)) {
         return { ok: false, error: 'the isolation probe failed; the session was not started', logs, isolation: checks, settings: redacted(buildInvocation(base(probeState, { stubUrl: 'http://127.0.0.1:0' }))) };
@@ -483,7 +500,7 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
       // 2. The session.
       const sessionState = join(opts.stateDir, 'session');
       prepare(sessionState);
-      const sessionStub = stub ? await startStubModel(stubGenerationScript(workspace), TOOLS) : undefined;
+      const sessionStub = stub ? await startStubModel(stubGenerationScript(workspace, opts.skill), TOOLS) : undefined;
       const auth: InvocationInput['auth'] = sessionStub ? { stubUrl: sessionStub.url } : { oauthToken: process.env['CLAUDE_CODE_OAUTH_TOKEN']! };
       const invocation = buildInvocation(base(sessionState, auth));
       writeFileSync(log('invocation.json'), `${JSON.stringify(redacted(invocation), null, 2)}\n`);

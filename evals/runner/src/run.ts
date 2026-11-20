@@ -18,14 +18,14 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { Adapter, GenerateResult, IsolationCheck } from '../../adapters/types.ts';
 import { materialize, REPO } from '../../starter/src/materialize.ts';
-import type { Preview } from '../../starter/src/preview.ts';
 import { toolchain } from '../../starter/src/toolchain.ts';
 import { checkOutside, checkPrompt, checkWorkspacePath, scanWorkspace } from './checks.ts';
 import { conditionNamed } from './conditions.ts';
 import { confine, confineCopy, sandboxAvailable, type ConfinementRecord } from './confine.ts';
 import { copyFiles, diff, hashEntry, hashTree, sha256, snapshot, walk } from './files.ts';
 import { PROMPT_FILE, renderPrompt } from './prompt.ts';
-import { summarizeReport, type TestSummary } from './report.ts';
+import { requireReport, summarizeReport, type TestSummary } from './report.ts';
+import { lintTokens, type TokenLint } from './token-lint.ts';
 import { copyBuild, serveBuild } from './serve.ts';
 
 export const RESULTS = join(REPO, 'evals', 'results');
@@ -39,6 +39,18 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 /** What the workspace snapshot skips: dependencies and build output, which the generator doesn't author. */
 const SNAPSHOT_SKIP = { skipAnywhere: ['node_modules', '.git'], skipPaths: ['dist', '.vite'] };
+
+/** Fingerprint the checked-out sources that produce the shared review evidence. */
+function scoringHash(): string {
+  const suites = hashTree(TESTS, {
+    skipAnywhere: ['node_modules', 'test-results', 'playwright-report'],
+    skipPaths: ['meta', 'conformance-app'],
+  });
+  const screenshots = hashTree(join(RUNNER, 'screenshots'));
+  const fixtures = hashTree(join(REPO, 'evals', 'fixtures', 'src'));
+  const evidence = ['playwright.config.ts', 'src/serve.ts', 'src/report.ts'].map((file) => hashEntry(join(RUNNER, file)));
+  return sha256([suites, screenshots, fixtures, ...evidence].join('\n'));
+}
 
 export interface RunOptions {
   brief: string;
@@ -60,11 +72,10 @@ export interface RunOptions {
 }
 
 /**
- * complete: every step ran (a failed build or failing tests are results, not errors).
- * invalid: an isolation check failed, so the output says nothing about the condition.
- * error: the run couldn't finish, for example because generation failed.
+ * complete: every applicable step ran. invalid: an isolation check failed.
+ * incomplete: the generation session didn't finish. error: the runner failed.
  */
-export type RunStatus = 'complete' | 'invalid' | 'error';
+export type RunStatus = 'complete' | 'invalid' | 'incomplete' | 'error';
 
 export interface Step {
   startedAt: string;
@@ -80,10 +91,13 @@ export interface Manifest {
   adapter: string;
   model: string | null;
   effort: string | null;
+  projects: string[];
+  limits: { timeoutMs: number; maxBudgetUsd: number | null };
   startedAt: string;
   finishedAt?: string;
   versions: { node: string; pnpm: string; playwright: string | null; agent: string | null };
-  hashes: { skill: string | null; starter: string | null; brief: string; prompt: string };
+  hashes: { skill: string | null; starter: string | null; brief: string; prompt: string; scoring: string };
+  skillRevision: string | null;
   prompt: string;
   /** The temp workspace, deleted after the run. Recorded so its removal can be checked. */
   workspace: string | null;
@@ -106,7 +120,7 @@ export interface Manifest {
   } | null;
   tests: (TestSummary & { report: string; log: string; touchTargets: string[] }) | null;
   screenshots: { expected: string[]; saved: string[]; missing: Array<{ file: string; reason: string }>; report: string } | null;
-  tokenLint: { status: 'not-applicable' | 'not-built-yet' };
+  tokenLint: TokenLint;
   files: Array<{ path: string; bytes: number; sha256: string }>;
 }
 
@@ -190,7 +204,8 @@ export function runLogged(
 export async function runEval(options: RunOptions): Promise<Manifest> {
   const { brief, adapter, model, effort, maxBudgetUsd, signal } = options;
   const log = options.log ?? ((line: string) => console.log(line));
-  const projects = options.projects ?? ALL_PROJECTS;
+  const projects = [...new Set(options.projects ?? ALL_PROJECTS)];
+  const timeoutMs = options.timeoutMs ?? 90 * 60_000;
 
   // Check every input before creating anything.
   const condition = conditionNamed(options.condition);
@@ -198,6 +213,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
   if (!states) throw new Error(`no screenshot states for brief "${brief}"`);
   const unknownProjects = projects.filter((p) => !ALL_PROJECTS.includes(p));
   if (unknownProjects.length) throw new Error(`unknown projects: ${unknownProjects.join(', ')}`);
+  if (!projects.length) throw new Error('select at least one project');
   if (effort && !EFFORTS.includes(effort)) throw new Error(`effort must be one of ${EFFORTS.join(', ')}`);
   if (adapter.live && !model) throw new Error(`the ${adapter.name} adapter calls a model: pass an exact model ID`);
   if (adapter.live && !(maxBudgetUsd && maxBudgetUsd > 0)) throw new Error(`the ${adapter.name} adapter calls a model: pass a spending cap`);
@@ -207,14 +223,19 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
   const briefPath = join(REPO, 'evals', 'briefs', `${brief}.md`);
   if (!existsSync(briefPath)) throw new Error(`no brief named "${brief}"`);
   const prompt = renderPrompt(brief);
+  const skillHash = condition.skill ? hashTree(join(REPO, condition.skill.from)) : null;
+  if (condition.skill?.pin && skillHash !== condition.skill.pin.hash) {
+    throw new Error(`the ${condition.skill.name} skill differs from its pinned revision ${condition.skill.pin.revision}`);
+  }
   adapter.check?.();
+  const scoring = scoringHash();
 
   const resultsRoot = resolve(options.resultsRoot ?? RESULTS);
   mkdirSync(resultsRoot, { recursive: true });
   const runId = randomBytes(6).toString('hex');
   const out = join(resultsRoot, runId);
   mkdirSync(out);
-  // The run-ID → condition mapping lives apart from the run folders, so they can be handed out blinded.
+  // Private operator mapping. Reviewer packets use a separate whitelist export.
   appendFileSync(
     join(resultsRoot, 'mapping.jsonl'),
     `${JSON.stringify({ runId, brief, condition: condition.name, adapter: adapter.name, model: model ?? null, effort: effort ?? null, startedAt: new Date().toISOString() })}\n`,
@@ -229,14 +250,18 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     adapter: adapter.name,
     model: model ?? null,
     effort: effort ?? null,
+    projects,
+    limits: { timeoutMs, maxBudgetUsd: maxBudgetUsd ?? null },
     startedAt: new Date().toISOString(),
     versions: { node: process.version, pnpm: tool('pnpm', ['--version']), playwright: playwrightVersion(), agent: adapter.version() ?? null },
     hashes: {
-      skill: condition.skill ? hashTree(join(REPO, condition.skill.from)) : null,
+      skill: skillHash,
       starter: null,
       brief: hashEntry(briefPath),
       prompt: sha256(readFileSync(PROMPT_FILE)),
+      scoring,
     },
+    skillRevision: condition.skill?.pin?.revision ?? null,
     prompt,
     workspace: null,
     timings: {},
@@ -248,7 +273,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     preview: null,
     tests: null,
     screenshots: null,
-    tokenLint: { status: condition.tokenLint ? 'not-built-yet' : 'not-applicable' },
+    tokenLint: { status: condition.tokenLint ? 'not-run' : 'not-applicable' },
     files: [],
   };
 
@@ -274,7 +299,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
   const scratch = mkdtempSync(join(realpathSync(tmpdir()), 'work-'));
   const workspace = join(scratch, 'app');
   manifest.workspace = workspace;
-  let server: Preview | undefined;
+  let server: Awaited<ReturnType<typeof serveBuild>> | undefined;
   let removeMarker = () => {};
 
   try {
@@ -305,6 +330,15 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     ];
     // Nothing reaches the adapter, and nothing is spent, unless these pass.
     if (!checks.every((c) => c.ok)) return invalid(checks);
+    const tools = toolchain();
+    const confinement = confine({ workspace, stateDir: join(scratch, 'build'), forbidden: forbiddenPaths, toolchain: tools });
+    manifest.confinement = confinement.record;
+    const sandboxLog = join(out, 'build-sandbox.log');
+    const [probeCommand, probeArgs] = confinement.wrap('pnpm', ['--version']);
+    const probe = await step('build-sandbox', () => runLogged(probeCommand, probeArgs, {
+      cwd: workspace, env: confinement.env, logFile: sandboxLog, signal,
+    }));
+    if (probe !== 0) throw new Error(`could not start the build sandbox: ${readFileSync(sandboxLog, 'utf8').trim()}`);
     const before = snapshot(workspace, SNAPSHOT_SKIP);
 
     // 2. Generate.
@@ -321,7 +355,7 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
         readProbes,
         skill: condition.skill && skillDir ? { name: condition.skill.name, dir: skillDir } : undefined,
         maxBudgetUsd,
-        timeoutMs: options.timeoutMs ?? 90 * 60_000,
+        timeoutMs,
         signal,
       }),
     );
@@ -351,29 +385,31 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     checks.push(...adapterChecks);
     if (!checks.every((c) => c.ok)) return invalid(checks, settings);
     manifest.isolation = { ok: true, checks, settings };
-    // A session that crashed, timed out or hit its budget is not scored. Its partial output is kept above.
+    // A session that stopped early (budget, time limit, error result) left
+    // unfinished work. It's recorded, with its output copied above, but not
+    // built or scored. Stopping the run itself is a runner error instead.
     if (!generation.ok) {
-      manifest.status = 'error';
-      manifest.error = `generation failed: ${generation.error ?? `the ${adapter.name} adapter gave no reason`}`;
+      if (signal?.aborted) throw new Error('the run was aborted');
+      manifest.status = 'incomplete';
+      manifest.error = generation.error ?? 'the generation session did not finish';
       return manifest;
     }
 
-    // The generated build runs only confined: no inherited credentials, no reads beyond what it needs, no network.
-    const confinement = confine({ workspace, stateDir: join(scratch, 'build'), forbidden: forbiddenPaths, toolchain: toolchain() });
-    manifest.confinement = confinement.record;
-
     // 4. Build. A failure is a brief-completion failure, recorded and never fixed.
     const buildLog = join(out, 'build.log');
+    rmSync(join(workspace, 'dist'), { recursive: true, force: true });
     const [buildCommand, buildArgs] = confinement.wrap('pnpm', ['build']);
     const buildCode = await step('build', () => runLogged(buildCommand, buildArgs, { cwd: workspace, env: confinement.env, logFile: buildLog, signal }));
+    if (buildCode === null) throw new Error('the isolated build process was interrupted');
     manifest.build = { ok: buildCode === 0, exitCode: buildCode, log: 'build.log' };
     // The build's output leaves the workspace only through the confined copy, never with the runner's own permissions.
     const servedDir = join(scratch, 'serve');
-    const copier = confineCopy({ from: join(workspace, 'dist'), to: servedDir, nodeRoot: toolchain().nodeRoot, forbidden: forbiddenPaths });
+    const copier = confineCopy({ from: join(workspace, 'dist'), to: servedDir, nodeRoot: tools.nodeRoot, forbidden: forbiddenPaths });
     const built = manifest.build.ok ? await step('copy-build', () => copyBuild(join(workspace, 'dist'), servedDir, copier)) : undefined;
     if (built?.missing) manifest.build = { ...manifest.build, ok: false, error: built.missing };
 
     if (built && !built.missing) {
+      if (scoringHash() !== scoring) throw new Error('the scoring sources changed before scoring');
       // 5. Serve the build: the runner's own server and mock API, never the workspace's.
       const preview = await step('serve', () => serveBuild(servedDir, built));
       server = preview;
@@ -381,36 +417,37 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
       const serverAlive = (when: string) => {
         if (preview.gone()) throw new Error(`the build's server stopped ${when}:\n${preview.output()}`);
       };
+      const browserEnv = { ...process.env, EVAL_BASE_URL: preview.url, EVAL_MOCK_ADMIN_TOKEN: preview.admin };
 
       // 6. The shared behavior tests.
       const testsDir = join(out, 'tests');
       mkdirSync(testsDir);
       const projectArgs = projects.flatMap((p) => ['--project', p]);
-      await step('tests', () =>
+      const testsCode = await step('tests', () =>
         runLogged('pnpm', ['exec', 'playwright', 'test', ...projectArgs, '--reporter=list,json', '--output', join(testsDir, 'artifacts')], {
           cwd: TESTS,
-          env: { ...process.env, EVAL_BASE_URL: preview.url, PLAYWRIGHT_JSON_OUTPUT_FILE: join(testsDir, 'report.json') },
+          env: { ...browserEnv, PLAYWRIGHT_JSON_OUTPUT_FILE: join(testsDir, 'report.json') },
           logFile: join(testsDir, 'output.log'),
           signal,
         }),
       );
-      serverAlive('during the tests');
       const touchTargets = existsSync(join(testsDir, 'artifacts'))
         ? walk(join(testsDir, 'artifacts'))
             .filter((rel) => rel.endsWith('/touch-targets.json'))
             .map((rel) => `tests/artifacts/${rel}`)
         : [];
       manifest.tests = { ...summarizeReport(join(testsDir, 'report.json')), report: 'tests/report.json', log: 'tests/output.log', touchTargets };
+      serverAlive('during the tests');
+      requireReport(manifest.tests, 'behavior tests', testsCode, projects);
 
       // 7. Screenshots of every state, in every project.
       const shotsDir = join(out, 'screenshots');
       mkdirSync(shotsDir);
-      await step('screenshots', () =>
+      const screenshotsCode = await step('screenshots', () =>
         runLogged('pnpm', ['exec', 'playwright', 'test', ...projectArgs, '--reporter=list,json', '--output', join(scratch, 'screenshot-artifacts')], {
           cwd: RUNNER,
           env: {
-            ...process.env,
-            EVAL_BASE_URL: preview.url,
+            ...browserEnv,
             EVAL_BRIEF: brief,
             EVAL_SCREENSHOT_DIR: shotsDir,
             PLAYWRIGHT_JSON_OUTPUT_FILE: join(shotsDir, 'report.json'),
@@ -420,9 +457,12 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
         }),
       );
       serverAlive('during the screenshots');
+      if (scoringHash() !== scoring) throw new Error('the scoring sources changed during scoring');
       const expected = projects.flatMap((p) => states.map((s) => `screenshots/${p}/${s}.png`));
       const saved = expected.filter((rel) => existsSync(join(out, rel)));
-      const failures = summarizeReport(join(shotsDir, 'report.json')).failures;
+      const screenshotReport = summarizeReport(join(shotsDir, 'report.json'));
+      requireReport(screenshotReport, 'screenshots', screenshotsCode, projects);
+      const { failures } = screenshotReport;
       const missing = expected
         .filter((rel) => !saved.includes(rel))
         .map((file) => {
@@ -431,10 +471,12 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
           return { file, reason: failure?.error ?? 'not saved' };
         });
       manifest.screenshots = { expected, saved, missing, report: 'screenshots/report.json' };
-      writeFileSync(join(out, 'preview.log'), preview.output());
     }
 
-    // 8. Token lint applies only to conditions with the token contract. Not built yet.
+    // 8. Token lint only applies where the token contract is part of the guidance.
+    if (manifest.build.ok && condition.tokenLint && skillDir) {
+      manifest.tokenLint = await step('token-lint', () => lintTokens(outputDir, copied.copied, out, scratch, skillDir));
+    }
     manifest.status = 'complete';
     return manifest;
   } catch (error) {
@@ -442,7 +484,10 @@ export async function runEval(options: RunOptions): Promise<Manifest> {
     manifest.error = error instanceof Error ? error.message : String(error);
     return manifest;
   } finally {
-    server?.stop();
+    if (server) {
+      server.stop();
+      writeFileSync(join(out, 'preview.log'), server.output());
+    }
     removeMarker();
     rmSync(scratch, { recursive: true, force: true });
     // 9. The manifest, with every output file.

@@ -38,6 +38,7 @@ export interface LogEntry {
   filename?: string;
   sizeBytes?: number;
   ids?: string[];
+  returnedIds?: string[];
   error?: string;
 }
 
@@ -174,7 +175,7 @@ export function createMockApi(): Handler {
         const scenario = method === 'POST' ? ((await readJson(req)) as { scenario?: unknown } | undefined)?.scenario : url.searchParams.get('scenario');
         const chosen = scenario ?? 'default';
         if (!isScenario(chosen)) return sendError(res, 400, 'unknown_scenario', { scenarios: SCENARIOS });
-        const cookie = `${COOKIE}=${startSession(chosen)}; Path=/; SameSite=Lax`;
+        const cookie = `${COOKIE}=${startSession(chosen)}; Path=/; SameSite=Lax; HttpOnly`;
         if (method === 'POST') return sendJson(res, 200, { scenario: chosen }, { 'Set-Cookie': cookie });
         const to = url.searchParams.get('to') ?? '/';
         res.writeHead(302, { Location: to.startsWith('/') ? to : '/', 'Set-Cookie': cookie, 'Cache-Control': 'no-store' });
@@ -202,13 +203,17 @@ export function createMockApi(): Handler {
         const offset = intParam(url.searchParams.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
         const limit = intParam(url.searchParams.get('limit'), DEFAULT_LIMIT, 1, MAX_LIMIT);
         const matches = visibleAssets(session).filter((a) => !q || a.filename.toLowerCase().includes(q));
-        return reply(200, { total: matches.length, offset, limit, items: matches.slice(offset, offset + limit) });
+        const items = matches.slice(offset, offset + limit);
+        entry.returnedIds = items.map((asset) => asset.id);
+        return reply(200, { total: matches.length, offset, limit, items });
       }
 
       const one = /^\/api\/assets\/([\w-]+)$/.exec(path);
       if (one && method === 'GET') {
         const asset = visibleAssets(session).find((a) => a.id === one[1]);
-        return asset ? reply(200, asset) : reply(404, { error: { code: 'not_found' } });
+        if (!asset) return reply(404, { error: { code: 'not_found' } });
+        entry.returnedIds = [asset.id];
+        return reply(200, asset);
       }
 
       if (path === '/api/assets/delete' && method === 'POST') {

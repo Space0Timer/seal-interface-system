@@ -1,6 +1,6 @@
 // The confinement of the generated app's build: an allowlisted environment
 // everywhere, and on macOS a sandbox that reads nothing it wasn't given and
-// keeps it from the network beyond localhost and from other processes.
+// blocks outbound network access and from other processes.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -112,7 +112,7 @@ Promise.all([remote, socket, local]).then(([remote, socket, local]) => {
 });
 `;
 
-test('sandboxed: nothing unnamed or forbidden is readable, no writes outside, no network beyond localhost, no other process', { skip: sandboxAvailable() ? false : 'needs macOS sandbox-exec' }, async () => {
+test('sandboxed: nothing unnamed or forbidden is readable, no writes outside, no outbound network access, no other process', { skip: sandboxAvailable() ? false : 'needs macOS sandbox-exec' }, async () => {
   // A Unix socket like an SSH agent's, listening outside the sandbox. Connecting needs no accept, so a blocked test process can host it.
   const agent = createServer();
   await new Promise<void>((resolve) => agent.listen(join(workspace, 'agent.sock'), resolve));
@@ -143,7 +143,7 @@ test('sandboxed: nothing unnamed or forbidden is readable, no writes outside, no
       home: undefined,
       remote: 'EPERM',
       socket: 'EPERM',
-      local: 'served',
+      local: 'EPERM',
     },
   );
   assert.equal(seen['home'], join(input.stateDir, 'home'));

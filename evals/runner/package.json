@@ -9,6 +9,7 @@
     "typecheck": "tsc -p ."
   },
   "devDependencies": {
-    "@playwright/test": "^1.65.1"
+    "@playwright/test": "^1.65.1",
+    "parse5": "8.1.1"
   }
 }

@@ -15,6 +15,6 @@ export default defineConfig({
   timeout: 120_000,
   expect: { timeout: 10_000 },
   reporter: [['list']],
-  use: { baseURL: base },
+  use: { baseURL: base, ...(process.env['EVAL_MOCK_ADMIN_TOKEN'] ? { serviceWorkers: 'block' } : {}) },
   projects: [...PROJECTS],
 });

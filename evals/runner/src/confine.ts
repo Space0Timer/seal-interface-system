@@ -8,7 +8,7 @@
 //   It may read only the OS runtime, the node and pnpm installs, the
 //   workspace and its own state, and never the repo checkouts or the
 //   results. It can write only to the workspace and its own state, has no
-//   network beyond localhost, and can't inspect other processes or ask the
+//   outbound network access, and can't inspect other processes or ask the
 //   keychain for anything.
 // So generated code can neither reach the host's files and credentials
 // (in the home folder, on a mounted volume, in a shared folder) nor copy
@@ -134,11 +134,8 @@ export function sandboxProfile(policy: SandboxPolicy): string {
     '; Writes: only the writable folders and the standard devices.',
     '(deny file-write*)',
     `(allow file-write* ${subpaths(policy.write)} (regex #"^/dev/(null|zero|tty[^/]*|fd/[0-9]+|dtracehelper|stdout|stderr)$"))`,
-    '; Network: localhost only. Name lookups go through mDNSResponder; every other Unix socket is closed.',
-    '(deny network-outbound (remote unix-socket))',
-    '(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))',
-    '(deny network-outbound (remote ip "*:*"))',
-    '(allow network-outbound (remote ip "localhost:*"))',
+    '; Neither the build nor its copy helper makes network requests.',
+    '(deny network-outbound)',
     "; No other process's arguments or environment, and no keychain.",
     '(deny process-info* (target others))',
     '(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd.xpc") (global-name "com.apple.security.agent"))',

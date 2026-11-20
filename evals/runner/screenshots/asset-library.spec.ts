@@ -10,7 +10,7 @@
 // can only be driven through the contract's checkboxes or aria-selected.
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { expect, test, type Page } from '@playwright/test';
+import { expect, type Page } from '@playwright/test';
 import { assetsFor, NO_RESULTS_QUERY, OVERSIZED_FILENAME, TRANSIENT_FAILURE_FILENAME, UPLOAD_BATCH, type Asset } from '../../fixtures/src/data.ts';
 import {
   DEFAULT_NAMES,
@@ -26,6 +26,7 @@ import {
   uploadsIn,
   visibleItems,
 } from '../../tests/asset-library/helpers.ts';
+import { test } from '../../tests/browser.ts';
 
 const DIR = process.env['EVAL_SCREENSHOT_DIR']!;
 const LARGE_NAMES = assetsFor('large')

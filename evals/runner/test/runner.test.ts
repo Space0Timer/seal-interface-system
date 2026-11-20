@@ -15,9 +15,12 @@ import { fakeAdapter } from '../../adapters/fake/index.ts';
 import type { Adapter } from '../../adapters/types.ts';
 import { leakIn } from '../../starter/src/leaks.ts';
 import { REPO } from '../../starter/src/materialize.ts';
-import { sandboxAvailable } from '../src/confine.ts';
+import { CONDITIONS } from '../src/conditions.ts';
+import { walk } from '../src/files.ts';
 import { renderPrompt } from '../src/prompt.ts';
+import { exportReview } from '../src/review.ts';
 import { runEval, runLogged, type Manifest } from '../src/run.ts';
+import { sandboxAvailable } from '../src/confine.ts';
 
 const temps: string[] = [];
 const resultsRoot = () => {
@@ -106,6 +109,7 @@ test('a full fake run: isolated, built, tested in every project, screenshotted, 
   assert.equal(m.preview?.copiedIn, sandboxAvailable() ? 'sandbox-exec' : 'none', 'dist/ left the workspace only through the confined copy');
   assert.deepEqual([m.preview?.links, m.preview?.refused], [[], []]);
   assert.match(m.preview?.url ?? '', /^http:\/\/(localhost|127\.0\.0\.1):\d+$/);
+  assert.match(m.hashes.scoring, /^[a-f0-9]{64}$/);
   assert.equal(m.tests?.ran, true);
   assert.deepEqual(m.tests?.failures, []);
   assert.ok((m.tests?.passed ?? 0) >= 4 * 10, `${m.tests?.passed} tests passed`);
@@ -121,6 +125,12 @@ test('a full fake run: isolated, built, tested in every project, screenshotted, 
   const mapping = readFileSync(join(root, 'mapping.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { runId: string; condition: string });
   assert.deepEqual(mapping.map((e) => [e.runId, e.condition]), [[m.runId, 'plain']]);
   assert.ok(!existsSync(m.workspace!), 'the temp workspace is deleted');
+  const review = exportReview(root, join(root, 'review-packet'), [m.runId]);
+  const evidence = readFileSync(join(review.packet, 'sample-1/evidence.json'), 'utf8');
+  assert.ok(!evidence.includes(m.runId) && !evidence.includes(m.condition));
+  assert.equal(walk(review.packet).filter((file) => file.endsWith('.png')).length, 24);
+  assert.ok(!existsSync(join(review.packet, 'manifest.json')));
+  assert.match(readFileSync(review.mapping, 'utf8'), new RegExp(m.runId));
 });
 
 test('a failed build is recorded as is: no fix, no tests, workspace deleted', async () => {
@@ -142,6 +152,21 @@ test('a run that reads the canary is invalid and goes no further', async () => {
   assert.deepEqual(failed(m), ['fake.canary-unread']);
   assert.equal(m.build, null);
   assert.ok(existsSync(join(root, m.runId, 'manifest.json')));
+  assert.ok(!existsSync(m.workspace!));
+});
+
+test('a session that stops early is incomplete: its output is kept, nothing is built or scored', async () => {
+  const root = resultsRoot();
+  const m = await runEval({ brief: 'asset-library', condition: 'plain', adapter: fakeAdapter('unfinished'), resultsRoot: root, log: quiet });
+  assert.equal(m.status, 'incomplete');
+  assert.match(m.error ?? '', /error_max_budget_usd/);
+  assert.equal(m.isolation.ok, true);
+  assert.equal(m.generation?.ok, false);
+  assert.ok(existsSync(join(root, m.runId, 'output', 'main.ts')), 'the unfinished output is kept for inspection');
+  assert.equal(m.build, null);
+  assert.equal(m.tests, null);
+  assert.equal(m.screenshots, null);
+  assert.throws(() => exportReview(root, join(root, 'packet'), [m.runId]), /no completed evaluation evidence/);
   assert.ok(!existsSync(m.workspace!));
 });
 
@@ -173,8 +198,8 @@ test('a workspace that fails an isolation check stops the run before the adapter
 test('a failed generation ends the run with the adapter\'s error: partial output kept, nothing built or scored', async () => {
   const root = resultsRoot();
   const m = await runEval({ brief: 'asset-library', condition: 'plain', adapter: fakeAdapter('timeout'), resultsRoot: root, log: quiet });
-  assert.equal(m.status, 'error');
-  assert.equal(m.error, 'generation failed: the session timed out');
+  assert.equal(m.status, 'incomplete');
+  assert.equal(m.error, 'the session timed out');
   assert.equal(m.isolation.ok, true);
   assert.equal(m.generation?.ok, false);
   assert.ok(existsSync(join(root, m.runId, 'output', 'main.ts')), 'the partial output is kept for diagnosis');
@@ -211,33 +236,47 @@ test('the build runs confined, and the build is scored against the runner\'s own
   assert.ok(!existsSync(join(root, m.runId, 'isolation-marker.txt')), 'the marker is gone once generation ends');
 });
 
-test('the my-skill hook: the skill lands where the adapter says, with its hash; the starter is unchanged', async () => {
+test('each skill lands in the assigned project directory with its hash and the same starter', async () => {
   const root = resultsRoot();
   const plain = await runEval({ brief: 'asset-library', condition: 'plain', adapter: fakeAdapter('broken-build'), resultsRoot: root, log: quiet });
-  const skilled = await runEval({ brief: 'asset-library', condition: 'my-skill', adapter: fakeAdapter('broken-build'), resultsRoot: root, log: quiet });
-  assert.match(skilled.hashes.skill ?? '', /^[0-9a-f]{64}$/);
-  assert.equal(skilled.hashes.starter, plain.hashes.starter, 'the same starter in both conditions');
-  assert.equal(skilled.prompt, plain.prompt, 'the same prompt in both conditions');
-  assert.equal(skilled.tokenLint.status, 'not-built-yet');
-  assert.deepEqual(failed(skilled), []);
+  for (const condition of ['my-skill', 'frontend-design']) {
+    const skilled = await runEval({ brief: 'asset-library', condition, adapter: fakeAdapter('broken-build'), resultsRoot: root, log: quiet });
+    assert.match(skilled.hashes.skill ?? '', /^[0-9a-f]{64}$/);
+    assert.equal(skilled.hashes.starter, plain.hashes.starter, 'the same starter in both conditions');
+    assert.equal(skilled.hashes.scoring, plain.hashes.scoring, 'the same scoring sources in both conditions');
+    assert.equal(skilled.prompt, plain.prompt, 'the same prompt in both conditions');
+    assert.equal(skilled.tokenLint.status, condition === 'my-skill' ? 'not-run' : 'not-applicable');
+    assert.deepEqual(failed(skilled), []);
+  }
 });
 
 const bin = findClaude();
-test('the real Claude Code CLI, isolated, against the local stub model (no cost)', { skip: bin ? false : 'set CLAUDE_CODE_BIN to run' }, async () => {
+test('all three conditions through the real Claude Code CLI against the local stub', { skip: !sandboxAvailable() ? 'needs macOS sandbox-exec' : bin ? false : 'set CLAUDE_CODE_BIN to run' }, async () => {
   const root = resultsRoot();
-  const m = await runEval({
-    brief: 'asset-library',
-    condition: 'plain',
-    adapter: claudeCodeAdapter({ stubModel: true }),
-    projects: ['desktop-light'],
-    resultsRoot: root,
-    log: quiet,
-  });
-  assert.equal(m.status, 'complete', `${m.error}\n${JSON.stringify(m.isolation.checks.filter((c) => !c.ok), null, 2)}`);
-  assert.deepEqual(failed(m), []);
-  assert.ok(m.isolation.checks.some((c) => c.id === 'claude-code.probe-shell-agent-temp' && c.ok));
-  assert.equal(m.build?.ok, true);
-  assert.deepEqual(m.tests?.failures, []);
-  assert.deepEqual(m.screenshots?.missing, []);
-  assert.ok(!existsSync(m.workspace!));
+  const runs: Manifest[] = [];
+  for (const condition of Object.values(CONDITIONS)) {
+    const m = await runEval({
+      brief: 'asset-library', condition: condition.name, adapter: claudeCodeAdapter({ stubModel: true }),
+      projects: ['desktop-light'], resultsRoot: root, log: quiet,
+    });
+    assert.equal(m.status, 'complete', `${m.error}\n${JSON.stringify(m.isolation.checks.filter((c) => !c.ok), null, 2)}`);
+    assert.deepEqual(failed(m), []);
+    assert.equal(m.isolation.checks.find((c) => c.id === 'claude-code.probe-skill-content')?.ok, condition.skill ? true : undefined);
+    assert.equal(m.build?.ok, true);
+    assert.deepEqual(m.tests?.failures, []);
+    assert.deepEqual(m.screenshots?.missing, []);
+    assert.equal(m.tokenLint.status, condition.tokenLint ? 'passed' : 'not-applicable');
+    assert.ok(!existsSync(m.workspace!));
+    runs.push(m);
+  }
+  const { packet, mapping } = exportReview(root, join(root, 'blinded'), runs.map((run) => run.runId));
+  const files = walk(packet);
+  assert.equal(files.filter((file) => file.endsWith('.png')).length, 18);
+  assert.equal(files.filter((file) => file.endsWith('evidence.json')).length, 3);
+  assert.equal(files.filter((file) => /manifest|invocation|transcript|token-lint|mapping/.test(file)).length, 0);
+  for (const file of files.filter((path) => path.endsWith('.json'))) {
+    const content = readFileSync(join(packet, file), 'utf8');
+    for (const run of runs) assert.ok(!content.includes(run.runId) && !content.includes(run.condition));
+  }
+  assert.match(readFileSync(mapping, 'utf8'), new RegExp(runs[0]!.runId));
 });

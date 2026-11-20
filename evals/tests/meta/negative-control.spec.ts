@@ -12,6 +12,7 @@ import {
   checkOversizedRecovery,
   checkSearchFinds,
   checkTransientRecovery,
+  checkWholeLibrarySearch,
 } from '../asset-library/helpers.ts';
 
 test.describe.configure({ mode: 'parallel' });
@@ -83,6 +84,12 @@ test.describe('broken variants fail', () => {
 
   test('search-loaded-only: the search check rejects searching only loaded pages', async ({ page }) => {
     await expect(checkSearchFinds(page, at('variant=search-loaded-only'))).rejects.toThrow(/items shown for "invoice"/);
+  });
+
+  test('search-loaded-only: a page large enough for all default assets still fails the whole-library check', async ({ page }) => {
+    const options = at('variant=search-loaded-only&page=100');
+    await checkSearchFinds(page, options);
+    await expect(checkWholeLibrarySearch(page, options)).rejects.toThrow(/search finds an asset absent from all pages fetched before searching/);
   });
 });
 
