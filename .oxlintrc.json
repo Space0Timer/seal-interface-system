@@ -14,7 +14,8 @@
     "**/dist/",
     "**/storybook-static/",
     "**/playwright-report/",
-    "**/test-results/"
+    "**/test-results/",
+    "evals/results/"
   ],
   "rules": {
     "constructor-super": "error",
