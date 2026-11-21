@@ -153,6 +153,10 @@ test.describe('valid variations pass', () => {
   test('"Delete selected" inside a toolbar ul > li: bulk delete finds it', async ({ page }) => {
     await checkBulkDelete(page, at('toolbar-list=1'));
   });
+
+  test('a closed confirmation dialog naming the selected assets: bulk delete still finds the rows', async ({ page }) => {
+    await checkBulkDelete(page, at('closed-dialog=1'));
+  });
 });
 
 test.describe('touch-target measurement', () => {

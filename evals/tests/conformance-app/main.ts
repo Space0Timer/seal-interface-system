@@ -16,6 +16,7 @@
 //   ?toolbar-list=1  "Delete selected" sits in a toolbar's ul > li
 //   ?reorder-last=1  when one failure remains, Dismiss comes before its recovery control
 //   ?virtual=1       the list scrolls inside a box and renders only 5 rows at a time
+//   ?closed-dialog=1 a closed confirmation dialog after the list names each selected asset
 //
 // Broken variants, which the meta tests check the shared tests reject:
 //   ?variant=retry-everything      Retry for every failure, even oversized files
@@ -68,6 +69,7 @@ const pagerNav = params.get('pager-nav') === '1';
 const toolbarList = params.get('toolbar-list') === '1';
 const reorderLast = params.get('reorder-last') === '1';
 const virtual = params.get('virtual') === '1';
+const closedDialog = params.get('closed-dialog') === '1';
 const ROW_HEIGHT = 40;
 const VISIBLE_ROWS = 5;
 const variant = params.get('variant');
@@ -108,6 +110,8 @@ const search = el('input', { type: 'search', 'aria-label': 'Search assets' });
 const upload = el('input', { type: 'file', multiple: '', 'aria-label': 'Upload files' });
 const uploadsRegion = el('section', { 'aria-label': 'Uploads' });
 const selectionRegion = el('div');
+// Prepared ahead and never opened here (closed-dialog): it holds the selected filenames but isn't shown.
+const confirmDialog = el('dialog', { 'aria-label': 'Delete selected assets' });
 const listRegion = el('div');
 const fullNames = el('div', { hidden: '' });
 // For ?virtual=1: a scroll box that stays attached (detaching it would reset
@@ -128,6 +132,7 @@ document.body.append(
     el('a', { href: '#' }, 'Settings'),
   ),
   el('main', {}, el('h1', {}, 'Assets'), search, ' ', upload, uploadsRegion, selectionRegion, listRegion, fullNames),
+  confirmDialog,
 );
 
 async function fetchPage(query: string, offset: number, limit = PAGE): Promise<Page> {
@@ -250,6 +255,10 @@ function renderList(): void {
 }
 
 function renderSelection(): void {
+  if (closedDialog) {
+    const names = state.items.filter((a) => state.selected.has(a.id)).map((a) => el('li', {}, a.filename));
+    confirmDialog.replaceChildren(el('ul', {}, ...names));
+  }
   if (state.selected.size === 0) {
     selectionRegion.replaceChildren();
     return;

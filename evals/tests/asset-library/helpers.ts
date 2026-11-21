@@ -54,13 +54,18 @@ export function uploadsIn(entries: LogEntry[]): LogEntry[] {
  * The list item for an asset: a row, option or list item whose computed
  * accessible name contains the full filename, or whose text does.
  */
+/**
+ * The asset's item in the library. Only visible elements count: a page may
+ * hold hidden copies of a filename, such as a closed confirmation dialog
+ * that lists the selected assets, and those aren't the library's items.
+ */
 export function libraryItem(page: Page, filename: string): Locator {
   const byName = page
     .getByRole('row', { name: filename })
     .or(page.getByRole('option', { name: filename }))
     .or(page.getByRole('listitem', { name: filename }));
   const byText = page.locator(ITEM).filter({ hasText: filename });
-  return byName.or(byText).last();
+  return byName.or(byText).filter({ visible: true }).last();
 }
 
 /** For each filename, the other filenames that contain it (a.png is inside …-cta.png). */

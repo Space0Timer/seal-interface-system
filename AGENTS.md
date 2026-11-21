@@ -815,6 +815,8 @@ CLI against the local stub and verifies the blinded export.
   - "Delete selected" inside a toolbar list
   - recovery controls that reorder after the first recovery
   - a virtualized list that renders 5 rows at a time
+  - a closed confirmation dialog that names the selected assets (items
+    are matched among visible elements only)
 
   A meta test also shows that the browser hold works: without it, the
   same server under `localhost` and another local port both answer the
