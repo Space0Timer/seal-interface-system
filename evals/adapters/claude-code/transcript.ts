@@ -157,24 +157,101 @@ export function withoutHeredocs(command: string): string {
 }
 
 /**
- * Paths in a shell command that point outside the workspace and the
- * session's own folders, and exist on disk. Absolute, home (~) and parent
- * (..) paths are resolved; URLs and strings that aren't real paths (such as
- * "/api/assets") are ignored, and so are here-document bodies. A lone "/"
- * is nearly always division in code, and the root holds only the system's
- * top-level folders, so it isn't counted either.
+ * A command split into simple commands at ;, &&, ||, | and line breaks
+ * outside quotes, with a leading "(" or "{" of a group dropped.
  */
-export function outsidePaths(command: string, workspace: string, home: string, exists: (p: string) => boolean = existsSync, own: readonly string[] = []): string[] {
-  const found = new Set<string>();
-  for (const match of withoutHeredocs(command).matchAll(/(?:^|[\s'"`=:(<>|;&])((?:~|\.\.|\/)[^\s'"`|;&<>()]*)/g)) {
-    const token = match[1]!;
-    if (token.includes('://')) continue;
-    const path = token.startsWith('~') ? join(home, token.slice(1)) : isAbsolute(token) ? resolve(token) : resolve(workspace, token);
-    if (path === '/' || [workspace, ...own].some((root) => inside(path, root))) continue;
-    if (SYSTEM.some((s) => path.startsWith(s) || `${path}/` === s)) continue;
-    if (exists(path)) found.add(path);
+export function simpleCommands(command: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let quote: string | undefined;
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i]!;
+    if (quote) {
+      current += c;
+      if (c === '\\' && quote === '"' && i + 1 < command.length) current += command[++i];
+      else if (c === quote) quote = undefined;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') quote = c;
+    if (c === ';' || c === '\n' || c === '|' || (c === '&' && command[i + 1] === '&')) {
+      parts.push(current);
+      current = '';
+      if ((c === '|' || c === '&') && command[i + 1] === c) i++;
+      continue;
+    }
+    current += c;
   }
-  return [...found];
+  parts.push(current);
+  return parts.map((part) => part.trim().replace(/^[({]\s*/, '')).filter(Boolean);
+}
+
+const unquote = (word: string) => word.replace(/^(['"])(.*)\1$/, '$2');
+
+/**
+ * Where a cd sends the shell. A bare cd or ~ is the home folder; "cd -" or
+ * a target that uses a variable can't be followed, so the shell is taken
+ * to stay where it was.
+ */
+function cdTarget(segment: string, cwd: string, home: string): string | undefined {
+  const match = /^(?:cd|pushd)(?:\s+(\S+))?\s*\)?$/.exec(segment);
+  if (!match) return undefined;
+  const target = match[1] === undefined ? '~' : unquote(match[1]);
+  if (target === '-' || target.includes('$')) return cwd;
+  if (target === '~' || target.startsWith('~/')) return join(home, target.slice(1));
+  return resolve(cwd, target);
+}
+
+/**
+ * Paths a shell command names outside the workspace and the session's own
+ * folders, which exist on disk, and the folder the shell is left in.
+ *
+ * The command runs from cwd and follows its cd's, so "cd src && cat
+ * ../package.json" names the workspace's own file. A cd's own target is
+ * where the shell moves, not something it reads; once it's outside the
+ * workspace, plain names count as paths there. Absolute, home (~) and
+ * parent (..) paths are resolved; URLs and strings that aren't real paths
+ * (such as "/api/assets") are ignored, and so are here-document bodies. A
+ * lone "/" is nearly always division in code, and the root holds only the
+ * system's top-level folders, so it isn't counted either.
+ */
+export function shellAccesses(
+  command: string,
+  cwd: string,
+  workspace: string,
+  home: string,
+  exists: (p: string) => boolean = existsSync,
+  own: readonly string[] = [],
+): { paths: string[]; cwd: string } {
+  const found = new Set<string>();
+  for (const segment of simpleCommands(withoutHeredocs(command))) {
+    const moved = cdTarget(segment, cwd, home);
+    if (moved !== undefined) {
+      cwd = moved;
+      continue;
+    }
+    // Outside the workspace and the session's folders, a plain name is a path there too.
+    if (![workspace, ...own].some((root) => inside(cwd, root))) {
+      for (const word of segment.split(/\s+/).slice(1).map(unquote)) {
+        if (!word || word.startsWith('-') || /[$~*?=:<>]|^\.\.|^\//.test(word)) continue;
+        const path = resolve(cwd, word);
+        if (exists(path)) found.add(path);
+      }
+    }
+    for (const match of segment.matchAll(/(?:^|[\s'"`=:(<>|;&])((?:~|\.\.|\/)[^\s'"`|;&<>()]*)/g)) {
+      const token = match[1]!;
+      if (token.includes('://')) continue;
+      const path = token.startsWith('~') ? join(home, token.slice(1)) : isAbsolute(token) ? resolve(token) : resolve(cwd, token);
+      if (path === '/' || [workspace, ...own].some((root) => inside(path, root))) continue;
+      if (SYSTEM.some((s) => path.startsWith(s) || `${path}/` === s)) continue;
+      if (exists(path)) found.add(path);
+    }
+  }
+  return { paths: [...found], cwd };
+}
+
+/** Paths a shell command run from the workspace names outside it and the session's own folders (see shellAccesses). */
+export function outsidePaths(command: string, workspace: string, home: string, exists: (p: string) => boolean = existsSync, own: readonly string[] = []): string[] {
+  return shellAccesses(command, workspace, workspace, home, exists, own).paths;
 }
 
 const FILE_FIELDS: Record<string, string[]> = {
@@ -203,11 +280,15 @@ export function outsideAccesses(
   own: readonly string[] = [],
 ): PathAccess[] {
   const accesses: PathAccess[] = [];
+  // Claude Code keeps the shell's folder from one command to the next while it stays in the workspace.
+  let cwd = workspace;
   for (const use of transcript.toolUses) {
     const denied = transcript.results.get(use.id)?.isError ?? true;
     const paths: string[] = [];
     if (use.name === 'Bash') {
-      paths.push(...outsidePaths(String(use.input['command'] ?? ''), workspace, home, exists, own));
+      const shell = shellAccesses(String(use.input['command'] ?? ''), cwd, workspace, home, exists, own);
+      paths.push(...shell.paths);
+      cwd = inside(shell.cwd, workspace) ? shell.cwd : workspace;
     } else {
       for (const field of FILE_FIELDS[use.name] ?? []) {
         const value = use.input[field];

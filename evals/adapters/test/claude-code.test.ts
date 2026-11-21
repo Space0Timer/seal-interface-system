@@ -23,7 +23,7 @@ import {
 import { buildInvocation, redacted, sandboxCover, TOOLS, type InvocationInput } from '../claude-code/invocation.ts';
 import { watchShells } from '../claude-code/leftovers.ts';
 import { startStubModel } from '../claude-code/stub-model.ts';
-import { checkInit, checkPaths, checkReceived, outsidePaths, parseTranscript, sessionOutcome, type InitEvent } from '../claude-code/transcript.ts';
+import { checkInit, checkPaths, checkReceived, outsidePaths, parseTranscript, sessionOutcome, simpleCommands, type InitEvent } from '../claude-code/transcript.ts';
 
 const WS = '/private/var/folders/aa/T/work-x/app';
 const HOME = '/private/var/folders/aa/T/work-x/state/session/home';
@@ -167,6 +167,32 @@ test('init: the expected model, tools and skills pass; any MCP server, plugin, e
   assert.deepEqual(failing({ model: 'claude-other' }), ['claude-code.init-model']);
   assert.deepEqual(failing({ permissionMode: 'bypassPermissions' }), ['claude-code.init-permission-mode']);
   assert.deepEqual(checkInit(undefined, expected).map((c) => c.ok), [false]);
+});
+
+test('shell commands: cd moves where later relative paths start, within a command and across commands', () => {
+  const exists = (p: string) => p === '/private/var/folders/aa' || p.startsWith('/Users/someone') || p.startsWith(WS);
+  // The command from the frontend-design run that was flagged: it went into a package and came back.
+  const back = "cd node_modules/@phosphor-icons/react && ls; for n in X Trash; do ls dist/csr/$n.d.ts >/dev/null 2>&1; done; cd ../../..; sed -n 1,40p tools/mock-api/thumbnails.ts";
+  assert.deepEqual(outsidePaths(back, WS, HOME, exists), []);
+  assert.deepEqual(outsidePaths('cd src && cat ../package.json', WS, HOME, exists), [], "a parent of src is the workspace");
+  assert.deepEqual(outsidePaths(`cd ${REPO} && cat AGENTS.md`, WS, HOME, exists), [`${REPO}/AGENTS.md`], 'a relative path after cd outside is caught');
+  assert.deepEqual(outsidePaths('cd ../../.. && ls', WS, HOME, exists), [], 'a cd alone reads nothing');
+  assert.deepEqual(outsidePaths('cd .. ; cat ../../../aa', WS, HOME, exists), ['/private/var/folders/aa']);
+  assert.deepEqual(simpleCommands('echo "a; cd /elsewhere" && cat x'), ['echo "a; cd /elsewhere"', 'cat x'], 'a cd inside quotes is not a cd');
+  assert.deepEqual(simpleCommands('a && b || c | d; (cd x && e)\nf "g; h" \'i && j\''), ['a', 'b', 'c', 'd', 'cd x', 'e)', 'f "g; h" \'i && j\'']);
+
+  const calls = (...commands: string[]) =>
+    parseTranscript(
+      commands
+        .flatMap((command, i) => [
+          event('assistant', [{ type: 'tool_use', id: `t${i}`, name: 'Bash', input: { command } }]),
+          event('user', [{ type: 'tool_result', tool_use_id: `t${i}`, is_error: false, content: 'ok' }]),
+        ])
+        .join('\n'),
+    );
+  assert.equal(checkPaths(calls('cd src', 'cat ../package.json'), WS, HOME, exists).ok, true, 'the folder carries to the next command');
+  assert.equal(checkPaths(calls(`cd ${REPO}`, 'cat ../package.json'), WS, HOME, exists).ok, true, 'a folder outside the workspace does not carry over');
+  assert.equal(checkPaths(calls(`cd ${REPO} && cat AGENTS.md`), WS, HOME, exists).ok, false);
 });
 
 test('paths: a path the sandbox denies counts as refused even when the command as a whole succeeded', () => {

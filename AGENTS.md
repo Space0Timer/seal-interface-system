@@ -681,7 +681,11 @@ the run `invalid`.
     a whole succeeded (`ls /Applications | grep chrome; which chromium`),
     since the probe proves those denials before every session.
     Here-document bodies are file contents, not paths, and a lone `/` is
-    nearly always division in code, so neither counts.
+    nearly always division in code, so neither counts. The check follows
+    `cd` as the shell does, within a command and from one command to the
+    next while the shell stays in the workspace, so `cd src && cat
+    ../package.json` names the workspace's own file; once the shell is
+    outside the workspace, plain names count as paths there.
   - The canary's token and forbidden paths appear in no tool result.
 - **Leftover processes,** for the probe and the session: nothing it
   started is still running once it ends, and no process with its HOME or
