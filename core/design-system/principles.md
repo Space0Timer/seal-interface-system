@@ -250,6 +250,8 @@ essentials.
 - Move secondary actions into `…`.
 - Size interactive targets on touch layouts to at least the touch target
   token.
+- Set text in fields to `type.input.touch` on touch layouts, so focusing a
+  field doesn't zoom the page. Don't block zoom in the viewport instead.
 
 **Don't**
 - Scale the desktop layout down.
