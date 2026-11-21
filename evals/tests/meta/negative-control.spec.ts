@@ -153,6 +153,18 @@ test.describe('valid variations pass', () => {
   test('"Delete selected" inside a toolbar ul > li: bulk delete finds it', async ({ page }) => {
     await checkBulkDelete(page, at('toolbar-list=1'));
   });
+
+  test('a closed confirmation dialog naming the selected assets: bulk delete still finds the rows', async ({ page }) => {
+    await checkBulkDelete(page, at('closed-dialog=1'));
+  });
+
+  test('a delete confirmation in place, not in a dialog: bulk delete confirms it', async ({ page }) => {
+    await checkBulkDelete(page, at('inline-confirm=1'));
+  });
+
+  test('a delete button that asks in place by changing its label: bulk delete confirms it', async ({ page }) => {
+    await checkBulkDelete(page, at('inline-confirm=relabel'));
+  });
 });
 
 test.describe('touch-target measurement', () => {

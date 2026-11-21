@@ -54,13 +54,18 @@ export function uploadsIn(entries: LogEntry[]): LogEntry[] {
  * The list item for an asset: a row, option or list item whose computed
  * accessible name contains the full filename, or whose text does.
  */
+/**
+ * The asset's item in the library. Only visible elements count: a page may
+ * hold hidden copies of a filename, such as a closed confirmation dialog
+ * that lists the selected assets, and those aren't the library's items.
+ */
 export function libraryItem(page: Page, filename: string): Locator {
   const byName = page
     .getByRole('row', { name: filename })
     .or(page.getByRole('option', { name: filename }))
     .or(page.getByRole('listitem', { name: filename }));
   const byText = page.locator(ITEM).filter({ hasText: filename });
-  return byName.or(byText).last();
+  return byName.or(byText).filter({ visible: true }).last();
 }
 
 /** For each filename, the other filenames that contain it (a.png is inside …-cta.png). */
@@ -981,10 +986,40 @@ export async function checkBulkDelete(page: Page, options: OpenOptions = {}): Pr
   const candidates = labelled.or(outsideItems).filter({ visible: true });
   const index = await firstOutsideAssetItems(candidates, DEFAULT_NAMES);
   expect(index, 'a visible Delete or Remove control outside the items').toBeGreaterThanOrEqual(0);
+  // The Delete and Remove controls on the page before the click, with their labels.
+  const before = await Promise.all((await candidates.elementHandles()).map(async (handle) => ({ handle, text: await handle.innerText() })));
   await candidates.nth(index).click();
 
+  // Deleting may ask first: in a dialog, or in place, where a Delete or
+  // Remove control outside the items appears, or changes its label, after
+  // the click. Wait for whichever happens: a delete request (no
+  // confirmation), a dialog, or such a control.
   const dialog = page.getByRole('dialog').or(page.getByRole('alertdialog')).filter({ visible: true });
-  if (await dialog.count()) await dialog.getByRole('button', { name: /delete|remove/i }).first().click();
+  const deleteRequests = async () => (await mockLog(page)).filter((e) => e.path === '/api/assets/delete').length;
+  const confirmInPlace = async (): Promise<number> => {
+    const now = await candidates.elementHandles();
+    for (let i = 0; i < now.length; i++) {
+      const handle = now[i]!;
+      const text = await handle.innerText();
+      let earlier: { handle: typeof handle; text: string } | undefined;
+      for (const b of before) if (await handle.evaluate((el, other) => el === other, b.handle)) earlier = b;
+      if (earlier && earlier.text === text) continue;
+      if ((await firstOutsideAssetItems(candidates.nth(i), DEFAULT_NAMES)) === 0) return i;
+    }
+    return -1;
+  };
+  for (const deadline = Date.now() + 5_000; Date.now() < deadline; await page.waitForTimeout(150)) {
+    if ((await deleteRequests()) > 0) break;
+    if (await dialog.count()) {
+      await dialog.getByRole('button', { name: /delete|remove/i }).first().click();
+      break;
+    }
+    const confirm = await confirmInPlace();
+    if (confirm >= 0) {
+      await candidates.nth(confirm).click();
+      break;
+    }
+  }
 
   // The complete effect: every delete request in the interaction, together,
   // removes exactly the selected assets, in the log and in the library.

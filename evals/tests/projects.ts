@@ -14,3 +14,13 @@ export const PROJECTS = [
 ] as const satisfies Project[];
 
 export type ProjectName = (typeof PROJECTS)[number]['name'];
+
+/**
+ * Browsers that run at once while a condition's app is scored, by the
+ * behavior tests and the screenshots alike. A test that uploads the whole
+ * batch, 112 MB file included, can hold up another test's page past its
+ * waits when too many run together. This file is part of the scoring
+ * fingerprint, so runs scored with a different number can't be exported
+ * together.
+ */
+export const SCORING_WORKERS = 2;

@@ -4,7 +4,7 @@
 // themselves.
 import { execFileSync } from 'node:child_process';
 import { defineConfig } from '@playwright/test';
-import { PROJECTS } from './projects.ts';
+import { PROJECTS, SCORING_WORKERS } from './projects.ts';
 
 const external = process.env['EVAL_BASE_URL'];
 
@@ -33,6 +33,8 @@ export default defineConfig({
   timeout: 120_000,
   expect: { timeout: 10_000 },
   forbidOnly: !!process.env['CI'],
+  // A condition's app is scored with SCORING_WORKERS; the conformance app and meta tests keep the default.
+  ...(external ? { workers: SCORING_WORKERS } : {}),
   reporter: [['list']],
   use: {
     baseURL: external ?? conformance,

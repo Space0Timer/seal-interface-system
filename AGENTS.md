@@ -423,6 +423,11 @@ Each run:
    - No generated code runs outside the browser after the build.
 7. Runs the shared behavior tests in all four projects. It saves a JSON
    report and the touch-target evidence.
+   - Two browsers run at a time (`SCORING_WORKERS` in
+     `evals/tests/projects.ts`), for the tests and the screenshots. With
+     Playwright's default of half the CPU cores, a test uploading the
+     batch's 112 MB file held up another test's first render past its
+     10-second wait. The number is part of the scoring fingerprint.
 8. Takes full-page screenshots of the six states in all four projects
    (`evals/runner/screenshots/`), with the clock fixed to the fixtures'
    NOW.
@@ -554,8 +559,17 @@ prompt on stdin. The CLI is `claude` on PATH, or `CLAUDE_CODE_BIN`.
   - Bash runs in the OS sandbox. It can't read the owner's home, the
     system temp folder (which holds the canary) or Claude Code's shared
     temp folder (`/tmp/claude-<uid>`, which holds other sessions' files).
-  - It can't write outside the workspace, and has no network except local
-    ports.
+  - It can't read `/Applications`, `/Users` or `/Volumes` either: they
+    show what's installed on the machine, and a session looking for a
+    browser to check its work goes there.
+  - It can't write outside the workspace and its own temp folder, and has
+    no network except local ports.
+  - Commands get the session's own temp folder. Claude Code starts every
+    command with `export TMPDIR=/tmp/claude-<uid>`, which the sandbox
+    denies, so here-documents and temp files failed; the shell wrapper
+    points that export at the session's folder instead. It also turns off
+    zsh's `bg_nice`, which the sandbox refuses with a warning in every
+    result.
   - Every forbidden path (each repo checkout, the results, `~/.claude`)
     is denied to Bash and the file tools wherever it is, including outside
     the home and temp folders. Claude Code shows the model its sandbox
@@ -620,11 +634,13 @@ settings and workspace against a local stub model, at no cost.
     token in the results, and each checkout's own `package.json`. No
     other file in a forbidden path is ever read, so a failed check can't
     have put a secret in the logs.
-  - list the owner's home and the shared temp folder
+  - list the owner's home, the shared temp folder, `/Applications`,
+    `/Users` and `/Volumes`
   - write outside the workspace
   - reach the network through the sandbox's proxy, and directly
-- Then it runs node and pnpm, reads a workspace file, and invokes the
-  assigned skill when present. The probe verifies that the stub receives
+- Then it runs node and pnpm, writes a here-document to `$TMPDIR`, runs a
+  background job without a warning, reads a workspace file, and invokes
+  the assigned skill when present. The probe verifies that the stub receives
   the skill body.
 - Every forbidden attempt must fail and every ordinary step must work, or
   the run stops before any model is called.
@@ -658,8 +674,18 @@ the run `invalid`.
     `SYSTEM_PROMPT_LINES_ALLOWED` (today only `# Harness`). A new match
     fails until someone reviews it.
 - **Transcript:**
-  - Every path a tool call read or wrote is inside the workspace. Refused
-    attempts are listed, not failed.
+  - Every path a tool call read or wrote is inside the workspace or the
+    session's own folders: the fresh home and temp folder the runner made
+    for it. Refused attempts are listed, not failed.
+    A path the sandbox denies counts as refused even when the command as
+    a whole succeeded (`ls /Applications | grep chrome; which chromium`),
+    since the probe proves those denials before every session.
+    Here-document bodies are file contents, not paths, and a lone `/` is
+    nearly always division in code, so neither counts. The check follows
+    `cd` as the shell does, within a command and from one command to the
+    next while the shell stays in the workspace, so `cd src && cat
+    ../package.json` names the workspace's own file; once the shell is
+    outside the workspace, plain names count as paths there.
   - The canary's token and forbidden paths appear in no tool result.
 - **Leftover processes,** for the probe and the session: nothing it
   started is still running once it ends, and no process with its HOME or
@@ -799,6 +825,12 @@ CLI against the local stub and verifies the blinded export.
   - "Delete selected" inside a toolbar list
   - recovery controls that reorder after the first recovery
   - a virtualized list that renders 5 rows at a time
+  - a closed confirmation dialog that names the selected assets (items
+    are matched among visible elements only)
+  - a delete confirmation in place, not in a dialog: new "Delete N assets"
+    and Cancel buttons, or the same button relabeled (the check confirms
+    with a Delete or Remove control outside the items that appeared or
+    changed label after the first click)
 
   A meta test also shows that the browser hold works: without it, the
   same server under `localhost` and another local port both answer the

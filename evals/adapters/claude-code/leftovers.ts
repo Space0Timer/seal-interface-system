@@ -76,9 +76,25 @@ export function processTable(): Map<number, Proc> {
   return table;
 }
 
-/** The shell wrapper's script: it checks in, runs zsh, checks in again, and exits with zsh's status. */
-function wrapper(register: string): string {
+/**
+ * The shell wrapper's script: it checks in, runs zsh, checks in again, and
+ * exits with zsh's status.
+ *
+ * Commands get the session's own temp folder: here-documents, $TMPDIR and
+ * tools' temp files need somewhere to write. Claude Code starts every
+ * command with "export TMPDIR=/tmp/claude-<uid>", its shared temp folder,
+ * which the sandbox denies because it holds other sessions' files, so the
+ * wrapper points that export at the session's folder instead. The probe
+ * checks the result, so a CLI that sets it another way fails closed.
+ *
+ * The sandbox may not lower a process's priority, so zsh doesn't try to for
+ * background jobs (bg_nice), which would print a warning in every result.
+ */
+function wrapper(register: string, tmp: string): string {
   return `#!/bin/zsh -f
+setopt no_bg_nice
+export TMPDIR=${quote(tmp)} TMPPREFIX=${quote(`${tmp}/zsh`)}
+argv=("\${(@)argv//export TMPDIR=\\/tmp\\/claude-<->/export TMPDIR=\${(q)TMPDIR}}")
 # Checks in before and after running zsh.
 checkin() {
   sleep 10 < /dev/null > /dev/null 2>&1 &
@@ -87,7 +103,7 @@ checkin() {
   kill $waiter 2>/dev/null
 }
 checkin
-/bin/zsh "$@"
+/bin/zsh -o no_bg_nice "$@"
 code=$?
 checkin
 exit $code
@@ -111,11 +127,11 @@ export interface Shells {
  * failed, fail is called once and later check-ins are ignored: what that
  * shell leaves could no longer be told apart.
  */
-export function watchShells(shell: string, cli: () => number | undefined, fail: (error: Error) => void): Shells {
+export function watchShells(shell: string, tmp: string, cli: () => number | undefined, fail: (error: Error) => void): Shells {
   const dir = dirname(shell);
   mkdirSync(dirname(dir), { recursive: true });
   mkdirSync(dir);
-  writeFileSync(shell, wrapper(join(dir, 'register')), { flag: 'wx', mode: 0o755 });
+  writeFileSync(shell, wrapper(join(dir, 'register'), tmp), { flag: 'wx', mode: 0o755 });
   const register = join(dir, 'register');
   execFileSync('mkfifo', [register], CALL);
   // Open for reading and writing, so it never reaches end of file between shells. It's opened once, before the
