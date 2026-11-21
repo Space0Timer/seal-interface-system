@@ -352,6 +352,11 @@ swapped without touching component or layout rules.
   Sections don't get rounded corners just for existing.
 - **Elevation.** Used only for real layering: menus, popovers, dialogs and
   controls that genuinely float.
+- **Icons.** Take them from Phosphor Icons, in the regular weight, at
+  `size.icon.default`, in the color of the text they sit with. Don't mix in
+  another set or draw your own. An icon-only control has a name that says
+  what it does, such as "Dismiss uploads", and on touch layouts its hit
+  area still meets `size.target.touch` (P6).
 
 **Don't**
 - Raw hex, RGB, HSL or OKLCH values, raw pixel spacing, or ad hoc font

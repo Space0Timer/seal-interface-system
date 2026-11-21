@@ -258,6 +258,9 @@ workspace. It must be outside this repo for real runs. The workspace gets:
 - `template/`: a blank Vite + React + TS app that renders nothing, with no
   styles. Dependencies are pinned exactly and installed from its own
   lockfile.
+  - They include Phosphor's React icons (`@phosphor-icons/react`), the icon
+    set the skill names, so every condition can use the same icons without
+    network access. *Owner decision, 2026-11-21.*
   - Only the files named in `TEMPLATE_FILES` in `materialize.ts` are
     copied, one by one. Local extras in the template folder (`.env`
     files, build output, OS junk) never reach a workspace.
