@@ -126,6 +126,18 @@ test('shell commands: real paths outside the workspace are caught; URLs, API rou
   assert.deepEqual(outsidePaths(`grep -rn "/api/assets" src && cat ${WS}/README.md && /usr/bin/env node -v`, WS, HOME, exists), []);
 });
 
+test("shell commands: here-document bodies, division and the session's own folders are not paths it reached", () => {
+  const exists = (p: string) => p === '/' || p.startsWith('/Users/someone') || p.startsWith('/private/var/folders/aa/T');
+  const heredoc = `cat > src/format.ts <<'EOF'\nconst kb = bytes / 1024;\nconst file = '/Users/someone/notes.txt';\nEOF\ncat ${REPO}/AGENTS.md`;
+  assert.deepEqual(outsidePaths(heredoc, WS, HOME, exists), [`${REPO}/AGENTS.md`], 'the body is skipped; a path after it is still caught');
+  assert.deepEqual(outsidePaths(`cat <<-"END"\n\t/Users/someone/x\n\tEND\nls /Users/someone`, WS, HOME, exists), ['/Users/someone']);
+  assert.deepEqual(outsidePaths('node -e "console.log(6 / 3)"', WS, HOME, exists), [], 'a lone slash is division');
+  assert.deepEqual(outsidePaths('cat <<< /Users/someone/x', WS, HOME, exists), ['/Users/someone/x'], 'a here-string is not a here-document');
+  const tmp = '/private/var/folders/aa/T/work-x/state/tmp';
+  assert.deepEqual(outsidePaths(`cat ${tmp}/preview.log`, WS, HOME, exists, [tmp]), [], "the session's temp folder is its own");
+  assert.deepEqual(outsidePaths(`cat ${tmp}/preview.log`, WS, HOME, exists), [`${tmp}/preview.log`]);
+});
+
 const event = (type: string, content: unknown[]) => JSON.stringify({ type, message: { content } });
 const init: InitEvent = {
   type: 'system',
@@ -154,6 +166,24 @@ test('init: the expected model, tools and skills pass; any MCP server, plugin, e
   assert.deepEqual(failing({ model: 'claude-other' }), ['claude-code.init-model']);
   assert.deepEqual(failing({ permissionMode: 'bypassPermissions' }), ['claude-code.init-permission-mode']);
   assert.deepEqual(checkInit(undefined, expected).map((c) => c.ok), [false]);
+});
+
+test('paths: a path the sandbox denies counts as refused even when the command as a whole succeeded', () => {
+  const exists = () => true;
+  const bash = (command: string) =>
+    parseTranscript(
+      [
+        event('assistant', [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command } }]),
+        event('user', [{ type: 'tool_result', tool_use_id: 't1', is_error: false, content: 'chromium not found' }]),
+      ].join('\n'),
+    );
+  const sandbox = { deny: ['/Applications', HOME], allow: [`${HOME}/.nvm`] };
+  const listed = checkPaths(bash('ls "/Applications" 2>&1 | grep -i chrome; which chromium'), WS, HOME, exists, [], sandbox);
+  assert.equal(listed.ok, true, listed.detail);
+  assert.match(listed.detail, /refused attempts outside it: Bash \/Applications/);
+  assert.equal(checkPaths(bash('ls "/Applications"; true'), WS, HOME, exists).ok, false, 'without the sandbox settings it counts');
+  assert.equal(checkPaths(bash(`ls ${HOME}/.nvm/versions; true`), WS, HOME, exists, [], sandbox).ok, false, 'a re-allowed path still counts');
+  assert.equal(checkPaths(bash('ls /Library/Fonts; true'), WS, HOME, exists, [], sandbox).ok, false, 'a path the sandbox allows still counts');
 });
 
 test('paths: a successful read outside the workspace fails the run; a refused one is only listed', () => {
@@ -227,6 +257,7 @@ const GOOD: Record<string, [string, boolean]> = {
   'network-proxy': proxyDenied,
   'network-direct': directRefused,
   'shell-works': ['v24.19.0\n12.21.0', false],
+  'shell-temp': ['heredoc ok\nbackground ok', false],
   'read-workspace': ['# Starter', false],
 };
 /** A transcript in which each scripted step got the given result (default: refused). */
@@ -247,6 +278,7 @@ const targets = (overrides: Partial<ProbeTargets> = {}): ProbeTargets => ({
   forbidden: ['/nonexistent-repo'],
   readProbes: [],
   realHome: '/nonexistent-home',
+  hostRoots: [],
   agentTemp: '/nonexistent-temp',
   workspace: process.cwd(),
   ...overrides,
@@ -258,11 +290,31 @@ test('probe: a forbidden read that returns the canary, or a shell that cannot ru
   assert.deepEqual(failedIds(judgeProbe(probeRun(steps, GOOD), steps)), []);
   assert.deepEqual(failedIds(judgeProbe(probeRun(steps, { ...GOOD, 'read-canary': [CANARY, false] }), steps)), ['claude-code.probe-read-canary']);
   assert.deepEqual(failedIds(judgeProbe(probeRun(steps, { ...GOOD, 'shell-works': ['command not found: pnpm', true] }), steps)), ['claude-code.probe-shell-works']);
+  for (const broken of [
+    ["(eval):1: can't create temp file for here document: operation not permitted\nbackground ok", true],
+    ['checkin:1: nice(5) failed: operation not permitted\nheredoc ok\nbackground ok', false],
+  ] as Array<[string, boolean]>) {
+    assert.deepEqual(failedIds(judgeProbe(probeRun(steps, { ...GOOD, 'shell-temp': broken }), steps)), ['claude-code.probe-shell-temp'], broken[0]);
+  }
   assert.deepEqual(
     failedIds(judgeProbe(probeRun(steps, GOOD, { 'read-canary': 'Glob' }), steps)),
     ['claude-code.probe-read-canary'],
     'a result for a call the probe never scripted there counts for nothing',
   );
+});
+
+test('probe: a host folder such as /Applications must list nothing', () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'host-root-'));
+  try {
+    mkdirSync(join(root, 'Some Browser.app'));
+    const steps = probeSteps(targets({ hostRoots: [root] }), versions);
+    assert.ok(steps.some((s) => s.id === 'shell-host-1'));
+    assert.deepEqual(failedIds(judgeProbe(probeRun(steps, GOOD), steps)), [], 'a refused listing passes');
+    const listed = probeRun(steps, { ...GOOD, 'shell-host-1': ['Some Browser.app', false] });
+    assert.deepEqual(failedIds(judgeProbe(listed, steps)), ['claude-code.probe-shell-host-1']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('probe: every forbidden root is globbed and listed; only a harmless file the runner named is ever read', () => {
@@ -420,7 +472,7 @@ setInterval(() => {}, 1000);`);
     // A time limit the CLI itself stays well within, though the cleanup after it doesn't.
     const run = await runSession(
       '/bin/sh',
-      { args: ['-c', script], env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, CLAUDE_CODE_SHELL: shell }, settings: {} },
+      { args: ['-c', script], env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, TMPDIR: dir, CLAUDE_CODE_SHELL: shell }, settings: {} },
       dir,
       '',
       { transcript: join(dir, 'transcript.jsonl'), stderr: join(dir, 'stderr.log') },
@@ -459,7 +511,7 @@ test('the shell wrapper is set up only in a folder of its own, never through one
     mkdirSync(join(dir, 'host'));
     mkdirSync(join(dir, 'state'));
     symlinkSync(join(dir, 'host'), join(dir, 'state', 'shell'));
-    assert.throws(() => watchShells(join(dir, 'state', 'shell', 'zsh'), () => undefined, () => undefined), /EEXIST/);
+    assert.throws(() => watchShells(join(dir, 'state', 'shell', 'zsh'), join(dir, 'state', 'tmp'), () => undefined, () => undefined), /EEXIST/);
     assert.deepEqual(readdirSync(join(dir, 'host')), [], 'nothing is written through the link');
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -493,7 +545,7 @@ require('node:fs').writeFileSync(pidFile, String(c.pid));`);
     await assert.rejects(
       runSession(
         '/bin/sh',
-        { args: ['-c', script], env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: join(dir, 'home'), CLAUDE_CODE_SHELL: join(dir, 'state', 'shell', 'zsh') }, settings: {} },
+        { args: ['-c', script], env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: join(dir, 'home'), TMPDIR: dir, CLAUDE_CODE_SHELL: join(dir, 'state', 'shell', 'zsh') }, settings: {} },
         dir,
         '',
         { transcript: join(dir, 'transcript.jsonl'), stderr: join(dir, 'stderr.log') },

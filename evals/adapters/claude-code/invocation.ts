@@ -162,6 +162,12 @@ export function buildSettings(input: InvocationInput): Record<string, unknown> {
   };
 }
 
+/** What the session's sandbox keeps Bash from reading, and what it re-allows inside that. */
+export function sandboxReads(settings: Record<string, unknown>): { deny: string[]; allow: string[] } {
+  const filesystem = (settings['sandbox'] as { filesystem?: { denyRead?: string[]; allowRead?: string[] } } | undefined)?.filesystem;
+  return { deny: filesystem?.denyRead ?? [], allow: filesystem?.allowRead ?? [] };
+}
+
 export function buildEnv(input: InvocationInput): Record<string, string> {
   const { home, config, tmp, agentTmp, shell } = sessionPaths(input.stateDir);
   const path = [...new Set([...input.binDirs, '/usr/bin', '/bin', '/usr/sbin', '/sbin'])].join(':');

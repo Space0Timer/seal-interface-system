@@ -28,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { leakIn } from '../../starter/src/leaks.ts';
 import { onPath, toolchain } from '../../starter/src/toolchain.ts';
 import type { Adapter, GenerateOptions, GenerateResult, IsolationCheck, ReadProbe } from '../types.ts';
-import { buildInvocation, coverFor, redacted, sessionPaths, TOOLS, type Invocation, type InvocationInput } from './invocation.ts';
+import { buildInvocation, coverFor, redacted, sandboxReads, sessionPaths, TOOLS, type Invocation, type InvocationInput } from './invocation.ts';
 import { stopLeftovers, watchShells, type Leftovers } from './leftovers.ts';
 import { startStubModel, type RecordedRequest, type ScriptTurn } from './stub-model.ts';
 import { checkInit, checkPaths, checkReceived, parseTranscript, sessionOutcome, type ToolResult, type Transcript } from './transcript.ts';
@@ -106,13 +106,16 @@ export function runSession(
 ): Promise<SessionRun> {
   const home = invocation.env['HOME'];
   const shell = invocation.env['CLAUDE_CODE_SHELL'];
+  const tmp = invocation.env['TMPDIR'];
   if (!home || !shell) throw new Error('the session needs a HOME and a shell of its own, which is how what it leaves running is found');
+  if (!tmp) throw new Error('the session needs a temp folder of its own for its commands');
   return new Promise((resolvePromise, reject) => {
     // Check-ins arrive only once the CLI has started a shell, by which time child is set. If one can't be handled,
     // what that shell leaves can't be told apart, so the session is ended the usual way and the run fails with it.
     let failure: Error | undefined;
     const shells = watchShells(
       shell,
+      tmp,
       () => child.pid,
       (error) => {
         failure ??= new Error(`could not check a shell in: ${error.message}`);
@@ -292,6 +295,8 @@ export interface ProbeTargets {
   /** The only files in them the probe may try to read (see GenerateOptions.readProbes). */
   readProbes: ReadProbe[];
   realHome: string;
+  /** Host folders outside the home that name what's installed or mounted (see HOST_ROOTS). */
+  hostRoots: string[];
   /** Claude Code's shared temp folder, which holds other sessions' files. */
   agentTemp: string;
   workspace: string;
@@ -299,6 +304,14 @@ export interface ProbeTargets {
 }
 
 type ToolTurn = Extract<ScriptTurn, { tool: string }>;
+
+/**
+ * Host folders the session never needs that show what's on this machine:
+ * installed apps (where a session looking for a browser goes), other
+ * users' folders and mounted volumes. The owner's home and the temp
+ * folders are hidden separately.
+ */
+export const HOST_ROOTS = ['/Applications', '/Users', '/Volumes'];
 
 /** One forbidden or ordinary attempt the probe session makes, and how its result is judged. */
 export interface ProbeStep {
@@ -411,6 +424,7 @@ export function probeSteps(t: ProbeTargets, versions: { node: string; pnpm: stri
     { id: 'shell-canary', turn: { tool: 'Bash', input: { command: `cat ${q(t.canaryFile)}`, description: 'Show a file' } }, judge: withoutCanary('cat of the canary') },
     ...forbidden,
     { id: 'shell-home', turn: ls(t.realHome), judge: listsNothing(t.realHome, "ls of the owner's home") },
+    ...t.hostRoots.map((dir, i) => ({ id: `shell-host-${i + 1}`, turn: ls(dir), judge: listsNothing(dir, `ls of ${dir}`) })),
     { id: 'shell-agent-temp', turn: ls(t.agentTemp), judge: listsNothing(t.agentTemp, "ls of Claude Code's shared temp folder") },
     { id: 'write-outside', turn: { tool: 'Write', input: { file_path: fromWrite, content: 'x' } }, judge: createdNothing(fromWrite, 'Write outside the workspace') },
     {
@@ -429,6 +443,18 @@ export function probeSteps(t: ProbeTargets, versions: { node: string; pnpm: stri
       judge: (r) => ({
         ok: !!r && !r.isError && r.text.includes(versions.node) && r.text.includes(versions.pnpm),
         detail: `the shell runs node ${versions.node} and pnpm ${versions.pnpm}`,
+      }),
+    },
+    {
+      // Commands get a temp folder they can write, here-documents included, and no warning from a background job.
+      id: 'shell-temp',
+      turn: {
+        tool: 'Bash',
+        input: { command: "cat > \"$TMPDIR/heredoc-check\" <<'EOF'\nheredoc ok\nEOF\ncat \"$TMPDIR/heredoc-check\"\nsleep 0 & wait\necho background ok", description: 'Check the temp folder' },
+      },
+      judge: (r) => ({
+        ok: !!r && !r.isError && r.text.includes('heredoc ok') && r.text.includes('background ok') && !r.text.includes('nice('),
+        detail: 'a here-document wrote to $TMPDIR, and a background job ran without a warning',
       }),
     },
     {
@@ -507,6 +533,7 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
       if (!model) throw new Error('the claude-code adapter needs an exact model ID');
       const cliVersion = getVersion();
       const realHome = homedir();
+      const hostRoots = HOST_ROOTS.filter((dir) => existsSync(dir)).map((dir) => realpathSync(dir));
       const scratch = dirname(workspace);
       const canaryDir = dirname(opts.canary.file);
       const tools = toolchain();
@@ -525,7 +552,7 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
         model,
         effort: opts.effort,
         maxBudgetUsd: stub ? undefined : opts.maxBudgetUsd,
-        hiddenRoots: [realHome, realpathSync(tmpdir()), agentTemp],
+        hiddenRoots: [realHome, realpathSync(tmpdir()), agentTemp, ...hostRoots],
         agentTemp,
         forbidden: opts.forbiddenPaths,
         toolRoots: tools.roots,
@@ -563,7 +590,7 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
 
       // 1. The probe, against the stub model.
       const probe = probeSteps(
-        { canaryFile: opts.canary.file, canaryToken: opts.canary.token, canaryDir, forbidden: opts.forbiddenPaths, readProbes: opts.readProbes, realHome, agentTemp, workspace, skill: opts.skill?.name },
+        { canaryFile: opts.canary.file, canaryToken: opts.canary.token, canaryDir, forbidden: opts.forbiddenPaths, readProbes: opts.readProbes, realHome, hostRoots, agentTemp, workspace, skill: opts.skill?.name },
         versions,
       );
       prepare(probeState);
@@ -618,7 +645,7 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
       const { transcript } = run;
       checks.push(
         ...checkInit(transcript.init, expectedInit(model)),
-        checkPaths(transcript, workspace, sessionPaths(sessionState).home),
+        checkPaths(transcript, workspace, sessionPaths(sessionState).home, existsSync, [sessionPaths(sessionState).tmp], sandboxReads(invocation.settings)),
         ...checkReceived(transcript, opts.canary.token, opts.forbiddenPaths),
         checkStopped('claude-code.session-stopped', run.leftovers),
       );
