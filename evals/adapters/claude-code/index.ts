@@ -645,7 +645,8 @@ export function claudeCodeAdapter(options: ClaudeCodeOptions = {}): Adapter {
       const { transcript } = run;
       checks.push(
         ...checkInit(transcript.init, expectedInit(model)),
-        checkPaths(transcript, workspace, sessionPaths(sessionState).home, existsSync, [sessionPaths(sessionState).tmp], sandboxReads(invocation.settings)),
+        // The session's fresh home and temp folder are its own: the runner made both for it, empty.
+        checkPaths(transcript, workspace, sessionPaths(sessionState).home, existsSync, [sessionPaths(sessionState).home, sessionPaths(sessionState).tmp], sandboxReads(invocation.settings)),
         ...checkReceived(transcript, opts.canary.token, opts.forbiddenPaths),
         checkStopped('claude-code.session-stopped', run.leftovers),
       );

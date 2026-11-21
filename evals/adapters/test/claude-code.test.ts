@@ -136,6 +136,7 @@ test("shell commands: here-document bodies, division and the session's own folde
   const tmp = '/private/var/folders/aa/T/work-x/state/tmp';
   assert.deepEqual(outsidePaths(`cat ${tmp}/preview.log`, WS, HOME, exists, [tmp]), [], "the session's temp folder is its own");
   assert.deepEqual(outsidePaths(`cat ${tmp}/preview.log`, WS, HOME, exists), [`${tmp}/preview.log`]);
+  assert.deepEqual(outsidePaths('ls ~ | head -0; ls ~/Library/Caches/ms-playwright', WS, HOME, exists, [HOME, tmp]), [], "and so is its own home");
 });
 
 const event = (type: string, content: unknown[]) => JSON.stringify({ type, message: { content } });

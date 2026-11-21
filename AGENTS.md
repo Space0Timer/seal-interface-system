@@ -675,7 +675,8 @@ the run `invalid`.
     fails until someone reviews it.
 - **Transcript:**
   - Every path a tool call read or wrote is inside the workspace or the
-    session's own temp folder. Refused attempts are listed, not failed.
+    session's own folders: the fresh home and temp folder the runner made
+    for it. Refused attempts are listed, not failed.
     A path the sandbox denies counts as refused even when the command as
     a whole succeeded (`ls /Applications | grep chrome; which chromium`),
     since the probe proves those denials before every session.
