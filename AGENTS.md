@@ -827,6 +827,10 @@ CLI against the local stub and verifies the blinded export.
   - a virtualized list that renders 5 rows at a time
   - a closed confirmation dialog that names the selected assets (items
     are matched among visible elements only)
+  - a delete confirmation in place, not in a dialog: new "Delete N assets"
+    and Cancel buttons, or the same button relabeled (the check confirms
+    with a Delete or Remove control outside the items that appeared or
+    changed label after the first click)
 
   A meta test also shows that the browser hold works: without it, the
   same server under `localhost` and another local port both answer the

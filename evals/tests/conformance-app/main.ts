@@ -17,6 +17,8 @@
 //   ?reorder-last=1  when one failure remains, Dismiss comes before its recovery control
 //   ?virtual=1       the list scrolls inside a box and renders only 5 rows at a time
 //   ?closed-dialog=1 a closed confirmation dialog after the list names each selected asset
+//   ?inline-confirm=1 "Delete selected" asks in place: the bar offers Cancel and "Delete N assets"
+//   ?inline-confirm=relabel  the same button asks in place: it becomes "Delete N assets"
 //
 // Broken variants, which the meta tests check the shared tests reject:
 //   ?variant=retry-everything      Retry for every failure, even oversized files
@@ -70,6 +72,9 @@ const toolbarList = params.get('toolbar-list') === '1';
 const reorderLast = params.get('reorder-last') === '1';
 const virtual = params.get('virtual') === '1';
 const closedDialog = params.get('closed-dialog') === '1';
+const inlineConfirm = params.get('inline-confirm') === '1';
+const relabelConfirm = params.get('inline-confirm') === 'relabel';
+let confirming = false;
 const ROW_HEIGHT = 40;
 const VISIBLE_ROWS = 5;
 const variant = params.get('variant');
@@ -260,10 +265,52 @@ function renderSelection(): void {
     confirmDialog.replaceChildren(el('ul', {}, ...names));
   }
   if (state.selected.size === 0) {
+    confirming = false;
     selectionRegion.replaceChildren();
     return;
   }
+  if (inlineConfirm && confirming) {
+    const cancel = el('button', { type: 'button' }, 'Cancel');
+    cancel.addEventListener('click', () => {
+      confirming = false;
+      renderSelection();
+    });
+    const confirm = el('button', { type: 'button' }, `Delete ${state.selected.size} assets`);
+    confirm.addEventListener('click', async () => {
+      confirming = false;
+      await fetch('/api/assets/delete', { method: 'POST', body: JSON.stringify({ ids: [...state.selected] }) });
+      state.selected.clear();
+      renderSelection();
+      await load();
+    });
+    selectionRegion.replaceChildren(el('p', {}, `Delete ${state.selected.size} assets? `, cancel, ' ', confirm));
+    return;
+  }
   const remove = el('button', { type: 'button' }, 'Delete selected');
+  if (relabelConfirm) {
+    let asked = false;
+    remove.addEventListener('click', async () => {
+      if (!asked) {
+        asked = true;
+        remove.textContent = `Delete ${state.selected.size} assets`;
+        return;
+      }
+      await fetch('/api/assets/delete', { method: 'POST', body: JSON.stringify({ ids: [...state.selected] }) });
+      state.selected.clear();
+      renderSelection();
+      await load();
+    });
+    selectionRegion.replaceChildren(el('p', {}, `${state.selected.size} selected `, remove));
+    return;
+  }
+  if (inlineConfirm) {
+    remove.addEventListener('click', () => {
+      confirming = true;
+      renderSelection();
+    });
+    selectionRegion.replaceChildren(el('p', {}, `${state.selected.size} selected `, remove));
+    return;
+  }
   remove.addEventListener('click', async () => {
     await fetch('/api/assets/delete', { method: 'POST', body: JSON.stringify({ ids: [...state.selected] }) });
     if (is('delete-extra')) {
