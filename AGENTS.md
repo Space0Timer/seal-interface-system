@@ -423,6 +423,11 @@ Each run:
    - No generated code runs outside the browser after the build.
 7. Runs the shared behavior tests in all four projects. It saves a JSON
    report and the touch-target evidence.
+   - Two browsers run at a time (`SCORING_WORKERS` in
+     `evals/tests/projects.ts`), for the tests and the screenshots. With
+     Playwright's default of half the CPU cores, a test uploading the
+     batch's 112 MB file held up another test's first render past its
+     10-second wait. The number is part of the scoring fingerprint.
 8. Takes full-page screenshots of the six states in all four projects
    (`evals/runner/screenshots/`), with the clock fixed to the fixtures'
    NOW.

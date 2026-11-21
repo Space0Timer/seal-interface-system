@@ -3,7 +3,7 @@
 // run's results. Every project from the behavior tests: desktop and mobile,
 // light and dark.
 import { defineConfig } from '@playwright/test';
-import { PROJECTS } from '../tests/projects.ts';
+import { PROJECTS, SCORING_WORKERS } from '../tests/projects.ts';
 
 const base = process.env['EVAL_BASE_URL'];
 const brief = process.env['EVAL_BRIEF'] ?? 'asset-library';
@@ -14,6 +14,8 @@ export default defineConfig({
   testMatch: [`${brief}.spec.ts`],
   timeout: 120_000,
   expect: { timeout: 10_000 },
+  // As many browsers at once as the behavior tests use (see SCORING_WORKERS).
+  workers: SCORING_WORKERS,
   reporter: [['list']],
   use: { baseURL: base, ...(process.env['EVAL_MOCK_ADMIN_TOKEN'] ? { serviceWorkers: 'block' } : {}) },
   projects: [...PROJECTS],
