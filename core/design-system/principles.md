@@ -86,8 +86,8 @@ reading order.
 
 **Rule.** Group with spacing, type and alignment first. Add a container
 (background, border, radius or shadow) only when the content is a distinct
-object or region, such as a dialog, menu, popover, drop zone or media
-frame. Never nest a card inside a card.
+object or region, such as a dialog, menu, popover, drop zone, media frame
+or the global navigation sidebar. Never nest a card inside a card.
 
 **Why.** Wrapping everything in a container is the most recognizable sign
 of generated UI. Containers add weight without adding information, and
@@ -161,6 +161,10 @@ destroys the page hierarchy as the data grows.
   - a small thumbnail, with the filename as the primary text
   - only the metadata needed for scanning
   - tabular numerals where numbers align in a column
+- Show hover and selection as a background highlight with rounded ends
+  (`radius.control`), never as a box or border around the row. Adjacent
+  selected rows merge into one shape, so only the ends of the run are
+  rounded.
 - Truncate long filenames inside the row. Show the full name on hover, on
   focus, and in details.
 - Give regions room: between the page heading and the controls, and between
@@ -246,6 +250,8 @@ essentials.
 - Move secondary actions into `…`.
 - Size interactive targets on touch layouts to at least the touch target
   token.
+- Set text in fields to `type.input.touch` on touch layouts, so focusing a
+  field doesn't zoom the page. Don't block zoom in the viewport instead.
 
 **Don't**
 - Scale the desktop layout down.
@@ -341,9 +347,9 @@ swapped without touching component or layout rules.
   - Numbers that align in columns use tabular numerals, not monospace.
   - Type sizes are semantic roles. A font change needs a content reason,
     not a styling reason.
-- **Radius.** Used on controls and on surfaces whose shape communicates
-  something: menus, popovers, dialogs. Sections don't get rounded corners
-  just for existing.
+- **Radius.** Used on controls, on hover and selection highlights, and on
+  surfaces whose shape communicates something: menus, popovers, dialogs.
+  Sections don't get rounded corners just for existing.
 - **Elevation.** Used only for real layering: menus, popovers, dialogs and
   controls that genuinely float.
 
